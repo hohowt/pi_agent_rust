@@ -23,7 +23,6 @@ use ignore::WalkBuilder;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AutocompleteItemKind {
     SlashCommand,
-    ExtensionCommand,
     PromptTemplate,
     Skill,
     Model,
@@ -49,7 +48,6 @@ pub struct AutocompleteResponse {
 pub struct AutocompleteCatalog {
     pub prompt_templates: Vec<NamedEntry>,
     pub skills: Vec<NamedEntry>,
-    pub extension_commands: Vec<NamedEntry>,
     pub enable_skill_commands: bool,
 }
 
@@ -87,7 +85,6 @@ impl AutocompleteCatalog {
         Self {
             prompt_templates,
             skills,
-            extension_commands: Vec::new(),
             enable_skill_commands: resources.enable_skill_commands(),
         }
     }
@@ -255,25 +252,6 @@ impl AutocompleteProvider {
                         label: label.clone(),
                         insert: label,
                         description: Some(cmd.description.to_string()),
-                    },
-                });
-            }
-        }
-
-        // Extension commands.
-        for cmd in &self.catalog.extension_commands {
-            if let Some((is_prefix, score)) = fuzzy_match_score(&cmd.name, query) {
-                let label = format!("/{}", cmd.name);
-                items.push(ScoredItem {
-                    is_prefix,
-                    score,
-                    kind_rank: kind_rank(AutocompleteItemKind::ExtensionCommand),
-                    label: label.clone(),
-                    item: AutocompleteItem {
-                        kind: AutocompleteItemKind::ExtensionCommand,
-                        label: label.clone(),
-                        insert: label,
-                        description: cmd.description.clone(),
                     },
                 });
             }
@@ -797,12 +775,11 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
 const fn kind_rank(kind: AutocompleteItemKind) -> u8 {
     match kind {
         AutocompleteItemKind::SlashCommand => 0,
-        AutocompleteItemKind::ExtensionCommand => 1,
-        AutocompleteItemKind::PromptTemplate => 2,
-        AutocompleteItemKind::Skill => 3,
-        AutocompleteItemKind::Model => 4,
-        AutocompleteItemKind::File => 5,
-        AutocompleteItemKind::Path => 6,
+        AutocompleteItemKind::PromptTemplate => 1,
+        AutocompleteItemKind::Skill => 2,
+        AutocompleteItemKind::Model => 3,
+        AutocompleteItemKind::File => 4,
+        AutocompleteItemKind::Path => 5,
     }
 }
 
@@ -1101,7 +1078,6 @@ mod tests {
                 description: Some("Code review".to_string()),
             }],
             skills: Vec::new(),
-            extension_commands: Vec::new(),
             enable_skill_commands: false,
         };
         let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
@@ -1120,7 +1096,6 @@ mod tests {
                 name: "rustfmt".to_string(),
                 description: None,
             }],
-            extension_commands: Vec::new(),
             enable_skill_commands: true,
         };
         let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
@@ -1135,7 +1110,6 @@ mod tests {
                 name: "rustfmt".to_string(),
                 description: None,
             }],
-            extension_commands: Vec::new(),
             enable_skill_commands: false,
         });
         let resp = provider.suggest("/skill:ru", "/skill:ru".len());
@@ -1163,7 +1137,6 @@ mod tests {
                 description: None,
             }],
             skills: Vec::new(),
-            extension_commands: Vec::new(),
             enable_skill_commands: false,
         });
         let resp = provider.suggest(query, query.len());
@@ -1272,35 +1245,6 @@ mod tests {
             AutocompleteProvider::new(PathBuf::from("."), AutocompleteCatalog::default());
         let resp = provider.suggest("foo /he bar", "foo /he".len());
         assert_eq!(resp.replace, 4..7);
-    }
-
-    #[test]
-    fn slash_suggests_extension_commands() {
-        let catalog = AutocompleteCatalog {
-            prompt_templates: Vec::new(),
-            skills: Vec::new(),
-            extension_commands: vec![NamedEntry {
-                name: "deploy".to_string(),
-                description: Some("Deploy to production".to_string()),
-            }],
-            enable_skill_commands: false,
-        };
-        let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
-        let resp = provider.suggest("/dep", 4);
-        assert!(resp.items.iter().any(|item| item.insert == "/deploy"
-            && item.kind == AutocompleteItemKind::ExtensionCommand
-            && item.description == Some("Deploy to production".to_string())));
-
-        // Verify extension commands don't appear with empty catalog
-        let empty_catalog = AutocompleteCatalog::default();
-        provider.set_catalog(empty_catalog);
-        let resp = provider.suggest("/dep", 4);
-        assert!(
-            !resp
-                .items
-                .iter()
-                .any(|item| item.kind == AutocompleteItemKind::ExtensionCommand)
-        );
     }
 
     #[test]
@@ -1733,10 +1677,6 @@ mod tests {
     fn kind_rank_ordering() {
         assert!(
             kind_rank(AutocompleteItemKind::SlashCommand)
-                < kind_rank(AutocompleteItemKind::ExtensionCommand)
-        );
-        assert!(
-            kind_rank(AutocompleteItemKind::ExtensionCommand)
                 < kind_rank(AutocompleteItemKind::PromptTemplate)
         );
         assert!(
@@ -2099,7 +2039,6 @@ mod tests {
         let catalog = AutocompleteCatalog::default();
         assert!(catalog.prompt_templates.is_empty());
         assert!(catalog.skills.is_empty());
-        assert!(catalog.extension_commands.is_empty());
         assert!(!catalog.enable_skill_commands);
     }
 
@@ -2125,20 +2064,11 @@ mod tests {
                 description: Some("A test".to_string()),
             }],
             skills: Vec::new(),
-            extension_commands: vec![NamedEntry {
-                name: "test-ext".to_string(),
-                description: Some("An extension".to_string()),
-            }],
             enable_skill_commands: false,
         };
         let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
         let resp = provider.suggest("/test", 5);
 
-        assert!(
-            resp.items
-                .iter()
-                .any(|i| i.kind == AutocompleteItemKind::ExtensionCommand)
-        );
         assert!(
             resp.items
                 .iter()
@@ -2156,7 +2086,6 @@ mod tests {
                 name: "deploy".to_string(),
                 description: None,
             }],
-            extension_commands: Vec::new(),
             enable_skill_commands: false,
         };
         let mut provider = AutocompleteProvider::new(PathBuf::from("."), catalog);
@@ -2396,19 +2325,18 @@ mod tests {
                 assert!(!tok.text.contains(char::is_whitespace) || tok.text.is_empty());
             }
 
-            /// `kind_rank` covers all variants with distinct ranks 0..=6.
+            /// `kind_rank` covers all variants with distinct ranks 0..=5.
             #[test]
-            fn kind_rank_distinct(idx in 0..7usize) {
+            fn kind_rank_distinct(idx in 0..6usize) {
                 let kinds = [
                     AutocompleteItemKind::SlashCommand,
-                    AutocompleteItemKind::ExtensionCommand,
                     AutocompleteItemKind::PromptTemplate,
                     AutocompleteItemKind::Skill,
                     AutocompleteItemKind::Model,
                     AutocompleteItemKind::File,
                     AutocompleteItemKind::Path,
                 ];
-                let expected = [0_u8, 1, 2, 3, 4, 5, 6][idx];
+                let expected = [0_u8, 1, 2, 3, 4, 5][idx];
                 assert_eq!(kind_rank(kinds[idx]), expected);
             }
 

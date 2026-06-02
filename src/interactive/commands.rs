@@ -121,25 +121,6 @@ impl SlashCommand {
     }
 }
 
-pub(super) fn parse_extension_command(input: &str) -> Option<(String, &str)> {
-    let input = input.trim();
-    if !input.starts_with('/') {
-        return None;
-    }
-
-    // Built-in slash commands are handled elsewhere.
-    if SlashCommand::parse(input).is_some() {
-        return None;
-    }
-
-    let (cmd, rest) = input.split_once(char::is_whitespace).unwrap_or((input, ""));
-    let cmd = cmd.trim_start_matches('/').trim();
-    if cmd.is_empty() {
-        return None;
-    }
-    Some((cmd.to_string(), rest.trim()))
-}
-
 pub(super) fn parse_bash_command(input: &str) -> Option<(String, bool)> {
     let trimmed = input.trim_start();
     let (rest, force) = trimmed
@@ -190,15 +171,11 @@ fn provider_has_dedicated_login_flow(provider: &str) -> bool {
 /// hint, but the only real fix is to set the env var.
 fn should_use_copilot_device_flow() -> bool {
     if std::env::var("PI_COPILOT_FORCE_DEVICE_FLOW")
-        .map(|v| matches!(v.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+        .is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes"))
     {
         return true;
     }
-    if std::env::var("GITHUB_COPILOT_CLIENT_ID")
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(true)
-    {
+    if std::env::var("GITHUB_COPILOT_CLIENT_ID").map_or(true, |v| v.trim().is_empty()) {
         return true;
     }
     std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
@@ -330,7 +307,6 @@ fn format_credential_status(status: &crate::auth::CredentialStatus) -> String {
         crate::auth::CredentialStatus::Missing => "Not authenticated".to_string(),
         crate::auth::CredentialStatus::ApiKey
         | crate::auth::CredentialStatus::BearerToken
-        | crate::auth::CredentialStatus::AwsCredentials
         | crate::auth::CredentialStatus::ServiceKey => "Authenticated".to_string(),
         crate::auth::CredentialStatus::OAuthValid { expires_in_ms } => {
             format!(
@@ -356,44 +332,6 @@ fn format_provider_status(auth: &crate::auth::AuthStorage, provider: &str) -> St
 
     let status = auth.credential_status(provider);
     format_credential_status(&status)
-}
-
-fn collect_extension_oauth_providers(available_models: &[ModelEntry]) -> Vec<String> {
-    let mut providers: Vec<String> = available_models
-        .iter()
-        .filter(|entry| entry.oauth_config.is_some())
-        .map(|entry| {
-            let provider = entry.model.provider.as_str();
-            crate::provider_metadata::canonical_provider_id(provider)
-                .unwrap_or(provider)
-                .to_string()
-        })
-        .collect();
-
-    providers.retain(|provider| {
-        !BUILTIN_LOGIN_PROVIDERS
-            .iter()
-            .any(|(builtin, _)| provider == builtin)
-    });
-    providers.sort_unstable();
-    providers.dedup();
-    providers
-}
-
-fn extension_oauth_config_for_provider(
-    available_models: &[ModelEntry],
-    provider: &str,
-) -> Option<crate::models::OAuthConfig> {
-    available_models.iter().find_map(|entry| {
-        let model_provider = entry.model.provider.as_str();
-        let canonical = crate::provider_metadata::canonical_provider_id(model_provider)
-            .unwrap_or(model_provider);
-        if canonical.eq_ignore_ascii_case(provider) {
-            entry.oauth_config.clone()
-        } else {
-            None
-        }
-    })
 }
 
 fn append_provider_rows(output: &mut String, heading: &str, rows: &[(String, String, String)]) {
@@ -426,7 +364,7 @@ fn append_provider_rows(output: &mut String, heading: &str, rows: &[(String, Str
 
 pub(super) fn format_login_provider_listing(
     auth: &crate::auth::AuthStorage,
-    available_models: &[ModelEntry],
+    _available_models: &[ModelEntry],
 ) -> String {
     let mut output = String::from("Available login providers:\n\n");
 
@@ -456,22 +394,6 @@ pub(super) fn format_login_provider_listing(
     api_key_rows.sort_by(|left, right| left.0.cmp(&right.0));
     built_in_rows.extend(api_key_rows);
     append_provider_rows(&mut output, "Built-in", &built_in_rows);
-
-    let extension_providers = collect_extension_oauth_providers(available_models);
-    if !extension_providers.is_empty() {
-        let extension_rows: Vec<(String, String, String)> = extension_providers
-            .iter()
-            .map(|provider| {
-                (
-                    provider.clone(),
-                    "OAuth".to_string(),
-                    format_provider_status(auth, provider),
-                )
-            })
-            .collect();
-        output.push('\n');
-        append_provider_rows(&mut output, "Extension providers", &extension_rows);
-    }
 
     output.push_str("\nUsage: /login <provider>");
     output
@@ -563,19 +485,6 @@ fn session_thinking_level(
         .effective_thinking_level_for_current_path()
         .as_deref()
         .and_then(|value| value.parse::<crate::model::ThinkingLevel>().ok())
-}
-
-fn model_entry_event_payload(entry: &ModelEntry) -> Value {
-    json!({
-        "id": entry.model.id.clone(),
-        "name": entry.model.name.clone(),
-        "provider": entry.model.provider.clone(),
-        "api": entry.model.api.clone(),
-        "baseUrl": entry.model.base_url.clone(),
-        "contextWindow": entry.model.context_window,
-        "maxTokens": entry.model.max_tokens,
-        "input": &entry.model.input,
-    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -940,8 +849,7 @@ impl PiApp {
         }
 
         let resolved_key_opt = resolved_key_for(&next);
-        let provider_impl = match crate::providers::create_provider(&next, self.extensions.as_ref())
-        {
+        let provider_impl = match crate::providers::create_provider(&next) {
             Ok(p) => p,
             Err(err) => {
                 self.status_message = Some(format!("Auto-switch failed: {err}"));
@@ -978,7 +886,6 @@ impl PiApp {
         resolved_key_opt: Option<&str>,
         source: &str,
     ) -> Result<(), String> {
-        let previous_entry = self.model_entry.clone();
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             return Err("Agent busy; try again".to_string());
         };
@@ -1017,39 +924,11 @@ impl PiApp {
             *guard = next.clone();
         }
         self.model = format!("{}/{}", next.model.provider, next.model.id);
-        self.dispatch_model_select_event(next, Some(&previous_entry), source);
+        let _ = source;
         Ok(())
     }
 
-    fn dispatch_model_select_event(
-        &self,
-        next: &ModelEntry,
-        previous: Option<&ModelEntry>,
-        source: &str,
-    ) {
-        let Some(manager) = self.extensions.clone() else {
-            return;
-        };
-        let runtime_handle = self.runtime_handle.clone();
-        let source = match source {
-            "selector" | "command" => "set",
-            other => other,
-        };
-        let payload = json!({
-            "model": model_entry_event_payload(next),
-            "previousModel": previous.map(model_entry_event_payload),
-            "source": source,
-        });
-
-        runtime_handle.spawn(async move {
-            let _ = manager
-                .dispatch_event(ExtensionEventName::ModelSelect, Some(payload))
-                .await;
-        });
-    }
-
     pub(super) fn sync_runtime_selection_from_session_header(&mut self) -> Result<(), String> {
-        let previous_entry = self.model_entry.clone();
         let Ok(mut agent_guard) = self.agent.try_lock() else {
             return Err("Agent busy; try again".to_string());
         };
@@ -1113,8 +992,8 @@ impl PiApp {
                 ));
             }
 
-            let provider_impl = providers::create_provider(&target_entry, self.extensions.as_ref())
-                .map_err(|err| err.to_string())?;
+            let provider_impl =
+                providers::create_provider(&target_entry).map_err(|err| err.to_string())?;
             agent_guard.set_provider(provider_impl);
             let stream_options = agent_guard.stream_options_mut();
             stream_options.api_key.clone_from(&resolved_key_opt);
@@ -1152,9 +1031,7 @@ impl PiApp {
             self.spawn_save_session();
         }
 
-        if model_changed {
-            self.dispatch_model_select_event(&target_entry, Some(&previous_entry), "restore");
-        }
+        let _ = model_changed;
 
         Ok(())
     }
@@ -1178,7 +1055,6 @@ impl PiApp {
             provider,
             kind,
             verifier,
-            oauth_config,
             device_code,
             redirect_uri,
         } = pending;
@@ -1253,21 +1129,11 @@ impl PiApp {
                             base_url,
                             ..crate::auth::GitLabOAuthConfig::default()
                         };
-                        let gitlab_redirect_uri = redirect_uri
-                            .clone()
-                            .or_else(|| oauth_config.as_ref().and_then(|c| c.redirect_uri.clone()));
                         Box::pin(crate::auth::complete_gitlab_oauth(
                             &gitlab_config,
                             &code_input,
                             &verifier,
-                            gitlab_redirect_uri.as_deref(),
-                        ))
-                        .await
-                    } else if let Some(config) = &oauth_config {
-                        Box::pin(crate::auth::complete_extension_oauth(
-                            config,
-                            &code_input,
-                            &verifier,
+                            redirect_uri.as_deref(),
                         ))
                         .await
                     } else {
@@ -1405,47 +1271,21 @@ impl PiApp {
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
         let cwd = self.cwd.clone();
-        let cwd_display = cwd.display().to_string();
         let shell_path = self.config.shell_path.clone();
         let command_prefix = self.config.shell_command_prefix.clone();
-        let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
 
         runtime_handle.spawn(async move {
-            let mut override_result = None;
-            if let Some(manager) = extensions {
-                let response = manager
-                    .dispatch_event_with_response(
-                        ExtensionEventName::UserBash,
-                        Some(json!({
-                            "command": command.clone(),
-                            "excludeFromContext": exclude_from_context,
-                            "cwd": cwd_display,
-                        })),
-                        EXTENSION_EVENT_TIMEOUT_MS,
-                    )
-                    .await
-                    .unwrap_or(None);
-                if let Some(value) = response {
-                    override_result = parse_user_bash_event_result(&value);
-                }
-            }
-
-            let result = match override_result {
-                Some(result) => Ok(result),
-                None => {
-                    crate::tools::run_bash_command(
-                        &cwd,
-                        shell_path.as_deref(),
-                        command_prefix.as_deref(),
-                        &command,
-                        None,
-                        None,
-                    )
-                    .await
-                }
-            };
+            let result = crate::tools::run_bash_command(
+                &cwd,
+                shell_path.as_deref(),
+                command_prefix.as_deref(),
+                &command,
+                None,
+                None,
+            )
+            .await;
 
             match result {
                 Ok(result) => {
@@ -1643,15 +1483,11 @@ impl PiApp {
             "$0.0000".to_string()
         };
 
-        let mut info = format!(
+        let info = format!(
             "Session info:\n  file: {file}\n  id: {id}\n  name: {name}\n  model: {model}\n  thinking: {thinking}\n  messageCount: {message_count}\n  tokens: {total_tokens}\n  cost: {cost_str}",
             id = session.header.id,
             model = self.model,
         );
-        info.push_str("\n\n");
-        info.push_str(&self.frame_timing.summary());
-        info.push_str("\n\n");
-        info.push_str(&self.memory_monitor.summary());
         info
     }
 
@@ -1682,7 +1518,6 @@ impl PiApp {
                 self.pending_tool_output = None;
                 self.abort_handle = None;
                 self.autocomplete.close();
-                self.message_render_cache.clear();
                 self.status_message = Some("Conversation cleared".to_string());
                 self.scroll_to_bottom();
                 None
@@ -1851,147 +1686,39 @@ impl PiApp {
                     return None;
                 }
 
-                let Some(extensions) = self.extensions.clone() else {
-                    let Ok(mut session_guard) = self.session.try_lock() else {
-                        self.status_message = Some("Session busy; try again".to_string());
-                        return None;
-                    };
-                    let session_dir = session_guard.session_dir.clone();
-                    *session_guard = Session::create_with_dir(session_dir);
-                    session_guard.header.provider = Some(self.model_entry.model.provider.clone());
-                    session_guard.header.model_id = Some(self.model_entry.model.id.clone());
-                    session_guard.header.thinking_level = Some(ThinkingLevel::Off.to_string());
-                    drop(session_guard);
-
-                    if let Ok(mut agent_guard) = self.agent.try_lock() {
-                        agent_guard.replace_messages(Vec::new());
-                        agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
-                    }
-
-                    self.messages.clear();
-                    self.message_render_cache.clear();
-                    self.total_usage = Usage::default();
-                    self.current_response.clear();
-                    self.current_thinking.clear();
-                    self.current_tool = None;
-                    self.pending_tool_output = None;
-                    self.abort_handle = None;
-                    self.pending_oauth = None;
-                    self.session_picker = None;
-                    self.tree_ui = None;
-                    self.autocomplete.close();
-                    self.message_render_cache.clear();
-
-                    self.status_message = Some(format!(
-                        "Started new session\nModel set to {}\nThinking level: off",
-                        self.model
-                    ));
-                    self.scroll_to_bottom();
-                    self.input.focus();
+                let Ok(mut session_guard) = self.session.try_lock() else {
+                    self.status_message = Some("Session busy; try again".to_string());
                     return None;
                 };
+                let session_dir = session_guard.session_dir.clone();
+                *session_guard = Session::create_with_dir(session_dir);
+                session_guard.header.provider = Some(self.model_entry.model.provider.clone());
+                session_guard.header.model_id = Some(self.model_entry.model.id.clone());
+                session_guard.header.thinking_level = Some(ThinkingLevel::Off.to_string());
+                drop(session_guard);
 
-                let model_provider = self.model_entry.model.provider.clone();
-                let model_id = self.model_entry.model.id.clone();
-                let model_label = self.model.clone();
-                let event_tx = self.event_tx.clone();
-                let session = Arc::clone(&self.session);
-                let agent = Arc::clone(&self.agent);
-                let runtime_handle = self.runtime_handle.clone();
+                if let Ok(mut agent_guard) = self.agent.try_lock() {
+                    agent_guard.replace_messages(Vec::new());
+                    agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
+                }
 
-                let previous_session_file = self
-                    .session
-                    .try_lock()
-                    .ok()
-                    .and_then(|guard| guard.path.as_ref().map(|p| p.display().to_string()));
-
-                self.agent_state = AgentState::Processing;
-                self.status_message = Some("Starting new session...".to_string());
-
-                let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-                runtime_handle.spawn(async move {
-                    let cancelled = extensions
-                        .dispatch_cancellable_event(
-                            ExtensionEventName::SessionBeforeSwitch,
-                            Some(json!({ "reason": "new" })),
-                            EXTENSION_EVENT_TIMEOUT_MS,
-                        )
-                        .await
-                        .unwrap_or(false);
-                    if cancelled {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::System("Session switch cancelled by extension".to_string()),
-                        )
-                        .await;
-                        return;
-                    }
-
-                    let new_session_id = {
-                        let mut guard = match session.lock(&task_cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = crate::interactive::enqueue_pi_event(
-                                    &event_tx,
-                                    &asupersync::Cx::for_request(),
-                                    PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        let session_dir = guard.session_dir.clone();
-                        let mut new_session = Session::create_with_dir(session_dir);
-                        new_session.header.provider = Some(model_provider);
-                        new_session.header.model_id = Some(model_id);
-                        new_session.header.thinking_level = Some(ThinkingLevel::Off.to_string());
-                        let new_id = new_session.header.id.clone();
-                        *guard = new_session;
-                        new_id
-                    };
-
-                    {
-                        let mut agent_guard = match agent.lock(&task_cx).await {
-                            Ok(guard) => guard,
-                            Err(err) => {
-                                let _ = crate::interactive::enqueue_pi_event(
-                                    &event_tx,
-                                    &task_cx,
-                                    PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                                )
-                                .await;
-                                return;
-                            }
-                        };
-                        agent_guard.replace_messages(Vec::new());
-                        agent_guard.stream_options_mut().thinking_level = Some(ThinkingLevel::Off);
-                    }
-
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::ConversationReset {
-                            messages: Vec::new(),
-                            usage: Usage::default(),
-                            status: Some(format!(
-                                "Started new session\nModel set to {model_label}\nThinking level: off"
-                            )),
-                        },
-                    )
-                    .await;
-
-                    let _ = extensions
-                        .dispatch_event(
-                            ExtensionEventName::SessionSwitch,
-                            Some(json!({
-                                "reason": "new",
-                                "previousSessionFile": previous_session_file,
-                                "sessionId": new_session_id,
-                            })),
-                        )
-                        .await;
-                });
+                self.messages.clear();
+                self.total_usage = Usage::default();
+                self.current_response.clear();
+                self.current_thinking.clear();
+                self.current_tool = None;
+                self.pending_tool_output = None;
+                self.abort_handle = None;
+                self.pending_oauth = None;
+                self.session_picker = None;
+                self.tree_ui = None;
+                self.autocomplete.close();
+                self.status_message = Some(format!(
+                    "Started new session\nModel set to {}\nThinking level: off",
+                    self.model
+                ));
+                self.scroll_to_bottom();
+                self.input.focus();
 
                 None
             }
@@ -2119,96 +1846,6 @@ impl PiApp {
                     return None;
                 }
 
-                if let Some(extensions) = self.extensions.clone() {
-                    let session = Arc::clone(&self.session);
-                    let event_tx = self.event_tx.clone();
-                    let runtime_handle = self.runtime_handle.clone();
-                    let args = args.to_string();
-                    let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-
-                    runtime_handle.spawn(async move {
-                        let cx = Cx::current().unwrap_or_else(Cx::for_request);
-                        let (initial_selected_id, branch_count, entry_count) =
-                            match session.lock(&cx).await {
-                                Ok(session_guard) => {
-                                    let initial_selected_id =
-                                        resolve_tree_selector_initial_id(&session_guard, &args);
-                                    let branch_count = session_guard.list_leaves().len();
-                                    let entry_count = session_guard.entries.len();
-                                    (initial_selected_id, branch_count, entry_count)
-                                }
-                                Err(err) => {
-                                    let _ = crate::interactive::enqueue_pi_event(
-                                        &event_tx,
-                                        &task_cx,
-                                        PiMsg::AgentError(format!("Failed to lock session: {err}")),
-                                    )
-                                    .await;
-                                    return;
-                                }
-                            };
-
-                        let response = extensions
-                            .dispatch_event_with_response(
-                                ExtensionEventName::SessionBeforeTree,
-                                Some(json!({
-                                    "preparation": {
-                                        "branchCount": branch_count,
-                                        "entryCount": entry_count,
-                                    }
-                                })),
-                                EXTENSION_EVENT_TIMEOUT_MS,
-                            )
-                            .await
-                            .unwrap_or(None);
-
-                        let mut label = None;
-                        let mut cancelled = false;
-                        if let Some(value) = response {
-                            if value.as_bool() == Some(false) {
-                                cancelled = true;
-                            }
-                            if let Some(obj) = value.as_object() {
-                                if obj.get("cancel").and_then(Value::as_bool).unwrap_or(false)
-                                    || obj
-                                        .get("cancelled")
-                                        .and_then(Value::as_bool)
-                                        .unwrap_or(false)
-                                {
-                                    cancelled = true;
-                                }
-                                if let Some(custom_label) = obj.get("label").and_then(Value::as_str)
-                                {
-                                    label = Some(custom_label.to_string());
-                                }
-                            }
-                        }
-
-                        if cancelled {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &task_cx,
-                                PiMsg::System("Session tree cancelled by extension".to_string()),
-                            )
-                            .await;
-                            return;
-                        }
-
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::OpenTree {
-                                initial_selected_id,
-                                label,
-                            },
-                        )
-                        .await;
-                    });
-
-                    self.status_message = Some("Preparing tree...".to_string());
-                    return None;
-                }
-
                 let Ok(session_guard) = self.session.try_lock() else {
                     self.status_message = Some("Session busy; try again".to_string());
                     return None;
@@ -2225,7 +1862,10 @@ impl PiApp {
                 None
             }
             SlashCommand::Fork => self.handle_slash_fork(args),
-            SlashCommand::Compact => self.handle_slash_compact(args),
+            SlashCommand::Compact => {
+                self.status_message = Some("Compaction is not available in this build".to_string());
+                None
+            }
             SlashCommand::Reload => self.handle_slash_reload(),
             SlashCommand::Template => self.handle_slash_template(args),
             SlashCommand::Share => self.handle_slash_share(args),
@@ -2358,7 +1998,6 @@ impl PiApp {
                 provider,
                 kind: PendingLoginKind::ApiKey,
                 verifier: String::new(),
-                oauth_config: None,
                 device_code: None,
                 redirect_uri: None,
             });
@@ -2368,22 +2007,22 @@ impl PiApp {
             return None;
         }
 
-        // Look up OAuth config: built-in providers or extension-registered OAuth config.
+        // Look up OAuth config for built-in providers.
         let oauth_result = if provider == "anthropic" {
-            crate::auth::start_anthropic_oauth().map(|info| (info, None))
+            crate::auth::start_anthropic_oauth()
         } else if provider == "openai-codex" {
-            crate::auth::start_openai_codex_oauth().map(|info| (info, None))
+            crate::auth::start_openai_codex_oauth()
         } else if provider == "google-gemini-cli" {
-            crate::auth::start_google_gemini_cli_oauth().map(|info| (info, None))
+            crate::auth::start_google_gemini_cli_oauth()
         } else if provider == "google-antigravity" {
-            crate::auth::start_google_antigravity_oauth().map(|info| (info, None))
+            crate::auth::start_google_antigravity_oauth()
         } else if provider == "github-copilot" || provider == "copilot" {
             let client_id = std::env::var("GITHUB_COPILOT_CLIENT_ID").unwrap_or_default();
             let copilot_config = crate::auth::CopilotOAuthConfig {
                 client_id,
                 ..crate::auth::CopilotOAuthConfig::default()
             };
-            crate::auth::start_copilot_browser_oauth(&copilot_config).map(|info| (info, None))
+            crate::auth::start_copilot_browser_oauth(&copilot_config)
         } else if provider == "gitlab" || provider == "gitlab-duo" {
             let client_id = std::env::var("GITLAB_CLIENT_ID").unwrap_or_default();
             let base_url = std::env::var("GITLAB_BASE_URL")
@@ -2393,23 +2032,16 @@ impl PiApp {
                 base_url,
                 ..crate::auth::GitLabOAuthConfig::default()
             };
-            crate::auth::start_gitlab_oauth(&gitlab_config).map(|info| (info, None))
+            crate::auth::start_gitlab_oauth(&gitlab_config)
         } else {
-            // Check extension providers for OAuth config.
-            let ext_oauth = extension_oauth_config_for_provider(&self.available_models, &provider);
-            if let Some(config) = ext_oauth {
-                crate::auth::start_extension_oauth(&provider, &config)
-                    .map(|info| (info, Some(config)))
-            } else {
-                self.status_message = Some(format!(
-                    "Login not supported for {provider} (no built-in flow or OAuth config)"
-                ));
-                return None;
-            }
+            self.status_message = Some(format!(
+                "Login not supported for {provider} (no built-in flow)"
+            ));
+            return None;
         };
 
         match oauth_result {
-            Ok((info, ext_config)) => {
+            Ok(info) => {
                 // Use the pre-bound callback server when the provider already
                 // created one (e.g. Copilot/GitLab with random port).  Otherwise
                 // start a new one for localhost redirect URIs (issue #22).
@@ -2480,7 +2112,6 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                     provider: info.provider,
                     kind: PendingLoginKind::OAuth,
                     verifier: info.verifier,
-                    oauth_config: ext_config,
                     device_code: None,
                     redirect_uri: info.redirect_uri,
                 });
@@ -2638,7 +2269,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             return None;
         }
 
-        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
+        let provider_impl = match providers::create_provider(&next) {
             Ok(provider_impl) => provider_impl,
             Err(err) => {
                 self.status_message = Some(err.to_string());
@@ -2842,27 +2473,13 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let cli = self.resource_cli.clone();
         let cwd = self.cwd.clone();
         let event_tx = self.event_tx.clone();
-        let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
 
         runtime_handle.spawn(async move {
             let manager = PackageManager::new(cwd.clone());
             match ResourceLoader::load(&manager, &cwd, &config, &cli).await {
-                Ok(mut resources) => {
-                    if let Some(manager) = extensions {
-                        let discovered = manager.discover_resources(&cwd, "reload").await;
-                        if !discovered.is_empty() {
-                            if let Err(err) = resources.extend_with_paths(&cwd, &discovered) {
-                                tracing::warn!(
-                                    event = "pi.resources.reload.extension_paths_failed",
-                                    error = %err,
-                                    "Failed to apply extension-discovered resource paths"
-                                );
-                            }
-                        }
-                    }
-
+                Ok(resources) => {
                     let models_error =
                         match crate::auth::AuthStorage::load_async(Config::auth_path()).await {
                             Ok(auth) => {
@@ -3034,7 +2651,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_bash_command, parse_extension_command, should_show_startup_oauth_hint};
+    use super::{parse_bash_command, should_show_startup_oauth_hint};
     use crate::auth::{AuthCredential, AuthStorage};
     use crate::models::ModelEntry;
     use crate::provider::{InputType, Model, ModelCost};
@@ -3074,7 +2691,6 @@ mod tests {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         }
     }
 
@@ -3105,60 +2721,6 @@ mod tests {
         assert_eq!(plan.effective, crate::model::ThinkingLevel::Off);
         assert!(!plan.thinking_changed);
         assert!(plan.persist_needed);
-    }
-
-    #[test]
-    fn parse_ext_cmd_basic() {
-        let result = parse_extension_command("/deploy");
-        assert_eq!(result, Some(("deploy".to_string(), "")));
-    }
-
-    #[test]
-    fn parse_ext_cmd_with_args() {
-        let result = parse_extension_command("/deploy staging fast");
-        assert_eq!(result, Some(("deploy".to_string(), "staging fast")));
-    }
-
-    #[test]
-    fn parse_ext_cmd_builtin_filtered() {
-        assert!(parse_extension_command("/help").is_none());
-        assert!(parse_extension_command("/clear").is_none());
-        assert!(parse_extension_command("/model").is_none());
-        assert!(parse_extension_command("/exit").is_none());
-        assert!(parse_extension_command("/compact").is_none());
-    }
-
-    #[test]
-    fn parse_ext_cmd_no_slash() {
-        assert!(parse_extension_command("deploy").is_none());
-        assert!(parse_extension_command("hello world").is_none());
-    }
-
-    #[test]
-    fn parse_ext_cmd_empty_slash() {
-        assert!(parse_extension_command("/").is_none());
-        assert!(parse_extension_command("/  ").is_none());
-    }
-
-    #[test]
-    fn parse_ext_cmd_whitespace_trimming() {
-        let result = parse_extension_command("  /deploy  arg1  arg2  ");
-        assert_eq!(result, Some(("deploy".to_string(), "arg1  arg2")));
-    }
-
-    #[test]
-    fn parse_ext_cmd_single_arg() {
-        let result = parse_extension_command("/greet world");
-        assert_eq!(result, Some(("greet".to_string(), "world")));
-    }
-
-    #[test]
-    fn parse_ext_cmd_preserves_raw_argument_spacing_and_quotes() {
-        let result = parse_extension_command(r#"/deploy   --message "hello world"   --force"#);
-        assert_eq!(
-            result,
-            Some(("deploy".to_string(), r#"--message "hello world"   --force"#))
-        );
     }
 
     #[test]
@@ -3387,31 +2949,5 @@ mod tests {
         assert!(super::remove_provider_credentials(&mut auth, "gemini"));
         assert!(auth.get("google").is_none());
         assert!(auth.get("gemini").is_none());
-    }
-
-    #[test]
-    fn extension_oauth_config_selection_skips_non_oauth_entries() {
-        let mut no_oauth = test_model_entry("ext-provider", "model-a");
-        no_oauth.oauth_config = None;
-        let mut with_oauth = test_model_entry("ext-provider", "model-b");
-        with_oauth.oauth_config = Some(crate::models::OAuthConfig {
-            auth_url: "https://example.test/oauth/authorize".to_string(),
-            token_url: "https://example.test/oauth/token".to_string(),
-            scopes: vec!["scope:a".to_string()],
-            client_id: "client-id".to_string(),
-            redirect_uri: Some("http://localhost/callback".to_string()),
-        });
-
-        let selected =
-            super::extension_oauth_config_for_provider(&[no_oauth, with_oauth], "ext-provider");
-        let selected = selected.expect("expected oauth config");
-        assert_eq!(selected.auth_url, "https://example.test/oauth/authorize");
-        assert_eq!(selected.token_url, "https://example.test/oauth/token");
-        assert_eq!(selected.client_id, "client-id");
-        assert_eq!(selected.scopes, vec!["scope:a".to_string()]);
-        assert_eq!(
-            selected.redirect_uri.as_deref(),
-            Some("http://localhost/callback")
-        );
     }
 }

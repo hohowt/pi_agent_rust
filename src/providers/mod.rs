@@ -4,31 +4,20 @@
 //! for various LLM APIs.
 
 use crate::error::{Error, Result};
-use crate::extensions::{ExtensionManager, ExtensionRuntimeHandle};
 use crate::http::client::{Client, RequestBuilder};
-use crate::model::{
-    AssistantMessage, AssistantMessageEvent, ContentBlock, StopReason, TextContent, Usage,
-};
 use crate::models::ModelEntry;
-use crate::provider::{Context, Provider, StreamEvent, StreamOptions};
+use crate::provider::Provider;
 use crate::provider_metadata::{
     PROVIDER_METADATA, canonical_provider_id, provider_routing_defaults,
 };
 use crate::vcr::{VCR_ENV_MODE, VcrRecorder};
-use async_trait::async_trait;
-use chrono::Utc;
-use futures::stream;
-use futures::stream::Stream;
-use serde_json::Value;
 use std::collections::HashMap;
 use std::env;
-use std::pin::Pin;
 use std::sync::Arc;
 use url::Url;
 
 pub mod anthropic;
 pub mod azure;
-pub mod bedrock;
 pub mod cohere;
 pub mod copilot;
 pub mod gemini;
@@ -99,34 +88,6 @@ fn vcr_client_if_enabled(base_url: &str) -> Result<Option<Client>> {
     Ok(Some(Client::new().with_vcr(recorder)))
 }
 
-struct ExtensionStreamSimpleProvider {
-    model: crate::provider::Model,
-    runtime: ExtensionRuntimeHandle,
-}
-
-struct ExtensionStreamSimpleState {
-    runtime: ExtensionRuntimeHandle,
-    stream_id: Option<String>,
-    model_id: String,
-    provider: String,
-    api: String,
-    accumulated_text: String,
-    last_message: Option<AssistantMessage>,
-    /// Whether `StreamEvent::Start` + `TextStart` have been emitted for string-chunk mode.
-    string_chunk_started: bool,
-    /// Buffered events to drain before polling the next JS chunk.
-    pending_events: std::collections::VecDeque<StreamEvent>,
-}
-
-impl Drop for ExtensionStreamSimpleState {
-    fn drop(&mut self) {
-        if let Some(stream_id) = self.stream_id.take() {
-            self.runtime
-                .provider_stream_simple_cancel_best_effort(stream_id);
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProviderRouteKind {
     NativeAnthropic,
@@ -137,7 +98,6 @@ enum ProviderRouteKind {
     NativeGoogle,
     NativeGoogleGeminiCli,
     NativeGoogleVertex,
-    NativeBedrock,
     NativeAzure,
     NativeCopilot,
     NativeGitlab,
@@ -161,7 +121,6 @@ impl ProviderRouteKind {
             Self::NativeGoogle => "native:google",
             Self::NativeGoogleGeminiCli => "native:google-gemini-cli",
             Self::NativeGoogleVertex => "native:google-vertex",
-            Self::NativeBedrock => "native:amazon-bedrock",
             Self::NativeAzure => "native:azure-openai",
             Self::NativeCopilot => "native:github-copilot",
             Self::NativeGitlab => "native:gitlab",
@@ -200,7 +159,6 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
         "google" => ProviderRouteKind::NativeGoogle,
         "google-gemini-cli" | "google-antigravity" => ProviderRouteKind::NativeGoogleGeminiCli,
         "google-vertex" | "vertexai" => ProviderRouteKind::NativeGoogleVertex,
-        "amazon-bedrock" | "bedrock" => ProviderRouteKind::NativeBedrock,
         "azure-openai" | "azure" | "azure-cognitive-services" | "azure-openai-responses" => {
             ProviderRouteKind::NativeAzure
         }
@@ -215,7 +173,6 @@ fn resolve_provider_route(entry: &ModelEntry) -> Result<(ProviderRouteKind, Stri
             "google-generative-ai" => ProviderRouteKind::ApiGoogleGenerativeAi,
             "google-gemini-cli" => ProviderRouteKind::ApiGoogleGeminiCli,
             "google-vertex" => ProviderRouteKind::NativeGoogleVertex,
-            "bedrock-converse-stream" => ProviderRouteKind::NativeBedrock,
             "azure-openai-responses" => ProviderRouteKind::NativeAzure,
             _ => {
                 let suggestions = suggest_similar_providers(&entry.model.provider);
@@ -474,437 +431,8 @@ where
     })
 }
 
-impl ExtensionStreamSimpleProvider {
-    const NEXT_TIMEOUT_MS: u64 = 600_000;
-
-    const fn new(model: crate::provider::Model, runtime: ExtensionRuntimeHandle) -> Self {
-        Self { model, runtime }
-    }
-
-    fn build_js_model(model: &crate::provider::Model) -> Value {
-        serde_json::json!({
-            "id": &model.id,
-            "name": &model.name,
-            "api": &model.api,
-            "provider": &model.provider,
-            "baseUrl": &model.base_url,
-            "reasoning": model.reasoning,
-            "input": &model.input,
-            "cost": &model.cost,
-            "contextWindow": model.context_window,
-            "maxTokens": model.max_tokens,
-            "headers": &model.headers,
-        })
-    }
-
-    fn build_js_context(context: &Context<'_>) -> Value {
-        let mut map = serde_json::Map::new();
-        if let Some(system_prompt) = &context.system_prompt {
-            map.insert(
-                "systemPrompt".to_string(),
-                Value::String(system_prompt.to_string()),
-            );
-        }
-        map.insert(
-            "messages".to_string(),
-            serde_json::to_value(&context.messages).unwrap_or(Value::Array(Vec::new())),
-        );
-        if !context.tools.is_empty() {
-            let tools = context
-                .tools
-                .iter()
-                .map(|tool| {
-                    serde_json::json!({
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    })
-                })
-                .collect::<Vec<_>>();
-            map.insert("tools".to_string(), Value::Array(tools));
-        }
-        Value::Object(map)
-    }
-
-    fn build_js_options(options: &StreamOptions) -> Value {
-        let mut map = serde_json::Map::new();
-        if let Some(temp) = options.temperature {
-            map.insert("temperature".to_string(), serde_json::json!(temp));
-        }
-        if let Some(max_tokens) = options.max_tokens {
-            map.insert("maxTokens".to_string(), serde_json::json!(max_tokens));
-        }
-        if let Some(api_key) = &options.api_key {
-            map.insert("apiKey".to_string(), Value::String(api_key.clone()));
-        }
-        if let Some(session_id) = &options.session_id {
-            map.insert("sessionId".to_string(), Value::String(session_id.clone()));
-        }
-        if !options.headers.is_empty() {
-            map.insert(
-                "headers".to_string(),
-                serde_json::to_value(&options.headers)
-                    .unwrap_or_else(|_| Value::Object(serde_json::Map::new())),
-            );
-        }
-        let cache_retention = match options.cache_retention {
-            crate::provider::CacheRetention::None => "none",
-            crate::provider::CacheRetention::Short => "short",
-            crate::provider::CacheRetention::Long => "long",
-        };
-        map.insert(
-            "cacheRetention".to_string(),
-            Value::String(cache_retention.to_string()),
-        );
-        if let Some(level) = options.thinking_level {
-            if level != crate::model::ThinkingLevel::Off {
-                map.insert("reasoning".to_string(), Value::String(level.to_string()));
-            }
-        }
-        if let Some(budgets) = &options.thinking_budgets {
-            map.insert(
-                "thinkingBudgets".to_string(),
-                serde_json::json!({
-                    "minimal": budgets.minimal,
-                    "low": budgets.low,
-                    "medium": budgets.medium,
-                    "high": budgets.high,
-                    "xhigh": budgets.xhigh,
-                }),
-            );
-        }
-        Value::Object(map)
-    }
-
-    fn assistant_event_to_stream_event(event: AssistantMessageEvent) -> StreamEvent {
-        match event {
-            AssistantMessageEvent::Start { partial } => StreamEvent::Start {
-                partial: partial.as_ref().clone(),
-            },
-            AssistantMessageEvent::TextStart { content_index, .. } => {
-                StreamEvent::TextStart { content_index }
-            }
-            AssistantMessageEvent::TextDelta {
-                content_index,
-                delta,
-                ..
-            } => StreamEvent::TextDelta {
-                content_index,
-                delta,
-            },
-            AssistantMessageEvent::TextEnd {
-                content_index,
-                content,
-                ..
-            } => StreamEvent::TextEnd {
-                content_index,
-                content,
-            },
-            AssistantMessageEvent::ThinkingStart { content_index, .. } => {
-                StreamEvent::ThinkingStart { content_index }
-            }
-            AssistantMessageEvent::ThinkingDelta {
-                content_index,
-                delta,
-                ..
-            } => StreamEvent::ThinkingDelta {
-                content_index,
-                delta,
-            },
-            AssistantMessageEvent::ThinkingEnd {
-                content_index,
-                content,
-                ..
-            } => StreamEvent::ThinkingEnd {
-                content_index,
-                content,
-            },
-            AssistantMessageEvent::ToolCallStart { content_index, .. } => {
-                StreamEvent::ToolCallStart { content_index }
-            }
-            AssistantMessageEvent::ToolCallDelta {
-                content_index,
-                delta,
-                ..
-            } => StreamEvent::ToolCallDelta {
-                content_index,
-                delta,
-            },
-            AssistantMessageEvent::ToolCallEnd {
-                content_index,
-                tool_call,
-                ..
-            } => StreamEvent::ToolCallEnd {
-                content_index,
-                tool_call,
-            },
-            AssistantMessageEvent::Done { reason, message } => StreamEvent::Done {
-                reason,
-                message: message.as_ref().clone(),
-            },
-            AssistantMessageEvent::Error { reason, error } => StreamEvent::Error {
-                reason,
-                error: error.as_ref().clone(),
-            },
-        }
-    }
-
-    fn make_partial(model_id: &str, provider: &str, api: &str, text: &str) -> AssistantMessage {
-        AssistantMessage {
-            model: model_id.to_string(),
-            api: api.to_string(),
-            provider: provider.to_string(),
-            content: vec![ContentBlock::Text(TextContent {
-                text: text.to_string(),
-                text_signature: None,
-            })],
-            stop_reason: StopReason::default(),
-            usage: Usage::default(),
-            error_message: None,
-            timestamp: Utc::now().timestamp_millis(),
-        }
-    }
-}
-
 #[allow(clippy::too_many_lines)]
-#[async_trait]
-impl Provider for ExtensionStreamSimpleProvider {
-    #[allow(clippy::misnamed_getters)]
-    fn name(&self) -> &str {
-        &self.model.provider
-    }
-
-    fn api(&self) -> &str {
-        &self.model.api
-    }
-
-    fn model_id(&self) -> &str {
-        &self.model.id
-    }
-
-    async fn stream(
-        &self,
-        context: &Context<'_>,
-        options: &StreamOptions,
-    ) -> Result<Pin<Box<dyn Stream<Item = Result<StreamEvent>> + Send>>> {
-        let model = Self::build_js_model(&self.model);
-        let ctx = Self::build_js_context(context);
-        let opts = Self::build_js_options(options);
-
-        let stream_id = self
-            .runtime
-            .provider_stream_simple_start(
-                self.model.provider.clone(),
-                model,
-                ctx,
-                opts,
-                Self::NEXT_TIMEOUT_MS,
-            )
-            .await?;
-
-        let state = ExtensionStreamSimpleState {
-            runtime: self.runtime.clone(),
-            stream_id: Some(stream_id),
-            model_id: self.model.id.clone(),
-            provider: self.model.provider.clone(),
-            api: self.model.api.clone(),
-            accumulated_text: String::new(),
-            last_message: None,
-            string_chunk_started: false,
-            pending_events: std::collections::VecDeque::new(),
-        };
-
-        let stream = stream::unfold(state, |mut state| async move {
-            // Drain any buffered events before polling JS.
-            if let Some(event) = state.pending_events.pop_front() {
-                return Some((Ok(event), state));
-            }
-
-            let stream_id = state.stream_id.clone()?;
-            let stream_id_for_cancel = stream_id.clone();
-
-            match state
-                .runtime
-                .provider_stream_simple_next(stream_id, Self::NEXT_TIMEOUT_MS)
-                .await
-            {
-                Ok(Some(value)) => {
-                    if let Some(chunk) = value.as_str() {
-                        let chunk = chunk.to_string();
-                        state.accumulated_text.push_str(&chunk);
-                        // Update last_message in-place: mutate existing text
-                        // content instead of rebuilding the entire
-                        // AssistantMessage (avoids 3 String + Vec allocs per
-                        // chunk).
-                        match &mut state.last_message {
-                            Some(msg) => {
-                                if let Some(ContentBlock::Text(t)) = msg.content.first_mut() {
-                                    t.text.clone_from(&state.accumulated_text);
-                                }
-                            }
-                            None => {
-                                state.last_message = Some(Self::make_partial(
-                                    &state.model_id,
-                                    &state.provider,
-                                    &state.api,
-                                    &state.accumulated_text,
-                                ));
-                            }
-                        }
-
-                        // Emit Start + TextStart before first string-chunk TextDelta.
-                        if !state.string_chunk_started {
-                            state.string_chunk_started = true;
-                            state
-                                .pending_events
-                                .push_back(StreamEvent::TextStart { content_index: 0 });
-                            state.pending_events.push_back(StreamEvent::TextDelta {
-                                content_index: 0,
-                                delta: chunk,
-                            });
-                            // Raw string mode still streams deltas chunk-by-chunk, so the
-                            // synthetic Start event must begin empty. Otherwise the agent
-                            // seeds the partial with the first chunk and then appends that
-                            // same first delta again.
-                            return Some((
-                                Ok(StreamEvent::Start {
-                                    partial: Self::make_partial(
-                                        &state.model_id,
-                                        &state.provider,
-                                        &state.api,
-                                        "",
-                                    ),
-                                }),
-                                state,
-                            ));
-                        }
-                        return Some((
-                            Ok(StreamEvent::TextDelta {
-                                content_index: 0,
-                                delta: chunk,
-                            }),
-                            state,
-                        ));
-                    }
-
-                    let event: AssistantMessageEvent = match serde_json::from_value(value) {
-                        Ok(event) => event,
-                        Err(err) => {
-                            state
-                                .runtime
-                                .provider_stream_simple_cancel_best_effort(stream_id_for_cancel);
-                            state.stream_id = None;
-                            return Some((
-                                Err(Error::extension(format!(
-                                    "streamSimple yielded invalid event: {err}"
-                                ))),
-                                state,
-                            ));
-                        }
-                    };
-
-                    match &event {
-                        AssistantMessageEvent::Start { partial }
-                        | AssistantMessageEvent::TextStart { partial, .. }
-                        | AssistantMessageEvent::TextDelta { partial, .. }
-                        | AssistantMessageEvent::TextEnd { partial, .. }
-                        | AssistantMessageEvent::ThinkingStart { partial, .. }
-                        | AssistantMessageEvent::ThinkingDelta { partial, .. }
-                        | AssistantMessageEvent::ThinkingEnd { partial, .. }
-                        | AssistantMessageEvent::ToolCallStart { partial, .. }
-                        | AssistantMessageEvent::ToolCallDelta { partial, .. }
-                        | AssistantMessageEvent::ToolCallEnd { partial, .. } => {
-                            state.last_message = Some(partial.as_ref().clone());
-                        }
-                        AssistantMessageEvent::Done { message, .. } => {
-                            state.last_message = Some(message.as_ref().clone());
-                        }
-                        AssistantMessageEvent::Error { error, .. } => {
-                            state.last_message = Some(error.as_ref().clone());
-                        }
-                    }
-
-                    let stream_event = Self::assistant_event_to_stream_event(event);
-                    if matches!(
-                        stream_event,
-                        StreamEvent::Done { .. } | StreamEvent::Error { .. }
-                    ) {
-                        state
-                            .runtime
-                            .provider_stream_simple_cancel_best_effort(stream_id_for_cancel);
-                        state.stream_id = None;
-                    }
-                    Some((Ok(stream_event), state))
-                }
-                Ok(None) => {
-                    // Stream ended — emit TextEnd (if string chunks were used) then Done.
-                    state.stream_id = None;
-                    let message = state.last_message.clone().unwrap_or_else(|| {
-                        Self::make_partial(
-                            &state.model_id,
-                            &state.provider,
-                            &state.api,
-                            &state.accumulated_text,
-                        )
-                    });
-
-                    if state.string_chunk_started {
-                        // Emit TextEnd before Done.
-                        state.pending_events.push_back(StreamEvent::Done {
-                            reason: StopReason::Stop,
-                            message,
-                        });
-                        Some((
-                            Ok(StreamEvent::TextEnd {
-                                content_index: 0,
-                                content: state.accumulated_text.clone(),
-                            }),
-                            state,
-                        ))
-                    } else {
-                        Some((
-                            Ok(StreamEvent::Done {
-                                reason: StopReason::Stop,
-                                message,
-                            }),
-                            state,
-                        ))
-                    }
-                }
-                Err(err) => {
-                    state
-                        .runtime
-                        .provider_stream_simple_cancel_best_effort(stream_id_for_cancel);
-                    state.stream_id = None;
-                    Some((Err(err), state))
-                }
-            }
-        });
-
-        Ok(Box::pin(stream))
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-pub fn create_provider(
-    entry: &ModelEntry,
-    extensions: Option<&ExtensionManager>,
-) -> Result<Arc<dyn Provider>> {
-    if let Some(manager) = extensions {
-        if manager.provider_has_stream_simple(&entry.model.provider) {
-            let runtime = manager.runtime().ok_or_else(|| {
-                Error::provider(
-                    &entry.model.provider,
-                    "Extension runtime not configured for streamSimple provider",
-                )
-            })?;
-            return Ok(Arc::new(ExtensionStreamSimpleProvider::new(
-                entry.model.clone(),
-                runtime,
-            )));
-        }
-    }
-
+pub fn create_provider(entry: &ModelEntry) -> Result<Arc<dyn Provider>> {
     let (route, canonical_provider, effective_api) = resolve_provider_route(entry)?;
     let vcr_client = vcr_client_if_enabled(&entry.model.base_url)?;
     let client = vcr_client.unwrap_or_else(Client::new);
@@ -993,13 +521,6 @@ pub fn create_provider(
                     .with_client(client),
             ))
         }
-        ProviderRouteKind::NativeBedrock => Ok(Arc::new(
-            bedrock::BedrockProvider::new(&entry.model.id)
-                .with_provider_name(&entry.model.provider)
-                .with_base_url(&entry.model.base_url)
-                .with_compat(entry.compat.clone())
-                .with_client(client),
-        )),
         ProviderRouteKind::NativeAzure => {
             let runtime = resolve_azure_provider_runtime(entry)?;
             Ok(Arc::new(
@@ -1241,16 +762,6 @@ pub fn normalize_cohere_base(base_url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extensions::{ExtensionManager, JsExtensionLoadSpec, JsExtensionRuntimeHandle};
-    use crate::extensions_js::PiJsRuntimeConfig;
-    use crate::model::{ContentBlock, Message, UserContent, UserMessage};
-    use crate::tools::ToolRegistry;
-    use asupersync::runtime::RuntimeBuilder;
-    use asupersync::time::{sleep, wall_now};
-    use futures::StreamExt;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tempfile::tempdir;
 
     #[test]
     fn vcr_loopback_detection_covers_provider_factory_mock_hosts() {
@@ -1261,506 +772,6 @@ mod tests {
         assert!(!base_url_targets_loopback("https://api.openai.com/v1"));
         assert!(!base_url_targets_loopback("http://127.example.com/v1"));
         assert!(!base_url_targets_loopback("not a url"));
-    }
-
-    const STREAM_SIMPLE_EXTENSION: &str = r#"
-export default function init(pi) {
-  pi.registerProvider("stream-provider", {
-    baseUrl: "https://api.example.test",
-    apiKey: "EXAMPLE_KEY",
-    api: "custom-api",
-    models: [
-      { id: "stream-model", name: "Stream Model", contextWindow: 100, maxTokens: 10, input: ["text"] }
-    ],
-    streamSimple: async function* (model, context, options) {
-      if (!model || !model.baseUrl || !model.maxTokens || !model.contextWindow) {
-        throw new Error("bad model shape");
-      }
-      if (!context || !Array.isArray(context.messages)) {
-        throw new Error("bad context shape");
-      }
-      if (!options || !options.signal) {
-        throw new Error("missing abort signal");
-      }
-
-      const partial = {
-        role: "assistant",
-        content: [{ type: "text", text: "" }],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        stopReason: "stop",
-        timestamp: 0
-      };
-
-      yield { type: "start", partial };
-      yield { type: "text_start", contentIndex: 0, partial };
-      partial.content[0].text += "hi";
-      yield { type: "text_delta", contentIndex: 0, delta: "hi", partial };
-      yield { type: "done", reason: "stop", message: partial };
-    }
-  });
-}
-"#;
-
-    const STREAM_SIMPLE_CANCEL_EXTENSION: &str = r#"
-export default function init(pi) {
-  pi.registerProvider("cancel-provider", {
-    baseUrl: "https://api.example.test",
-    apiKey: "EXAMPLE_KEY",
-    api: "custom-api",
-    models: [
-      { id: "cancel-model", name: "Cancel Model", contextWindow: 100, maxTokens: 10, input: ["text"] }
-    ],
-    streamSimple: async function* (model, context, options) {
-      const partial = {
-        role: "assistant",
-        content: [{ type: "text", text: "" }],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        stopReason: "stop",
-        timestamp: 0
-      };
-
-      try {
-        yield { type: "start", partial };
-        await new Promise((resolve) => {
-          if (options && options.signal && options.signal.aborted) return resolve();
-          if (options && options.signal && typeof options.signal.addEventListener === "function") {
-            options.signal.addEventListener("abort", () => resolve());
-          }
-        });
-      } finally {
-        await pi.tool("write", { path: "cancelled.txt", content: "ok" });
-      }
-    }
-  });
-}
-"#;
-
-    async fn load_extension(
-        source: &str,
-        allow_write: bool,
-    ) -> (tempfile::TempDir, ExtensionManager) {
-        let dir = tempdir().expect("tempdir");
-        let entry_path = dir.path().join("ext.mjs");
-        std::fs::write(&entry_path, source).expect("write extension");
-
-        let manager = ExtensionManager::new();
-        let tools = if allow_write {
-            Arc::new(ToolRegistry::new(&["write"], dir.path(), None))
-        } else {
-            Arc::new(ToolRegistry::new(&[], dir.path(), None))
-        };
-
-        let js_runtime = JsExtensionRuntimeHandle::start(
-            PiJsRuntimeConfig {
-                cwd: dir.path().display().to_string(),
-                ..Default::default()
-            },
-            Arc::clone(&tools),
-            manager.clone(),
-        )
-        .await
-        .expect("start js runtime");
-        manager.set_js_runtime(js_runtime);
-
-        let spec = JsExtensionLoadSpec::from_entry_path(&entry_path).expect("load spec");
-        manager
-            .load_js_extensions(vec![spec])
-            .await
-            .expect("load extension");
-
-        (dir, manager)
-    }
-
-    fn basic_context() -> Context<'static> {
-        Context {
-            system_prompt: Some("system".to_string().into()),
-            messages: vec![Message::User(UserMessage {
-                content: UserContent::Text("hello".to_string()),
-                timestamp: 0,
-            })]
-            .into(),
-            tools: Vec::new().into(),
-        }
-    }
-
-    fn basic_options() -> StreamOptions {
-        StreamOptions {
-            api_key: Some("sk-test".to_string()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn extension_stream_simple_provider_emits_assistant_events() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async move {
-            let (_dir, manager) = load_extension(STREAM_SIMPLE_EXTENSION, false).await;
-            let entries = manager.extension_model_entries();
-            assert_eq!(entries.len(), 1);
-            let entry = entries
-                .iter()
-                .find(|e| e.model.provider == "stream-provider")
-                .expect("stream-provider entry");
-
-            let provider = create_provider(entry, Some(&manager)).expect("create provider");
-            assert_eq!(provider.name(), "stream-provider");
-
-            let ctx = basic_context();
-            let opts = basic_options();
-            let mut stream = provider.stream(&ctx, &opts).await.expect("stream");
-
-            let mut saw_start = false;
-            let mut saw_text_delta = false;
-            while let Some(item) = stream.next().await {
-                let event = item.expect("stream event");
-                match event {
-                    StreamEvent::Start { .. } => {
-                        saw_start = true;
-                    }
-                    StreamEvent::TextDelta { delta, .. } => {
-                        assert_eq!(delta, "hi");
-                        saw_text_delta = true;
-                    }
-                    StreamEvent::Done { reason, message } => {
-                        assert_eq!(reason, StopReason::Stop);
-                        let text = match &message.content[0] {
-                            ContentBlock::Text(text) => text,
-                            other => unreachable!("expected text content block, got {other:?}"),
-                        };
-                        assert_eq!(text.text, "hi");
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            assert!(saw_start, "expected a Start event");
-            assert!(saw_text_delta, "expected a TextDelta event");
-        });
-    }
-
-    #[test]
-    fn extension_stream_simple_provider_drop_cancels_js_stream() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async move {
-            let (dir, manager) = load_extension(STREAM_SIMPLE_CANCEL_EXTENSION, true).await;
-            let entries = manager.extension_model_entries();
-            assert_eq!(entries.len(), 1);
-            let entry = entries
-                .iter()
-                .find(|e| e.model.provider == "cancel-provider")
-                .expect("cancel-provider entry");
-
-            let provider = create_provider(entry, Some(&manager)).expect("create provider");
-            let ctx = basic_context();
-            let opts = basic_options();
-            let mut stream = provider.stream(&ctx, &opts).await.expect("stream");
-
-            let first = stream.next().await.expect("first event");
-            let _ = first.expect("first event ok");
-            drop(stream);
-
-            let out_path = dir.path().join("cancelled.txt");
-            for _ in 0..200 {
-                if out_path.exists() {
-                    let contents = std::fs::read_to_string(&out_path).expect("read cancelled.txt");
-                    assert_eq!(contents, "ok");
-                    return;
-                }
-                sleep(wall_now(), Duration::from_millis(5)).await;
-            }
-
-            assert!(
-                out_path.exists(),
-                "expected cancelled.txt to be created after stream drop/cancel"
-            );
-        });
-    }
-
-    // ========================================================================
-    // Additional tests for bd-izzp
-    // ========================================================================
-
-    const STREAM_SIMPLE_MULTI_CHUNK: &str = r#"
-export default function init(pi) {
-  pi.registerProvider("multi-chunk-provider", {
-    baseUrl: "https://api.example.test",
-    apiKey: "EXAMPLE_KEY",
-    api: "custom-api",
-    models: [
-      { id: "multi-model", name: "Multi Model", contextWindow: 100, maxTokens: 10, input: ["text"] }
-    ],
-    streamSimple: async function* (model, context, options) {
-      const partial = {
-        role: "assistant",
-        content: [{ type: "text", text: "" }],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        stopReason: "stop",
-        timestamp: 0
-      };
-
-      yield { type: "start", partial };
-      yield { type: "text_start", contentIndex: 0, partial };
-
-      const chunks = ["Hello", ", ", "world", "!"];
-      for (const chunk of chunks) {
-        partial.content[0].text += chunk;
-        yield { type: "text_delta", contentIndex: 0, delta: chunk, partial };
-      }
-
-      yield { type: "text_end", contentIndex: 0, content: partial.content[0].text, partial };
-      yield { type: "done", reason: "stop", message: partial };
-    }
-  });
-}
-"#;
-
-    const STREAM_SIMPLE_ERROR: &str = r#"
-export default function init(pi) {
-  pi.registerProvider("error-provider", {
-    baseUrl: "https://api.example.test",
-    apiKey: "EXAMPLE_KEY",
-    api: "custom-api",
-    models: [
-      { id: "error-model", name: "Error Model", contextWindow: 100, maxTokens: 10, input: ["text"] }
-    ],
-    streamSimple: async function* (model, context, options) {
-      const partial = {
-        role: "assistant",
-        content: [{ type: "text", text: "" }],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        stopReason: "stop",
-        timestamp: 0
-      };
-
-      yield { type: "start", partial };
-      throw new Error("simulated JS error during streaming");
-    }
-  });
-}
-"#;
-
-    const STREAM_SIMPLE_UNICODE: &str = r#"
-export default function init(pi) {
-  pi.registerProvider("unicode-provider", {
-    baseUrl: "https://api.example.test",
-    apiKey: "EXAMPLE_KEY",
-    api: "custom-api",
-    models: [
-      { id: "unicode-model", name: "Unicode Model", contextWindow: 100, maxTokens: 10, input: ["text"] }
-    ],
-    streamSimple: async function* (model, context, options) {
-      const partial = {
-        role: "assistant",
-        content: [{ type: "text", text: "" }],
-        api: model.api,
-        provider: model.provider,
-        model: model.id,
-        usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
-        stopReason: "stop",
-        timestamp: 0
-      };
-
-      yield { type: "start", partial };
-      yield { type: "text_start", contentIndex: 0, partial };
-      partial.content[0].text = "日本語テスト 🦀";
-      yield { type: "text_delta", contentIndex: 0, delta: "日本語テスト 🦀", partial };
-      yield { type: "done", reason: "stop", message: partial };
-    }
-  });
-}
-"#;
-
-    #[test]
-    fn extension_stream_simple_multiple_chunks_in_order() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async move {
-            let (_dir, manager) = load_extension(STREAM_SIMPLE_MULTI_CHUNK, false).await;
-            let entries = manager.extension_model_entries();
-            let entry = entries
-                .iter()
-                .find(|e| e.model.provider == "multi-chunk-provider")
-                .expect("multi-chunk-provider entry");
-
-            let provider = create_provider(entry, Some(&manager)).expect("create provider");
-            let ctx = basic_context();
-            let opts = basic_options();
-            let mut stream = provider.stream(&ctx, &opts).await.expect("stream");
-
-            let mut deltas = Vec::new();
-            let mut final_text = String::new();
-            while let Some(item) = stream.next().await {
-                let event = item.expect("stream event");
-                match event {
-                    StreamEvent::TextDelta { delta, .. } => {
-                        deltas.push(delta);
-                    }
-                    StreamEvent::Done { message, .. } => {
-                        let text = match &message.content[0] {
-                            ContentBlock::Text(text) => text,
-                            other => unreachable!("expected text content block, got {other:?}"),
-                        };
-                        final_text = text.text.clone();
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            assert_eq!(deltas, vec!["Hello", ", ", "world", "!"]);
-            assert_eq!(final_text, "Hello, world!");
-        });
-    }
-
-    #[test]
-    fn extension_stream_simple_js_error_propagates() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async move {
-            let (_dir, manager) = load_extension(STREAM_SIMPLE_ERROR, false).await;
-            let entries = manager.extension_model_entries();
-            let entry = entries
-                .iter()
-                .find(|e| e.model.provider == "error-provider")
-                .expect("error-provider entry");
-
-            let provider = create_provider(entry, Some(&manager)).expect("create provider");
-            let ctx = basic_context();
-            let opts = basic_options();
-            let mut stream = provider.stream(&ctx, &opts).await.expect("stream");
-
-            let mut saw_start = false;
-            let mut saw_error = false;
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(StreamEvent::Start { .. }) => {
-                        saw_start = true;
-                    }
-                    Err(err) => {
-                        // JS error should propagate as an extension error.
-                        let msg = err.to_string();
-                        assert!(
-                            msg.contains("simulated JS error") || msg.contains("error"),
-                            "expected JS error message, got: {msg}"
-                        );
-                        saw_error = true;
-                        break;
-                    }
-                    Ok(StreamEvent::Error { .. }) => {
-                        saw_error = true;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-
-            assert!(saw_start, "expected a Start event before error");
-            assert!(saw_error, "expected JS error to propagate");
-        });
-    }
-
-    #[test]
-    fn extension_stream_simple_unicode_content() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async move {
-            let (_dir, manager) = load_extension(STREAM_SIMPLE_UNICODE, false).await;
-            let entries = manager.extension_model_entries();
-            let entry = entries
-                .iter()
-                .find(|e| e.model.provider == "unicode-provider")
-                .expect("unicode-provider entry");
-
-            let provider = create_provider(entry, Some(&manager)).expect("create provider");
-            let ctx = basic_context();
-            let opts = basic_options();
-            let mut stream = provider.stream(&ctx, &opts).await.expect("stream");
-
-            let mut saw_unicode = false;
-            while let Some(item) = stream.next().await {
-                let event = item.expect("stream event");
-                match event {
-                    StreamEvent::TextDelta { delta, .. } => {
-                        assert_eq!(delta, "日本語テスト 🦀");
-                        saw_unicode = true;
-                    }
-                    StreamEvent::Done { .. } => break,
-                    _ => {}
-                }
-            }
-
-            assert!(saw_unicode, "expected unicode text delta");
-        });
-    }
-
-    #[test]
-    fn extension_stream_simple_provider_name_and_model() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async move {
-            let (_dir, manager) = load_extension(STREAM_SIMPLE_EXTENSION, false).await;
-            let entries = manager.extension_model_entries();
-            let entry = entries
-                .iter()
-                .find(|e| e.model.provider == "stream-provider")
-                .expect("stream-provider entry");
-
-            let provider = create_provider(entry, Some(&manager)).expect("create provider");
-            assert_eq!(provider.name(), "stream-provider");
-            assert_eq!(provider.model_id(), "stream-model");
-            assert_eq!(provider.api(), "custom-api");
-        });
-    }
-
-    #[test]
-    fn create_provider_returns_extension_provider_for_stream_simple() {
-        let runtime = RuntimeBuilder::current_thread()
-            .build()
-            .expect("runtime build");
-
-        runtime.block_on(async move {
-            let (_dir, manager) = load_extension(STREAM_SIMPLE_EXTENSION, false).await;
-            let entries = manager.extension_model_entries();
-            let entry = entries
-                .iter()
-                .find(|e| e.model.provider == "stream-provider")
-                .expect("stream-provider entry");
-
-            // With extensions, should create ExtensionStreamSimpleProvider.
-            let provider = create_provider(entry, Some(&manager));
-            assert!(provider.is_ok());
-
-            // Without extensions, should fail (unknown provider).
-            let provider_no_ext = create_provider(entry, None);
-            assert!(provider_no_ext.is_err());
-        });
     }
 
     // ========================================================================
@@ -1795,7 +806,6 @@ export default function init(pi) {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         }
     }
 
@@ -2111,7 +1121,7 @@ export default function init(pi) {
             "claude-sonnet-4-5",
             "https://api.anthropic.com",
         );
-        let provider = create_provider(&entry, None).expect("anthropic provider");
+        let provider = create_provider(&entry).expect("anthropic provider");
         assert_eq!(provider.name(), "anthropic");
         assert_eq!(provider.model_id(), "claude-sonnet-4-5");
         assert_eq!(provider.api(), "anthropic-messages");
@@ -2125,7 +1135,7 @@ export default function init(pi) {
             "gpt-4o",
             "https://api.openai.com/v1",
         );
-        let provider = create_provider(&entry, None).expect("openai completions provider");
+        let provider = create_provider(&entry).expect("openai completions provider");
         assert_eq!(provider.name(), "openai");
         assert_eq!(provider.model_id(), "gpt-4o");
     }
@@ -2138,7 +1148,7 @@ export default function init(pi) {
             "gpt-4o",
             "https://api.openai.com/v1",
         );
-        let provider = create_provider(&entry, None).expect("openai responses provider");
+        let provider = create_provider(&entry).expect("openai responses provider");
         assert_eq!(provider.name(), "openai");
         assert_eq!(provider.model_id(), "gpt-4o");
     }
@@ -2147,7 +1157,7 @@ export default function init(pi) {
     fn create_provider_openai_defaults_to_responses() {
         // When api is not "openai-completions", OpenAI defaults to Responses API
         let entry = model_entry("openai", "openai", "gpt-4o", "https://api.openai.com/v1");
-        let provider = create_provider(&entry, None).expect("openai default responses provider");
+        let provider = create_provider(&entry).expect("openai default responses provider");
         assert_eq!(provider.name(), "openai");
     }
 
@@ -2159,7 +1169,7 @@ export default function init(pi) {
             "gemini-2.0-flash",
             "https://generativelanguage.googleapis.com",
         );
-        let provider = create_provider(&entry, None).expect("google provider");
+        let provider = create_provider(&entry).expect("google provider");
         assert_eq!(provider.name(), "google");
         assert_eq!(provider.model_id(), "gemini-2.0-flash");
     }
@@ -2172,7 +1182,7 @@ export default function init(pi) {
             "command-r-plus",
             "https://api.cohere.com/v2",
         );
-        let provider = create_provider(&entry, None).expect("cohere provider");
+        let provider = create_provider(&entry).expect("cohere provider");
         assert_eq!(provider.name(), "cohere");
         assert_eq!(provider.model_id(), "command-r-plus");
     }
@@ -2185,7 +1195,7 @@ export default function init(pi) {
             "gpt-4o",
             "https://myresource.openai.azure.com",
         );
-        let provider = create_provider(&entry, None).expect("azure provider");
+        let provider = create_provider(&entry).expect("azure provider");
         assert_eq!(provider.name(), "azure-openai");
         assert_eq!(provider.api(), "azure-openai");
         assert!(!provider.model_id().is_empty());
@@ -2199,7 +1209,7 @@ export default function init(pi) {
             "gpt-4o-mini",
             "https://myresource.cognitiveservices.azure.com",
         );
-        let provider = create_provider(&entry, None).expect("azure cognitive provider");
+        let provider = create_provider(&entry).expect("azure cognitive provider");
         assert_eq!(provider.name(), "azure-cognitive-services");
         assert_eq!(provider.api(), "azure-openai");
         assert!(!provider.model_id().is_empty());
@@ -2213,7 +1223,7 @@ export default function init(pi) {
             "@cf/meta/llama-3.1-8b-instruct",
             "https://api.cloudflare.com/client/v4/accounts/test-account/ai/v1",
         );
-        let provider = create_provider(&entry, None).expect("cloudflare workers provider");
+        let provider = create_provider(&entry).expect("cloudflare workers provider");
         assert_eq!(provider.name(), "cloudflare-workers-ai");
         assert_eq!(provider.api(), "openai-completions");
         assert_eq!(provider.model_id(), "@cf/meta/llama-3.1-8b-instruct");
@@ -2227,7 +1237,7 @@ export default function init(pi) {
             "gpt-4o-mini",
             "https://gateway.ai.cloudflare.com/v1/account-id/gateway-id/openai",
         );
-        let provider = create_provider(&entry, None).expect("cloudflare gateway provider");
+        let provider = create_provider(&entry).expect("cloudflare gateway provider");
         assert_eq!(provider.name(), "cloudflare-ai-gateway");
         assert_eq!(provider.api(), "openai-completions");
         assert_eq!(provider.model_id(), "gpt-4o-mini");
@@ -2243,7 +1253,7 @@ export default function init(pi) {
             "my-model",
             "https://custom.api.com",
         );
-        let provider = create_provider(&entry, None).expect("fallback anthropic provider");
+        let provider = create_provider(&entry).expect("fallback anthropic provider");
         // Anthropic fallback uses the standard anthropic provider
         assert_eq!(provider.model_id(), "my-model");
     }
@@ -2256,7 +1266,7 @@ export default function init(pi) {
             "local-model",
             "http://localhost:8080/v1",
         );
-        let provider = create_provider(&entry, None).expect("fallback openai completions");
+        let provider = create_provider(&entry).expect("fallback openai completions");
         assert_eq!(provider.model_id(), "local-model");
     }
 
@@ -2268,7 +1278,7 @@ export default function init(pi) {
             "local-model",
             "http://localhost:8080/v1",
         );
-        let provider = create_provider(&entry, None).expect("fallback openai responses");
+        let provider = create_provider(&entry).expect("fallback openai responses");
         assert_eq!(provider.model_id(), "local-model");
     }
 
@@ -2280,7 +1290,7 @@ export default function init(pi) {
             "custom-r",
             "https://custom-cohere.api.com/v2",
         );
-        let provider = create_provider(&entry, None).expect("fallback cohere provider");
+        let provider = create_provider(&entry).expect("fallback cohere provider");
         assert_eq!(provider.model_id(), "custom-r");
     }
 
@@ -2292,7 +1302,7 @@ export default function init(pi) {
             "custom-gemini",
             "https://custom.google.com",
         );
-        let provider = create_provider(&entry, None).expect("fallback google provider");
+        let provider = create_provider(&entry).expect("fallback google provider");
         assert_eq!(provider.model_id(), "custom-gemini");
     }
 
@@ -2320,7 +1330,7 @@ export default function init(pi) {
             "some-model",
             "https://example.com",
         );
-        let Err(err) = create_provider(&entry, None) else {
+        let Err(err) = create_provider(&entry) else {
             panic!();
         };
         let msg = err.to_string();
@@ -2799,7 +1809,7 @@ export default function init(pi) {
             "https://api.anthropic.com",
             compat_with_custom_headers(),
         );
-        let provider = create_provider(&entry, None).expect("anthropic with compat");
+        let provider = create_provider(&entry).expect("anthropic with compat");
         assert_eq!(provider.name(), "anthropic");
     }
 
@@ -2817,7 +1827,7 @@ export default function init(pi) {
                 ..Default::default()
             },
         );
-        let provider = create_provider(&entry, None).expect("openai completions with compat");
+        let provider = create_provider(&entry).expect("openai completions with compat");
         assert_eq!(provider.name(), "openai");
     }
 
@@ -2830,7 +1840,7 @@ export default function init(pi) {
             "https://api.openai.com/v1",
             compat_with_custom_headers(),
         );
-        let provider = create_provider(&entry, None).expect("openai responses with compat");
+        let provider = create_provider(&entry).expect("openai responses with compat");
         assert_eq!(provider.name(), "openai");
     }
 
@@ -2843,7 +1853,7 @@ export default function init(pi) {
             "https://api.cohere.com/v2",
             compat_with_custom_headers(),
         );
-        let provider = create_provider(&entry, None).expect("cohere with compat");
+        let provider = create_provider(&entry).expect("cohere with compat");
         assert_eq!(provider.name(), "cohere");
     }
 
@@ -2856,7 +1866,7 @@ export default function init(pi) {
             "https://generativelanguage.googleapis.com",
             compat_with_custom_headers(),
         );
-        let provider = create_provider(&entry, None).expect("google with compat");
+        let provider = create_provider(&entry).expect("google with compat");
         assert_eq!(provider.name(), "google");
     }
 
@@ -2870,7 +1880,7 @@ export default function init(pi) {
             "https://custom.api.com",
             compat_with_custom_headers(),
         );
-        let provider = create_provider(&entry, None).expect("fallback anthropic with compat");
+        let provider = create_provider(&entry).expect("fallback anthropic with compat");
         assert_eq!(provider.model_id(), "my-model");
 
         // Custom provider using openai-completions API fallback
@@ -2881,7 +1891,7 @@ export default function init(pi) {
             "http://localhost:8080/v1",
             compat_with_custom_headers(),
         );
-        let provider = create_provider(&entry, None).expect("fallback openai with compat");
+        let provider = create_provider(&entry).expect("fallback openai with compat");
         assert_eq!(provider.model_id(), "llama-3.1");
 
         // Custom provider using cohere-chat API fallback
@@ -2892,7 +1902,7 @@ export default function init(pi) {
             "https://custom-cohere.api.com/v2",
             compat_with_custom_headers(),
         );
-        let provider = create_provider(&entry, None).expect("fallback cohere with compat");
+        let provider = create_provider(&entry).expect("fallback cohere with compat");
         assert_eq!(provider.model_id(), "custom-r");
 
         // Custom provider using google-generative-ai API fallback
@@ -2903,7 +1913,7 @@ export default function init(pi) {
             "https://custom.google.com",
             compat_with_custom_headers(),
         );
-        let provider = create_provider(&entry, None).expect("fallback google with compat");
+        let provider = create_provider(&entry).expect("fallback google with compat");
         assert_eq!(provider.model_id(), "custom-gemini");
     }
 
@@ -2962,7 +1972,7 @@ export default function init(pi) {
             "gemini-2.0-flash",
             "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash",
         );
-        let provider = create_provider(&entry, None).expect("google-vertex from full URL");
+        let provider = create_provider(&entry).expect("google-vertex from full URL");
         assert_eq!(provider.name(), "google-vertex");
         assert_eq!(provider.api(), "google-vertex");
         assert_eq!(provider.model_id(), "gemini-2.0-flash");
@@ -2976,8 +1986,7 @@ export default function init(pi) {
             "claude-sonnet-4-5",
             "https://us-east5-aiplatform.googleapis.com/v1/projects/my-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5",
         );
-        let provider =
-            create_provider(&entry, None).expect("google-vertex with anthropic publisher");
+        let provider = create_provider(&entry).expect("google-vertex with anthropic publisher");
         assert_eq!(provider.name(), "google-vertex");
         assert_eq!(provider.model_id(), "claude-sonnet-4-5");
     }
@@ -2991,7 +2000,7 @@ export default function init(pi) {
             "https://us-central1-aiplatform.googleapis.com/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.0-flash",
             compat_with_custom_headers(),
         );
-        let provider = create_provider(&entry, None).expect("google-vertex with compat");
+        let provider = create_provider(&entry).expect("google-vertex with compat");
         assert_eq!(provider.name(), "google-vertex");
     }
 
@@ -3024,7 +2033,7 @@ export default function init(pi) {
                 entry.compat.is_none(),
                 "expected None compat for {provider}"
             );
-            let result = create_provider(&entry, None);
+            let result = create_provider(&entry);
             assert!(
                 result.is_ok(),
                 "create_provider failed for {provider} with None compat: {:?}",

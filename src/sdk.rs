@@ -41,7 +41,6 @@ pub use crate::agent::{
 };
 pub use crate::config::Config;
 pub use crate::error::{Error, Result};
-pub use crate::extensions::{ExtensionManager, ExtensionPolicy, ExtensionRegion};
 pub use crate::model::ThinkingLevel;
 pub use crate::model::{
     AssistantMessage, ContentBlock, Cost, CustomMessage, ImageContent, Message, StopReason,
@@ -292,9 +291,6 @@ pub struct SessionOptions {
     pub no_session: bool,
     pub session_path: Option<PathBuf>,
     pub session_dir: Option<PathBuf>,
-    pub extension_paths: Vec<PathBuf>,
-    pub extension_policy: Option<String>,
-    pub repair_policy: Option<String>,
     pub include_cwd_in_prompt: bool,
     pub max_tool_iterations: usize,
 
@@ -346,9 +342,6 @@ impl Default for SessionOptions {
             no_session: true,
             session_path: None,
             session_dir: None,
-            extension_paths: Vec::new(),
-            extension_policy: None,
-            repair_policy: None,
             include_cwd_in_prompt: true,
             max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
             tool_factory: None,
@@ -605,15 +598,6 @@ pub struct RpcExportHtmlResult {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct RpcLastAssistantText {
     pub text: Option<String>,
-}
-
-/// Extension UI response payload used by RPC `extension_ui_response`.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum RpcExtensionUiResponse {
-    Value { value: Value },
-    Confirmed { confirmed: bool },
-    Cancelled,
 }
 
 /// Process-boundary transport options for SDK callers that prefer RPC mode.
@@ -1004,39 +988,6 @@ impl RpcTransportClient {
         Ok(payload.commands)
     }
 
-    pub async fn extension_ui_response(
-        &mut self,
-        request_id: &str,
-        response: RpcExtensionUiResponse,
-    ) -> Result<bool> {
-        #[derive(Deserialize)]
-        struct ExtensionUiResolvedPayload {
-            resolved: bool,
-        }
-
-        let mut payload = Map::new();
-        payload.insert(
-            "requestId".to_string(),
-            Value::String(request_id.to_string()),
-        );
-
-        match response {
-            RpcExtensionUiResponse::Value { value } => {
-                payload.insert("value".to_string(), value);
-            }
-            RpcExtensionUiResponse::Confirmed { confirmed } => {
-                payload.insert("confirmed".to_string(), Value::Bool(confirmed));
-            }
-            RpcExtensionUiResponse::Cancelled => {
-                payload.insert("cancelled".to_string(), Value::Bool(true));
-            }
-        }
-
-        let response: Option<ExtensionUiResolvedPayload> =
-            self.request_typed("extension_ui_response", payload).await?;
-        Ok(response.is_none_or(|payload| payload.resolved))
-    }
-
     pub async fn prompt(&mut self, message: impl Into<String>) -> Result<Vec<Value>> {
         self.prompt_with_options(message, None, None).await
     }
@@ -1298,30 +1249,6 @@ impl AgentSessionHandle {
     /// `on_stream_event`) after session creation.
     pub const fn listeners_mut(&mut self) -> &mut EventListeners {
         &mut self.listeners
-    }
-
-    // -----------------------------------------------------------------
-    // Extensions & Capability Policy
-    // -----------------------------------------------------------------
-
-    /// Whether this session has extensions loaded.
-    pub const fn has_extensions(&self) -> bool {
-        self.session.extensions.is_some()
-    }
-
-    /// Return a reference to the extension manager (if extensions are loaded).
-    pub fn extension_manager(&self) -> Option<&ExtensionManager> {
-        self.session
-            .extensions
-            .as_ref()
-            .map(ExtensionRegion::manager)
-    }
-
-    /// Return a reference to the extension region (if extensions are loaded).
-    ///
-    /// The region wraps the extension manager with lifecycle management.
-    pub const fn extension_region(&self) -> Option<&ExtensionRegion> {
-        self.session.extensions.as_ref()
     }
 
     // -----------------------------------------------------------------
@@ -1747,7 +1674,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
     )
     .map_err(|err| Error::validation(err.to_string()))?;
 
-    let provider = providers::create_provider(&selection.model_entry, None)
+    let provider = providers::create_provider(&selection.model_entry)
         .map_err(|e| Error::provider("sdk", e.to_string()))?;
 
     let api_key = app::resolve_api_key(&auth, &cli, &selection.model_entry)
@@ -1761,7 +1688,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         max_tool_iterations: options.max_tool_iterations,
         stream_options,
         block_images: config.image_block_images(),
-        fail_closed_hooks: config.fail_closed_hooks(),
+        fail_closed_hooks: false,
         tool_approval: None,
     };
 
@@ -1790,30 +1717,6 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         compaction_settings,
     );
     agent_session.set_api_key_override(options.api_key.clone());
-
-    if !options.extension_paths.is_empty() {
-        let extension_paths = options
-            .extension_paths
-            .iter()
-            .map(|path| resolve_path_for_cwd(path, &cwd))
-            .collect::<Vec<_>>();
-        let resolved_ext_policy =
-            config.resolve_extension_policy_with_metadata(options.extension_policy.as_deref());
-        let resolved_repair_policy =
-            config.resolve_repair_policy_with_metadata(options.repair_policy.as_deref());
-
-        agent_session
-            .enable_extensions_with_policy(
-                &enabled_tools,
-                &cwd,
-                Some(&config),
-                &extension_paths,
-                Some(resolved_ext_policy.policy),
-                Some(resolved_repair_policy.effective_mode),
-                None,
-            )
-            .await?;
-    }
 
     agent_session.set_model_registry(model_registry.clone());
     agent_session.set_auth_storage(auth);
@@ -2110,7 +2013,7 @@ mod tests {
         let entry = registry
             .find("anthropic", "claude-sonnet-4-5")
             .expect("anthropic model in registry");
-        let provider = providers::create_provider(&entry, None).expect("create anthropic provider");
+        let provider = providers::create_provider(&entry).expect("create anthropic provider");
         let tools = crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None);
         let agent = Agent::new(
             provider,
@@ -2218,12 +2121,11 @@ mod tests {
             headers: HashMap::new(),
             auth_header: false,
             compat: None,
-            oauth_config: None,
         }]);
         let entry = registry
             .find("anthropic", "claude-sonnet-4-5")
             .expect("anthropic model in registry");
-        let provider = providers::create_provider(&entry, None).expect("create anthropic provider");
+        let provider = providers::create_provider(&entry).expect("create anthropic provider");
         let tools = crate::tools::ToolRegistry::new(&[], std::path::Path::new("."), None);
         let agent = Agent::new(
             provider,
@@ -2578,24 +2480,6 @@ mod tests {
         let debug = format!("{listeners:?}");
         assert!(debug.contains("subscriber_count"));
         assert!(debug.contains("has_on_tool_start"));
-    }
-
-    // =====================================================================
-    // Extension convenience method tests
-    // =====================================================================
-
-    #[test]
-    fn has_extensions_false_by_default() {
-        let tmp = tempdir().expect("tempdir");
-        let options = hermetic_session_options(tmp.path());
-
-        let handle = run_async(create_agent_session(options)).expect("create session");
-        assert!(
-            !handle.has_extensions(),
-            "session without extension_paths should have no extensions"
-        );
-        assert!(handle.extension_manager().is_none());
-        assert!(handle.extension_region().is_none());
     }
 
     // =====================================================================

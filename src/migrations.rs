@@ -10,10 +10,6 @@ use serde_json::{Map, Value};
 use crate::config::Config;
 use crate::session::encode_cwd;
 
-const MIGRATION_GUIDE_URL: &str = "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/CHANGELOG.md#extensions-migration";
-const EXTENSIONS_DOC_URL: &str =
-    "https://github.com/badlogic/pi-mono/blob/main/packages/coding-agent/docs/extensions.md";
-
 const MANAGED_TOOL_BINARIES: &[&str] = &["fd", "rg", "fd.exe", "rg.exe"];
 
 /// Summary of startup migration actions.
@@ -73,11 +69,6 @@ impl MigrationReport {
             messages.push(format!("Warning: {warning}"));
         }
 
-        if !self.deprecation_warnings.is_empty() {
-            messages.push(format!("Migration guide: {MIGRATION_GUIDE_URL}"));
-            messages.push(format!("Extensions docs: {EXTENSIONS_DOC_URL}"));
-        }
-
         messages
     }
 }
@@ -107,13 +98,6 @@ fn run_startup_migrations_with_agent_dir(agent_dir: &Path, cwd: &Path) -> Migrat
             .migrated_commands_dirs
             .push(project_dir.join("prompts"));
     }
-
-    report
-        .deprecation_warnings
-        .extend(check_deprecated_extension_dirs(agent_dir, "Global"));
-    report
-        .deprecation_warnings
-        .extend(check_deprecated_extension_dirs(&project_dir, "Project"));
 
     report
 }
@@ -426,46 +410,6 @@ fn migrate_tools_to_bin(agent_dir: &Path, warnings: &mut Vec<String>) -> Vec<Str
     }
 
     moved
-}
-
-fn check_deprecated_extension_dirs(base_dir: &Path, label: &str) -> Vec<String> {
-    let mut warnings = Vec::new();
-
-    let hooks_dir = base_dir.join("hooks");
-    if hooks_dir.exists() {
-        warnings.push(format!(
-            "{label} hooks/ directory found. Hooks have been renamed to extensions/"
-        ));
-    }
-
-    let tools_dir = base_dir.join("tools");
-    if tools_dir.exists() {
-        match fs::read_dir(&tools_dir) {
-            Ok(entries) => {
-                let custom_entries = entries
-                    .flatten()
-                    .filter(|entry| {
-                        let name = entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with('.') {
-                            return false;
-                        }
-                        !MANAGED_TOOL_BINARIES.iter().any(|managed| *managed == name)
-                    })
-                    .count();
-                if custom_entries > 0 {
-                    warnings.push(format!(
-                        "{label} tools/ directory contains custom files. Custom tools should live under extensions/"
-                    ));
-                }
-            }
-            Err(err) => warnings.push(format!(
-                "could not inspect deprecated tools/ directory at {}: {err}",
-                tools_dir.display()
-            )),
-        }
-    }
-
-    warnings
 }
 
 fn set_owner_only_permissions(path: &Path) -> std::io::Result<()> {

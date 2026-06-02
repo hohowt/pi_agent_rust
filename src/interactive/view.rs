@@ -380,17 +380,8 @@ impl PiApp {
     /// Render the view.
     #[allow(clippy::too_many_lines)]
     pub(super) fn view(&self) -> String {
-        let view_start = if self.frame_timing.enabled {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
+        let mut output = String::new();
 
-        // PERF-7: Pre-allocate view output with capacity from the previous
-        // frame, avoiding incremental String grows during assembly.
-        let mut output = String::with_capacity(self.render_buffers.view_capacity_hint());
-
-        // Header — PERF-7: render directly into output, no intermediate String.
         self.render_header_into(&mut output);
         output.push('\n');
 
@@ -405,23 +396,9 @@ impl PiApp {
         // Trim trailing whitespace so the viewport line count matches
         // what refresh_conversation_viewport() stored — this keeps the
         // y_offset from goto_bottom() aligned with the visible lines.
-        let conversation_content = {
-            let content_start = if self.frame_timing.enabled {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
-            let mut raw = self.build_conversation_content();
-            if let Some(start) = content_start {
-                self.frame_timing
-                    .record_content_build(micros_as_u64(start.elapsed().as_micros()));
-            }
-            // PERF-7: Truncate in place instead of trim_end().to_string()
-            // which would allocate a second copy of the entire content.
-            let trimmed_len = raw.trim_end().len();
-            raw.truncate(trimmed_len);
-            raw
-        };
+        let mut conversation_content = self.build_conversation_content();
+        let trimmed_len = conversation_content.trim_end().len();
+        conversation_content.truncate(trimmed_len);
 
         // Render conversation area (scrollable).
         // Use the per-frame effective height so that conditional chrome
@@ -429,18 +406,12 @@ impl PiApp {
         // for and the total output never exceeds term_height rows.
         let effective_vp = self.view_effective_conversation_height();
         {
-            // PERF-7: Use Cow to avoid consuming conversation_content so
-            // the reusable buffer is always returned regardless of path.
             use std::borrow::Cow;
             let viewport_content: Cow<'_, str> = if conversation_content.is_empty() {
                 Cow::Owned(self.render_startup_placeholder())
             } else {
                 Cow::Borrowed(&conversation_content)
             };
-
-            // PERF: Count total lines with memchr (O(n) byte scan, no alloc)
-            // instead of collecting all lines into a Vec.  For a 10K-line
-            // conversation this avoids a ~80KB Vec<&str> allocation per frame.
             let total_lines = memchr::memchr_iter(b'\n', viewport_content.as_bytes()).count() + 1;
             let start = if self.follow_stream_tail {
                 total_lines.saturating_sub(effective_vp)
@@ -450,9 +421,6 @@ impl PiApp {
                     .min(total_lines.saturating_sub(1))
             };
             let end = (start + effective_vp).min(total_lines);
-
-            // Skip `start` lines, then take `end - start` lines — no Vec
-            // allocation needed.
             let mut first = true;
             for line in viewport_content.lines().skip(start).take(end - start) {
                 if first {
@@ -473,10 +441,6 @@ impl PiApp {
                 output.push('\n');
             }
         }
-        // PERF-7: Return the conversation buffer for reuse next frame.
-        // Always returned (even when empty) to preserve heap capacity.
-        self.render_buffers
-            .return_conversation_buffer(conversation_content);
 
         // Tool status
         if let Some(tool) = &self.current_tool {
@@ -529,16 +493,6 @@ impl PiApp {
             output.push_str(&self.render_theme_picker(picker));
         }
 
-        // Capability prompt overlay (if open)
-        if let Some(ref prompt) = self.capability_prompt {
-            output.push_str(&self.render_capability_prompt(prompt));
-        }
-
-        // Extension custom overlay (if open)
-        if let Some(ref overlay) = self.extension_custom_overlay {
-            output.push_str(&self.render_extension_custom_overlay(overlay));
-        }
-
         // Branch picker overlay (if open)
         if let Some(ref picker) = self.branch_picker {
             output.push_str(&self.render_branch_picker(picker));
@@ -574,30 +528,14 @@ impl PiApp {
             }
         }
 
-        // Footer with usage stats — PERF-7: render directly into output.
         self.render_footer_into(&mut output);
 
         // Clamp the output to `term_height` rows so the terminal never
         // scrolls in the alternate-screen buffer.
         let output = clamp_to_terminal_height(output, self.term_height);
-        let output = normalize_raw_terminal_newlines(output);
-
-        // PERF-7: Remember this frame's output size so the next frame can
-        // pre-allocate with the right capacity.
-        self.render_buffers.set_view_capacity_hint(output.len());
-
-        if let Some(start) = view_start {
-            self.frame_timing
-                .record_frame(micros_as_u64(start.elapsed().as_micros()));
-            self.tui_pressure_frame_p99_us
-                .store(self.frame_timing.frame_p99_us(), Ordering::Relaxed);
-        }
-
-        output
+        normalize_raw_terminal_newlines(output)
     }
 
-    /// PERF-7: Render the header directly into `output`, avoiding an
-    /// intermediate `String` allocation on the hot path.
     fn render_header_into(&self, output: &mut String) {
         let model_label = format!("({})", self.model);
 
@@ -638,11 +576,10 @@ impl PiApp {
 
         let resources_line = truncate(
             &format!(
-                "resources: {} skills, {} prompts, {} themes, {} extensions",
+                "resources: {} skills, {} prompts, {} themes",
                 self.resources.skills().len(),
                 self.resources.prompts().len(),
-                self.resources.themes().len(),
-                self.resources.extensions().len()
+                self.resources.themes().len()
             ),
             max_width,
         );
@@ -908,55 +845,14 @@ impl PiApp {
     }
 
     /// Build the conversation content string for the viewport.
-    ///
-    /// Uses `MessageRenderCache` (PERF-1) to avoid re-rendering unchanged
-    /// messages and a conversation prefix cache (PERF-2) to skip iterating
-    /// all messages during streaming. Streaming content (current_response)
-    /// always renders fresh.
     pub fn build_conversation_content(&self) -> String {
-        let has_streaming_state =
-            !self.current_response.is_empty() || !self.current_thinking.is_empty();
         let has_visible_streaming_tail = !self.current_response.is_empty()
             || (self.thinking_visible && !self.current_thinking.is_empty());
 
-        // PERF-7: Reuse the pre-allocated conversation buffer from the
-        // previous frame. `take_conversation_buffer()` clears the buffer
-        // but preserves its heap capacity, avoiding a fresh allocation.
-        let mut output = self.render_buffers.take_conversation_buffer();
-
-        // PERF-2 fast path: during streaming, reuse the cached prefix
-        // (all finalized messages) and only rebuild the streaming tail.
-        if has_streaming_state && self.message_render_cache.prefix_valid(self.messages.len()) {
-            // PERF-7: Append prefix directly into the reusable buffer
-            // instead of cloning via prefix_get().
-            self.message_render_cache.prefix_append_to(&mut output);
-            if has_visible_streaming_tail {
-                self.append_streaming_tail(&mut output);
-            }
-            return output;
+        let mut output = String::new();
+        for msg in &self.messages {
+            output.push_str(&self.render_single_message(msg));
         }
-
-        // Full rebuild: iterate all messages with per-message cache (PERF-1).
-        for (index, msg) in self.messages.iter().enumerate() {
-            let key =
-                MessageRenderCache::compute_key(msg, self.thinking_visible, self.tools_expanded);
-
-            if self
-                .message_render_cache
-                .append_cached(&mut output, index, &key)
-            {
-                continue;
-            }
-            let rendered = self.render_single_message(msg);
-            // PERF: push_str first, then move into cache — avoids cloning
-            // the rendered String (which can be several KB for tool output).
-            output.push_str(&rendered);
-            self.message_render_cache.put(index, key, rendered);
-        }
-
-        // Snapshot the prefix for future streaming frames (PERF-2).
-        self.message_render_cache
-            .prefix_set(&output, self.messages.len());
 
         // Append streaming content if active.
         if has_visible_streaming_tail {
@@ -1101,7 +997,6 @@ impl PiApp {
 
             let kind_icon = match item.kind {
                 AutocompleteItemKind::SlashCommand => "⚡",
-                AutocompleteItemKind::ExtensionCommand => "🧩",
                 AutocompleteItemKind::PromptTemplate => "📄",
                 AutocompleteItemKind::Skill => "🔧",
                 AutocompleteItemKind::Model => "🤖",
@@ -1377,15 +1272,7 @@ impl PiApp {
                         "followUpMode: {}",
                         self.config.follow_up_queue_mode().as_str()
                     ),
-                    SettingsUiEntry::DefaultPermissive => format!(
-                        "extensionPolicy.defaultPermissive: {}{}",
-                        bool_label(self.effective_default_permissive()),
-                        if self.default_permissive_changes_require_extension_restart() {
-                            " (restart required)"
-                        } else {
-                            ""
-                        }
-                    ),
+                    SettingsUiEntry::DefaultPermissive => continue,
                     SettingsUiEntry::QuietStartup => format!(
                         "quietStartup: {}",
                         bool_label(self.config.quiet_startup.unwrap_or(false))
@@ -1512,117 +1399,6 @@ impl PiApp {
             self.styles
                 .muted_italic
                 .render("↑/↓/j/k/PgUp/PgDn: navigate  Enter: select  Esc/q: back")
-        );
-
-        output
-    }
-
-    pub(super) fn render_capability_prompt(&self, prompt: &CapabilityPromptOverlay) -> String {
-        let mut output = String::new();
-
-        // Title line.
-        let _ = writeln!(
-            output,
-            "\n  {}",
-            self.styles.title.render("Extension Permission Request")
-        );
-
-        // Extension and capability info.
-        let _ = writeln!(
-            output,
-            "  {} requests {}",
-            self.styles.accent_bold.render(&prompt.extension_id),
-            self.styles.warning_bold.render(&prompt.capability),
-        );
-
-        // Description.
-        if !prompt.description.is_empty() {
-            let _ = writeln!(
-                output,
-                "\n  {}",
-                self.styles.muted.render(&prompt.description),
-            );
-        }
-
-        // Button row.
-        output.push('\n');
-        output.push_str("  ");
-        for (idx, action) in CapabilityAction::ALL.iter().enumerate() {
-            let label = action.label();
-            let rendered = if idx == prompt.focused {
-                self.styles.selection.render(&format!("[{label}]"))
-            } else {
-                self.styles.muted.render(&format!(" {label} "))
-            };
-            output.push_str(&rendered);
-            output.push_str("  ");
-        }
-        output.push('\n');
-
-        // Auto-deny timer.
-        if let Some(secs) = prompt.auto_deny_secs {
-            let _ = writeln!(
-                output,
-                "  {}",
-                self.styles
-                    .muted_italic
-                    .render(&format!("Auto-deny in {secs}s")),
-            );
-        }
-
-        // Help text.
-        let _ = writeln!(
-            output,
-            "  {}",
-            self.styles
-                .muted_italic
-                .render("←/→/Tab: navigate  Enter: confirm  Esc: deny")
-        );
-
-        output
-    }
-
-    pub(super) fn render_extension_custom_overlay(
-        &self,
-        overlay: &ExtensionCustomOverlay,
-    ) -> String {
-        let mut output = String::new();
-        let title = overlay.title.as_deref().unwrap_or("Extension Overlay");
-        let source = overlay.extension_id.as_deref().unwrap_or("extension");
-
-        let _ = writeln!(output, "\n  {}", self.styles.title.render(title));
-        let _ = writeln!(
-            output,
-            "  {}",
-            self.styles
-                .muted
-                .render(&format!("[{source}] custom UI active"))
-        );
-
-        let max_lines = self.term_height.saturating_sub(12).max(4);
-        if overlay.lines.is_empty() {
-            let _ = writeln!(
-                output,
-                "  {}",
-                self.styles
-                    .muted_italic
-                    .render("Waiting for extension frame...")
-            );
-        } else {
-            for line in overlay
-                .lines
-                .iter()
-                .skip(overlay.lines.len().saturating_sub(max_lines))
-            {
-                let _ = writeln!(output, "  {line}");
-            }
-        }
-        let _ = writeln!(
-            output,
-            "  {}",
-            self.styles
-                .muted_italic
-                .render("Press q to exit extension overlays that support quit")
         );
 
         output

@@ -188,7 +188,6 @@ const SKIP_STREAM_PROVIDERS: &[&str] = &[
 /// Providers that fail at `create_provider` without env vars (superset of stream skips).
 const SKIP_ROUTE_PROVIDERS: &[&str] = &[
     "google-vertex",  // needs GOOGLE_CLOUD_PROJECT env var at create time
-    "amazon-bedrock", // needs runtime region/endpoint resolution
     "azure-openai",   // needs Azure host parsing at create time
     "github-copilot", // needs OAuth at create time
     "gitlab",         // needs OAuth at create time
@@ -862,57 +861,6 @@ fn smoke_native_cohere_baseline() {
             ctx.push(("path".to_string(), request.path.clone()));
         });
 }
-
-/// Smoke-tests native Bedrock through mock HTTP (JSON response, not SSE).
-#[test]
-fn smoke_native_bedrock_baseline() {
-    let harness = TestHarness::new("smoke_native_bedrock_baseline");
-    let server = harness.start_mock_http_server();
-    let bedrock_model = "anthropic.claude-3-5-sonnet-v1";
-    let expected_path = format!("/model/{bedrock_model}/converse");
-    server.add_route(
-        "POST",
-        &expected_path,
-        MockHttpResponse::json(200, &bedrock_converse_json()),
-    );
-
-    let mut entry = make_smoke_entry("amazon-bedrock", bedrock_model, &server.base_url());
-    entry.model.api = "bedrock-converse-stream".to_string();
-    let provider = create_provider(&entry, None).expect("create native bedrock provider");
-    assert_eq!(provider.name(), "amazon-bedrock");
-    assert_eq!(provider.api(), "bedrock-converse-stream");
-
-    let api_key = "smoke-bedrock-token".to_string();
-    let options = StreamOptions {
-        api_key: Some(api_key.clone()),
-        max_tokens: Some(64),
-        ..Default::default()
-    };
-    drive_to_done(provider, minimal_context(), options);
-
-    let requests = server.requests();
-    assert_eq!(requests.len(), 1);
-    let request = &requests[0];
-    assert_eq!(request.path, expected_path);
-    assert_eq!(
-        request_header(&request.headers, "authorization").as_deref(),
-        Some(format!("Bearer {api_key}").as_str())
-    );
-    assert_eq!(
-        request_header(&request.headers, "content-type").as_deref(),
-        Some("application/json")
-    );
-
-    let body: serde_json::Value = serde_json::from_slice(&request.body).expect("valid JSON body");
-    assert!(body.get("messages").is_some());
-
-    harness
-        .log()
-        .info_ctx("native.ok", "bedrock baseline passed", |ctx| {
-            ctx.push(("path".to_string(), request.path.clone()));
-        });
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // Test 5: Structured smoke report
 // ═══════════════════════════════════════════════════════════════════════
@@ -1069,16 +1017,6 @@ fn run_smoke_stream(
             server.add_route("POST", &path, text_event_stream_response(gemini_sse()));
             (format!("{}/v1beta", server.base_url()), path)
         }
-        "bedrock-converse-stream" => {
-            let model = "smoke-report-model";
-            let path = format!("/model/{model}/converse");
-            server.add_route(
-                "POST",
-                &path,
-                MockHttpResponse::json(200, &bedrock_converse_json()),
-            );
-            (server.base_url(), path)
-        }
         other => {
             harness
                 .log()
@@ -1146,7 +1084,6 @@ fn smoke_all_api_families_are_known() {
         "cohere-chat",
         "google-generative-ai",
         "google-vertex",
-        "bedrock-converse-stream",
     ];
 
     for meta in PROVIDER_METADATA {

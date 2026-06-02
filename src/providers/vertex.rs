@@ -851,7 +851,6 @@ mod tests {
             headers: std::collections::HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         };
 
         let runtime = resolve_vertex_provider_runtime(&entry).expect("resolve");
@@ -1047,47 +1046,5 @@ mod tests {
 
             out
         })
-    }
-}
-
-// ============================================================================
-// Fuzzing support
-// ============================================================================
-
-#[cfg(feature = "fuzzing")]
-pub mod fuzz {
-    use super::*;
-    use futures::stream;
-    use std::pin::Pin;
-
-    type FuzzStream =
-        Pin<Box<futures::stream::Empty<std::result::Result<Vec<u8>, std::io::Error>>>>;
-
-    /// Opaque wrapper around the Vertex AI stream processor state.
-    pub struct Processor(StreamState<FuzzStream>);
-
-    impl Default for Processor {
-        fn default() -> Self {
-            Self::new()
-        }
-    }
-
-    impl Processor {
-        /// Create a fresh processor with default state.
-        pub fn new() -> Self {
-            let empty = stream::empty::<std::result::Result<Vec<u8>, std::io::Error>>();
-            Self(StreamState::new(
-                crate::sse::SseStream::new(Box::pin(empty)),
-                "vertex-fuzz".into(),
-                "vertex-ai".into(),
-                "vertex".into(),
-            ))
-        }
-
-        /// Feed one SSE data payload and return any emitted `StreamEvent`s.
-        pub fn process_event(&mut self, data: &str) -> crate::error::Result<Vec<StreamEvent>> {
-            self.0.process_event(data)?;
-            Ok(self.0.pending_events.drain(..).collect())
-        }
     }
 }

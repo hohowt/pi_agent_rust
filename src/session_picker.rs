@@ -379,7 +379,7 @@ pub fn list_sessions_for_project(cwd: &Path, override_dir: Option<&Path>) -> Vec
     }
 
     for meta in scanned.metas {
-        let _ = index.upsert_session_meta(meta.clone());
+        let _ = index.upsert_session_meta(&meta);
         by_path.insert(meta.path.clone(), meta);
     }
 
@@ -595,8 +595,7 @@ mod tests {
     use crate::session::{SessionMessage, SessionStoreKind};
     #[cfg(feature = "sqlite-sessions")]
     use asupersync::runtime::RuntimeBuilder;
-    use sqlmodel_core::Value;
-    use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
+    use rusqlite::{Connection, OpenFlags, params};
     #[cfg(feature = "sqlite-sessions")]
     use std::future::Future;
 
@@ -1135,21 +1134,22 @@ mod tests {
         index.reindex_all().expect("seed session index");
 
         let db_path = base_dir.join("session-index.sqlite");
-        let config = SqliteConfig::file(db_path.to_string_lossy())
-            .flags(OpenFlags::create_read_write())
-            .busy_timeout(5000);
-        let conn = SqliteConnection::open(&config).expect("open session index sqlite");
-        conn.execute_sync(
+        let conn = Connection::open_with_flags(
+            db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        )
+        .expect("open session index sqlite");
+        conn.busy_timeout(std::time::Duration::from_millis(5000))
+            .expect("set busy timeout");
+        conn.execute(
             "UPDATE sessions
              SET message_count=?1, size_bytes=?2, name=?3
              WHERE path=?4",
-            &[
-                Value::BigInt(0),
-                Value::BigInt(
-                    i64::try_from(expected.size_bytes.saturating_sub(1)).expect("size fits in i64"),
-                ),
-                Value::Text("Stale name".to_string()),
-                Value::Text(session_path.display().to_string()),
+            params![
+                0,
+                i64::try_from(expected.size_bytes.saturating_sub(1)).expect("size fits in i64"),
+                "Stale name",
+                session_path.display().to_string(),
             ],
         )
         .expect("corrupt cached row");

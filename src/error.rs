@@ -38,10 +38,6 @@ pub enum Error {
     #[error("Validation error: {0}")]
     Validation(String),
 
-    /// Extension errors
-    #[error("Extension error: {0}")]
-    Extension(String),
-
     /// IO errors
     #[error("IO error: {0}")]
     Io(#[from] Box<std::io::Error>),
@@ -52,7 +48,7 @@ pub enum Error {
 
     /// SQLite errors
     #[error("SQLite error: {0}")]
-    Sqlite(#[from] Box<sqlmodel_core::Error>),
+    Sqlite(#[from] Box<rusqlite::Error>),
 
     /// User aborted operation
     #[error("Operation aborted")]
@@ -199,11 +195,6 @@ impl Error {
         Self::Validation(message.into())
     }
 
-    /// Create an extension error.
-    pub fn extension(message: impl Into<String>) -> Self {
-        Self::Extension(message.into())
-    }
-
     /// Create an API error.
     pub fn api(message: impl Into<String>) -> Self {
         Self::Api(message.into())
@@ -220,7 +211,6 @@ impl Error {
             Self::Auth(_) => "denied",
             Self::Aborted => "timeout",
             Self::Json(_)
-            | Self::Extension(_)
             | Self::Config(_)
             | Self::Provider { .. }
             | Self::Tool { .. }
@@ -238,7 +228,6 @@ impl Error {
             Self::Auth(_) => "auth",
             Self::Tool { .. } => "tool",
             Self::Validation(_) => "validation",
-            Self::Extension(_) => "extension",
             Self::Io(_) => "io",
             Self::Json(_) => "json",
             Self::Sqlite(_) => "sqlite",
@@ -282,14 +271,6 @@ impl Error {
                 vec![
                     "Check the specific fields mentioned in the error.".to_string(),
                     "Review CLI flags or settings for typos.".to_string(),
-                ],
-                vec![("details", message.clone())],
-            ),
-            Self::Extension(message) => build_hints(
-                "Extension failed to load or run.",
-                vec![
-                    "Try `--no-extensions` to isolate the issue.".to_string(),
-                    "Check the extension manifest and dependencies.".to_string(),
                 ],
                 vec![("details", message.clone())],
             ),
@@ -859,7 +840,7 @@ fn io_hints(err: &std::io::Error) -> ErrorHints {
     }
 }
 
-fn sqlite_hints(err: &sqlmodel_core::Error) -> ErrorHints {
+fn sqlite_hints(err: &rusqlite::Error) -> ErrorHints {
     let details = err.to_string();
     let lower = details.to_lowercase();
     if contains_any(&lower, &["database is locked", "busy"]) {
@@ -909,8 +890,8 @@ impl From<serde_json::Error> for Error {
     }
 }
 
-impl From<sqlmodel_core::Error> for Error {
-    fn from(value: sqlmodel_core::Error) -> Self {
+impl From<rusqlite::Error> for Error {
+    fn from(value: rusqlite::Error) -> Self {
         Self::Sqlite(Box::new(value))
     }
 }

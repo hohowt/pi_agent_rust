@@ -227,22 +227,7 @@ pub enum AuthCredential {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         client_id: Option<String>,
     },
-    /// AWS IAM credentials for providers like Amazon Bedrock.
-    ///
-    /// Supports the standard credential chain: explicit keys → env vars → profile → container
-    /// credentials → web identity token.
-    AwsCredentials {
-        access_key_id: String,
-        secret_access_key: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        session_token: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        region: Option<String>,
-    },
     /// Bearer token for providers that accept `Authorization: Bearer <token>`.
-    ///
-    /// Used by gateway proxies (Vercel AI Gateway, Helicone, etc.) and services
-    /// that issue pre-authenticated bearer tokens (e.g. `AWS_BEARER_TOKEN_BEDROCK`).
     BearerToken {
         token: String,
     },
@@ -272,7 +257,6 @@ pub enum CredentialStatus {
     OAuthValid { expires_in_ms: i64 },
     OAuthExpired { expired_by_ms: i64 },
     BearerToken,
-    AwsCredentials,
     ServiceKey,
 }
 
@@ -450,8 +434,6 @@ impl AuthStorage {
     ///
     /// For `ApiKey` and `BearerToken` variants the key/token is returned directly.
     /// For `OAuth` the access token is returned only when not expired.
-    /// For `AwsCredentials` the access key ID is returned (callers needing the full
-    /// credential set should use [`get`] instead).
     /// For `ServiceKey` this returns `None` because a token exchange is required first.
     pub fn api_key(&self, provider: &str) -> Option<String> {
         self.credential_for_provider(provider)
@@ -491,7 +473,6 @@ impl AuthStorage {
                 expired_by_ms: now.saturating_sub(*expires),
             },
             AuthCredential::BearerToken { .. } => CredentialStatus::BearerToken,
-            AuthCredential::AwsCredentials { .. } => CredentialStatus::AwsCredentials,
             AuthCredential::ServiceKey { .. } => CredentialStatus::ServiceKey,
             AuthCredential::Unknown(_) => CredentialStatus::Missing,
         }
@@ -762,107 +743,6 @@ impl AuthStorage {
         Ok(())
     }
 
-    /// Refresh expired OAuth tokens for extension-registered providers.
-    ///
-    /// `extension_configs` maps provider ID to its [`OAuthConfig`](crate::models::OAuthConfig).
-    /// Providers already handled by `refresh_expired_oauth_tokens_with_client` (e.g. "anthropic")
-    /// are skipped.
-    pub async fn refresh_expired_extension_oauth_tokens(
-        &mut self,
-        client: &crate::http::client::Client,
-        extension_configs: &HashMap<String, crate::models::OAuthConfig>,
-    ) -> Result<()> {
-        let now = chrono::Utc::now().timestamp_millis();
-        let proactive_deadline = now + PROACTIVE_REFRESH_WINDOW_MS;
-        let mut refreshes = Vec::new();
-
-        for (provider, cred) in &self.entries {
-            if let AuthCredential::OAuth {
-                refresh_token,
-                expires,
-                token_url,
-                client_id,
-                ..
-            } = cred
-            {
-                // Skip built-in providers (handled by refresh_expired_oauth_tokens_with_client).
-                if matches!(
-                    provider.as_str(),
-                    "anthropic"
-                        | "openai-codex"
-                        | "google-gemini-cli"
-                        | "google-antigravity"
-                        | "kimi-for-coding"
-                ) {
-                    continue;
-                }
-                // Skip self-contained credentials — they are refreshed by
-                // refresh_expired_oauth_tokens_with_client instead.
-                if token_url.is_some() && client_id.is_some() {
-                    continue;
-                }
-                if *expires <= proactive_deadline {
-                    if let Some(config) = extension_configs.get(provider) {
-                        refreshes.push((provider.clone(), refresh_token.clone(), config.clone()));
-                    }
-                }
-            }
-        }
-
-        if !refreshes.is_empty() {
-            tracing::info!(
-                event = "pi.auth.extension_oauth_refresh.start",
-                count = refreshes.len(),
-                "Refreshing expired extension OAuth tokens"
-            );
-        }
-        let mut failed_providers: Vec<String> = Vec::new();
-        let mut needs_save = false;
-
-        for (provider, refresh_token, config) in refreshes {
-            let start = std::time::Instant::now(); // ubs:ignore false positive: refresh latency instrumentation, not security token generation.
-            match refresh_extension_oauth_token(client, &config, &refresh_token).await {
-                Ok(refreshed) => {
-                    tracing::info!(
-                        event = "pi.auth.extension_oauth_refresh.ok",
-                        provider = %provider,
-                        elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        "Extension OAuth token refreshed"
-                    );
-                    self.entries.insert(provider, refreshed);
-                    needs_save = true;
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        event = "pi.auth.extension_oauth_refresh.error",
-                        provider = %provider,
-                        error = %e,
-                        elapsed_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        "Failed to refresh extension OAuth token; continuing with remaining providers"
-                    );
-                    failed_providers.push(format!("{provider} ({e})"));
-                }
-            }
-        }
-
-        if needs_save {
-            if let Err(e) = self.save_async().await {
-                tracing::warn!(
-                    "Failed to save auth.json after refreshing extension OAuth tokens: {e}"
-                );
-            }
-        }
-
-        if failed_providers.is_empty() {
-            Ok(())
-        } else {
-            Err(Error::api(format!(
-                "Extension OAuth token refresh failed for: {}",
-                failed_providers.join(", ")
-            )))
-        }
-    }
-
     /// Remove OAuth credentials that expired more than `max_age_ms` ago and
     /// whose refresh token is no longer usable (no stored `token_url`/`client_id`
     /// and no matching extension config).
@@ -1070,7 +950,6 @@ fn api_key_from_credential(credential: &AuthCredential) -> Option<String> {
             }
         }
         AuthCredential::BearerToken { token } => Some(token.clone()),
-        AuthCredential::AwsCredentials { access_key_id, .. } => Some(access_key_id.clone()),
         AuthCredential::ServiceKey { .. } | AuthCredential::Unknown(_) => None,
     }
 }
@@ -1449,9 +1328,10 @@ fn decode_project_scoped_access_token(payload: &str) -> Option<(String, String)>
     Some((token, project_id))
 }
 
-// ── AWS Credential Chain ────────────────────────────────────────
+// ── Retired AWS Bedrock Credential Chain ────────────────────────
 
 /// Resolved AWS credentials ready for Sigv4 signing or bearer auth.
+#[cfg(any())]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AwsResolvedCredentials {
     /// Standard IAM credentials for Sigv4 signing.
@@ -1475,10 +1355,12 @@ pub enum AwsResolvedCredentials {
 /// 5. Stored `BearerToken` in auth.json (for bedrock)
 ///
 /// `region` is resolved from: `AWS_REGION` → `AWS_DEFAULT_REGION` → `"us-east-1"`.
+#[cfg(any())]
 pub fn resolve_aws_credentials(auth: &AuthStorage) -> Option<AwsResolvedCredentials> {
     resolve_aws_credentials_with_env(auth, |var| std::env::var(var).ok())
 }
 
+#[cfg(any())]
 fn resolve_aws_credentials_with_env<F>(
     auth: &AuthStorage,
     mut env: F,
@@ -1584,6 +1466,7 @@ where
     }
 }
 
+#[cfg(any())]
 fn aws_home_dir_from_env<F>(env: &mut F) -> Option<PathBuf>
 where
     F: FnMut(&str) -> Option<String>,
@@ -1615,6 +1498,7 @@ where
         })
 }
 
+#[cfg(any())]
 fn aws_credentials_paths_from_env<F>(env: &mut F) -> Option<(PathBuf, PathBuf)>
 where
     F: FnMut(&str) -> Option<String>,
@@ -1657,6 +1541,7 @@ where
 ///
 /// Falls back: `AWS_CONFIG_FILE` env var → `<HOME>/.aws/config`. Returns
 /// None only when no env var is set AND no home directory can be resolved.
+#[cfg(any())]
 fn aws_config_path_from_env<F>(env: &mut F) -> Option<PathBuf>
 where
     F: FnMut(&str) -> Option<String>,
@@ -1672,6 +1557,7 @@ where
     Some(home.join(".aws").join("config"))
 }
 
+#[cfg(any())]
 fn parse_aws_ini(contents: &str) -> HashMap<String, HashMap<String, String>> {
     let mut sections: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut current: Option<String> = None;
@@ -1703,6 +1589,7 @@ fn parse_aws_ini(contents: &str) -> HashMap<String, HashMap<String, String>> {
     sections
 }
 
+#[cfg(any())]
 fn resolve_aws_profile_credentials_with_env<F>(
     profile: &str,
     region_override: Option<&str>,
@@ -1776,6 +1663,7 @@ where
 /// (or sometimes `[profile default]` when written by tooling), while named
 /// profiles are written as `[profile NAME]`. SSO sessions live in
 /// `[sso-session NAME]` and use just the session name (no `profile` prefix).
+#[cfg(any())]
 fn profile_section_candidates(profile_key: &str) -> Vec<String> {
     if profile_key.eq("default") {
         vec!["default".to_string(), "profile default".to_string()]
@@ -1822,6 +1710,7 @@ fn profile_section_candidates(profile_key: &str) -> Vec<String> {
 ///
 /// Produced synchronously from `~/.aws/config` + `~/.aws/sso/cache/`.
 /// Consumed by the async [`exchange_aws_sso_credentials`] helper.
+#[cfg(any())]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AwsSsoTokenLocator {
     /// SSO Portal access token (`accessToken` from the cache file).
@@ -1849,6 +1738,7 @@ pub struct AwsSsoTokenLocator {
 ///   e.g. token cache missing/expired/malformed, or required fields
 ///   absent. The error message tells the user how to recover (typically
 ///   "run `aws sso login --profile <name>`").
+#[cfg(any())]
 #[allow(clippy::too_many_lines)] // SSO config parsing has irreducible branching for sso-session vs legacy form + cache lookup + diagnostics
 fn detect_aws_sso_profile_with_env<F>(
     profile: &str,
@@ -2001,6 +1891,7 @@ where
     }))
 }
 
+#[cfg(any())]
 fn aws_sso_cache_dir_from_env<F>(env: &mut F) -> Option<PathBuf>
 where
     F: FnMut(&str) -> Option<String>,
@@ -2024,8 +1915,10 @@ where
 /// Per the AWS CLI/SDK convention, the file is `<sha1(key)>.json` where
 /// `key` is the sso-session name (sso-session form) or the start URL
 /// (legacy form). The hash is lowercase hex.
+#[cfg(any())]
 fn aws_sso_cache_filename(cache_key: &str) -> String {
     use sha1::{Digest as _, Sha1};
+    use std::fmt::Write as _;
     let mut hasher = Sha1::new();
     hasher.update(cache_key.as_bytes());
     let digest = hasher.finalize();
@@ -2037,6 +1930,7 @@ fn aws_sso_cache_filename(cache_key: &str) -> String {
     hex
 }
 
+#[cfg(any())]
 fn aws_sso_cache_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
     let filename = aws_sso_cache_filename(cache_key);
     debug_assert!(
@@ -2048,6 +1942,7 @@ fn aws_sso_cache_path(cache_dir: &Path, cache_key: &str) -> PathBuf {
     path
 }
 
+#[cfg(any())]
 #[derive(Debug, Deserialize)]
 struct SsoCachedToken {
     #[serde(rename = "accessToken")]
@@ -2056,6 +1951,7 @@ struct SsoCachedToken {
     expires_at: Option<String>,
 }
 
+#[cfg(any())]
 fn load_aws_sso_token_cache(cache_dir: &Path, cache_key: &str, profile: &str) -> Result<String> {
     let path = aws_sso_cache_path(cache_dir, cache_key);
     let text = std::fs::read_to_string(&path).map_err(|err| {
@@ -2120,12 +2016,14 @@ fn load_aws_sso_token_cache(cache_dir: &Path, cache_key: &str, profile: &str) ->
 }
 
 /// Response shape from the SSO Portal `GetRoleCredentials` endpoint.
+#[cfg(any())]
 #[derive(Debug, Deserialize)]
 struct SsoRoleCredentialsResponse {
     #[serde(rename = "roleCredentials")]
     role_credentials: SsoRoleCredentials,
 }
 
+#[cfg(any())]
 #[derive(Debug, Deserialize)]
 struct SsoRoleCredentials {
     #[serde(rename = "accessKeyId")]
@@ -2147,7 +2045,7 @@ struct SsoRoleCredentials {
 /// and the crate forbids `unsafe_code`. Tests set the override via
 /// `set_sso_portal_base_url_override`; production code paths always see `None`
 /// because both helpers are cfg-gated.
-#[cfg(test)]
+#[cfg(any())]
 static SSO_PORTAL_BASE_URL_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
     std::sync::OnceLock::new();
 
@@ -2159,7 +2057,7 @@ static SSO_PORTAL_BASE_URL_OVERRIDE: std::sync::OnceLock<std::sync::Mutex<Option
 /// returning `None` on poison would mask the override state and produce
 /// confusing test failures where the resolver hits the real AWS endpoint
 /// instead of the mock — recovering preserves the test's intent.
-#[cfg(test)]
+#[cfg(any())]
 fn sso_portal_base_url_override() -> Option<String> {
     let mutex = SSO_PORTAL_BASE_URL_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
     let guard = mutex
@@ -2178,7 +2076,7 @@ fn sso_portal_base_url_override() -> Option<String> {
 ///
 /// Recovers from lock poisoning rather than silently dropping the write —
 /// see `sso_portal_base_url_override` for the rationale.
-#[cfg(test)]
+#[cfg(any())]
 fn set_sso_portal_base_url_override(value: Option<String>) {
     let mutex = SSO_PORTAL_BASE_URL_OVERRIDE.get_or_init(|| std::sync::Mutex::new(None));
     let mut guard = mutex
@@ -2187,11 +2085,12 @@ fn set_sso_portal_base_url_override(value: Option<String>) {
     *guard = value;
 }
 
-#[cfg(not(test))]
+#[cfg(any())]
 const fn sso_portal_base_url_override() -> Option<String> {
     None
 }
 
+#[cfg(any())]
 fn sso_portal_base_url(sso_region: &str) -> String {
     if let Some(override_url) = sso_portal_base_url_override() {
         let trimmed = override_url.trim().trim_end_matches('/').to_string();
@@ -2204,6 +2103,7 @@ fn sso_portal_base_url(sso_region: &str) -> String {
 
 /// Exchange a cached SSO access token for short-lived IAM credentials via
 /// the SSO Portal `GetRoleCredentials` endpoint.
+#[cfg(any())]
 async fn exchange_aws_sso_credentials_with_client(
     client: &crate::http::client::Client,
     locator: &AwsSsoTokenLocator,
@@ -2273,6 +2173,7 @@ async fn exchange_aws_sso_credentials_with_client(
 /// falls through to SSO when the profile is configured for it. SSO
 /// requires an HTTP call to the AWS SSO Portal; the bedrock provider
 /// invokes this from its async `stream()` path.
+#[cfg(any())]
 pub async fn resolve_aws_credentials_async(
     auth: &AuthStorage,
     client: &crate::http::client::Client,
@@ -2280,6 +2181,7 @@ pub async fn resolve_aws_credentials_async(
     resolve_aws_credentials_async_with_env(auth, client, |var| std::env::var(var).ok()).await
 }
 
+#[cfg(any())]
 async fn resolve_aws_credentials_async_with_env<F>(
     auth: &AuthStorage,
     client: &crate::http::client::Client,
@@ -4026,157 +3928,6 @@ async fn refresh_kimi_code_oauth_token(
     })
 }
 
-/// Start OAuth for an extension-registered provider using its [`OAuthConfig`](crate::models::OAuthConfig).
-pub fn start_extension_oauth(
-    provider_name: &str,
-    config: &crate::models::OAuthConfig,
-) -> Result<OAuthStartInfo> {
-    let (verifier, challenge) = generate_pkce();
-    let scopes = config.scopes.join(" ");
-
-    let mut params: Vec<(&str, &str)> = vec![
-        ("client_id", &config.client_id),
-        ("response_type", "code"),
-        ("scope", &scopes),
-        ("code_challenge", &challenge),
-        ("code_challenge_method", "S256"),
-        ("state", &verifier),
-    ];
-
-    let redirect_uri_ref = config.redirect_uri.as_deref();
-    if let Some(uri) = redirect_uri_ref {
-        params.push(("redirect_uri", uri));
-    }
-
-    let url = build_url_with_query(&config.auth_url, &params);
-
-    Ok(OAuthStartInfo {
-        provider: provider_name.to_string(),
-        url,
-        verifier,
-        instructions: Some(
-            "Open the URL, complete login, then paste the callback URL or authorization code."
-                .to_string(),
-        ),
-        redirect_uri: config.redirect_uri.clone(),
-        callback_server: None,
-    })
-}
-
-/// Complete OAuth for an extension-registered provider by exchanging an authorization code.
-pub async fn complete_extension_oauth(
-    config: &crate::models::OAuthConfig,
-    code_input: &str,
-    verifier: &str,
-) -> Result<AuthCredential> {
-    let client = crate::http::client::Client::new();
-    complete_extension_oauth_with_client(&client, config, code_input, verifier).await
-}
-
-/// Complete OAuth for an extension-registered provider with an injected HTTP client.
-pub async fn complete_extension_oauth_with_client(
-    client: &crate::http::client::Client,
-    config: &crate::models::OAuthConfig,
-    code_input: &str,
-    verifier: &str,
-) -> Result<AuthCredential> {
-    let (code, state) = parse_oauth_code_input(code_input);
-
-    let Some(code) = code else {
-        return Err(Error::auth("Missing authorization code".to_string()));
-    };
-
-    let state = state.unwrap_or_else(|| verifier.to_string());
-    if state.ne(verifier) {
-        return Err(Error::auth("State mismatch".to_string()));
-    }
-
-    let mut body = serde_json::json!({
-        "grant_type": "authorization_code",
-        "client_id": config.client_id,
-        "code": code,
-        "state": state,
-        "code_verifier": verifier,
-    });
-
-    if let Some(ref redirect_uri) = config.redirect_uri {
-        body["redirect_uri"] = serde_json::Value::String(redirect_uri.clone());
-    }
-
-    let request = client.post(&config.token_url).json(&body)?; // ubs:ignore extension OAuth token_url comes from trusted extension config metadata, not request input.
-
-    let response = Box::pin(request.send())
-        .await
-        .map_err(|e| Error::auth(format!("Token exchange failed: {e}")))?;
-
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<failed to read body>".to_string());
-    let redacted_text = redact_known_secrets(&text, &[code.as_str(), verifier, state.as_str()]);
-
-    if !(200..300).contains(&status) {
-        return Err(Error::auth(format!(
-            "Token exchange failed: {redacted_text}"
-        )));
-    }
-
-    let oauth_response: OAuthTokenResponse = serde_json::from_str(&text)
-        .map_err(|e| Error::auth(format!("Invalid token response: {e}")))?;
-
-    Ok(AuthCredential::OAuth {
-        access_token: oauth_response.access_token,
-        refresh_token: oauth_response.refresh_token,
-        expires: oauth_expires_at_ms(oauth_response.expires_in),
-        token_url: Some(config.token_url.clone()),
-        client_id: Some(config.client_id.clone()),
-    })
-}
-
-/// Refresh an OAuth token for an extension-registered provider.
-async fn refresh_extension_oauth_token(
-    client: &crate::http::client::Client,
-    config: &crate::models::OAuthConfig,
-    refresh_token: &str,
-) -> Result<AuthCredential> {
-    let request = client.post(&config.token_url).json(
-        &serde_json::json!({ // ubs:ignore extension OAuth token_url comes from trusted extension config metadata, not request input.
-            "grant_type": "refresh_token",
-            "client_id": config.client_id,
-            "refresh_token": refresh_token,
-        }),
-    )?;
-
-    let response = Box::pin(request.send())
-        .await
-        .map_err(|e| Error::auth(format!("Extension OAuth token refresh failed: {e}")))?;
-
-    let status = response.status();
-    let text = response
-        .text()
-        .await
-        .unwrap_or_else(|_| "<failed to read body>".to_string());
-    let redacted_text = redact_known_secrets(&text, &[refresh_token]);
-
-    if !(200..300).contains(&status) {
-        return Err(Error::auth(format!(
-            "Extension OAuth token refresh failed: {redacted_text}"
-        )));
-    }
-
-    let oauth_response: OAuthTokenResponse = serde_json::from_str(&text)
-        .map_err(|e| Error::auth(format!("Invalid refresh response: {e}")))?;
-
-    Ok(AuthCredential::OAuth {
-        access_token: oauth_response.access_token,
-        refresh_token: oauth_response.refresh_token,
-        expires: oauth_expires_at_ms(oauth_response.expires_in),
-        token_url: Some(config.token_url.clone()),
-        client_id: Some(config.client_id.clone()),
-    })
-}
-
 /// Provider-agnostic OAuth refresh using self-contained credential metadata.
 ///
 /// This is called for providers whose [`AuthCredential::OAuth`] stores its own
@@ -5391,112 +5142,6 @@ mod tests {
         });
     }
 
-    fn sample_oauth_config() -> crate::models::OAuthConfig {
-        crate::models::OAuthConfig {
-            auth_url: "https://auth.example.com/authorize".to_string(),
-            token_url: "https://auth.example.com/token".to_string(),
-            client_id: "ext-client-123".to_string(),
-            scopes: vec!["read".to_string(), "write".to_string()],
-            redirect_uri: Some("http://localhost:9876/callback".to_string()),
-        }
-    }
-
-    #[test]
-    fn test_start_extension_oauth_url_contains_required_params() {
-        let config = sample_oauth_config();
-        let info = start_extension_oauth("my-ext-provider", &config).expect("start");
-
-        assert_eq!(info.provider, "my-ext-provider");
-        assert!(!info.verifier.is_empty());
-
-        let (base, query) = info.url.split_once('?').expect("missing query");
-        assert_eq!(base, "https://auth.example.com/authorize");
-
-        let params: std::collections::HashMap<_, _> =
-            parse_query_pairs(query).into_iter().collect();
-        assert_eq!(
-            params.get("client_id").map(String::as_str),
-            Some("ext-client-123")
-        );
-        assert_eq!(
-            params.get("response_type").map(String::as_str),
-            Some("code")
-        );
-        assert_eq!(
-            params.get("redirect_uri").map(String::as_str),
-            Some("http://localhost:9876/callback")
-        );
-        assert_eq!(params.get("scope").map(String::as_str), Some("read write"));
-        assert_eq!(
-            params.get("code_challenge_method").map(String::as_str),
-            Some("S256")
-        );
-        assert_eq!(
-            params.get("state").map(String::as_str),
-            Some(info.verifier.as_str())
-        );
-        assert!(params.contains_key("code_challenge"));
-    }
-
-    #[test]
-    fn test_start_extension_oauth_no_redirect_uri() {
-        let config = crate::models::OAuthConfig {
-            auth_url: "https://auth.example.com/authorize".to_string(),
-            token_url: "https://auth.example.com/token".to_string(),
-            client_id: "ext-client-123".to_string(),
-            scopes: vec!["read".to_string()],
-            redirect_uri: None,
-        };
-        let info = start_extension_oauth("no-redirect", &config).expect("start");
-
-        let (_, query) = info.url.split_once('?').expect("missing query");
-        let params: std::collections::HashMap<_, _> =
-            parse_query_pairs(query).into_iter().collect();
-        assert!(!params.contains_key("redirect_uri"));
-    }
-
-    #[test]
-    fn test_start_extension_oauth_empty_scopes() {
-        let config = crate::models::OAuthConfig {
-            auth_url: "https://auth.example.com/authorize".to_string(),
-            token_url: "https://auth.example.com/token".to_string(),
-            client_id: "ext-client-123".to_string(),
-            scopes: vec![],
-            redirect_uri: None,
-        };
-        let info = start_extension_oauth("empty-scopes", &config).expect("start");
-
-        let (_, query) = info.url.split_once('?').expect("missing query");
-        let params: std::collections::HashMap<_, _> =
-            parse_query_pairs(query).into_iter().collect();
-        // scope param still present but empty string
-        assert_eq!(params.get("scope").map(String::as_str), Some(""));
-    }
-
-    #[test]
-    fn test_start_extension_oauth_pkce_format() {
-        let config = sample_oauth_config();
-        let info = start_extension_oauth("pkce-test", &config).expect("start");
-
-        // Verifier should be base64url without padding
-        assert!(!info.verifier.contains('+'));
-        assert!(!info.verifier.contains('/'));
-        assert!(!info.verifier.contains('='));
-        assert_eq!(info.verifier.len(), 43);
-    }
-
-    #[test]
-    fn test_complete_extension_oauth_rejects_state_mismatch() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
-        rt.expect("runtime").block_on(async {
-            let config = sample_oauth_config();
-            let err = complete_extension_oauth(&config, "abc#mismatch", "expected")
-                .await
-                .unwrap_err();
-            assert!(err.to_string().contains("State mismatch"));
-        });
-    }
-
     #[test]
     fn test_complete_copilot_browser_oauth_rejects_state_mismatch() {
         let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
@@ -5518,255 +5163,6 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(err.to_string().contains("State mismatch"));
-        });
-    }
-
-    #[test]
-    fn test_refresh_expired_extension_oauth_tokens_skips_anthropic() {
-        // Verify that the extension refresh method skips "anthropic" (handled separately).
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
-        rt.expect("runtime").block_on(async {
-            let dir = tempfile::tempdir().expect("tmpdir");
-            let auth_path = dir.path().join("auth.json");
-            let mut auth = AuthStorage {
-                path: auth_path,
-                entries: HashMap::new(),
-            };
-            // Insert an expired anthropic OAuth credential.
-            let initial_access = next_token();
-            let initial_refresh = next_token();
-            auth.entries.insert(
-                "anthropic".to_string(),
-                AuthCredential::OAuth {
-                    access_token: initial_access.clone(),
-                    refresh_token: initial_refresh,
-                    expires: 0, // expired
-                    token_url: None,
-                    client_id: None,
-                },
-            );
-
-            let client = crate::http::client::Client::new();
-            let mut extension_configs = HashMap::new();
-            extension_configs.insert("anthropic".to_string(), sample_oauth_config());
-
-            // Should succeed and NOT attempt refresh (anthropic is skipped).
-            let result = auth
-                .refresh_expired_extension_oauth_tokens(&client, &extension_configs)
-                .await;
-            assert!(result.is_ok());
-
-            // Credential should remain unchanged.
-            assert!(
-                matches!(
-                    auth.entries.get("anthropic"),
-                    Some(AuthCredential::OAuth { access_token, .. })
-                        if access_token.eq(&initial_access)
-                ),
-                "expected OAuth credential"
-            );
-        });
-    }
-
-    #[test]
-    fn test_refresh_expired_extension_oauth_tokens_skips_unexpired() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
-        rt.expect("runtime").block_on(async {
-            let dir = tempfile::tempdir().expect("tmpdir");
-            let auth_path = dir.path().join("auth.json");
-            let mut auth = AuthStorage {
-                path: auth_path,
-                entries: HashMap::new(),
-            };
-            // Insert a NOT expired credential.
-            let initial_access_token = next_token();
-            let initial_refresh_token = next_token();
-            let far_future = chrono::Utc::now().timestamp_millis() + 3_600_000;
-            auth.entries.insert(
-                "my-ext".to_string(),
-                AuthCredential::OAuth {
-                    access_token: initial_access_token.clone(),
-                    refresh_token: initial_refresh_token,
-                    expires: far_future,
-                    token_url: None,
-                    client_id: None,
-                },
-            );
-
-            let client = crate::http::client::Client::new();
-            let mut extension_configs = HashMap::new();
-            extension_configs.insert("my-ext".to_string(), sample_oauth_config());
-
-            let result = auth
-                .refresh_expired_extension_oauth_tokens(&client, &extension_configs)
-                .await;
-            assert!(result.is_ok());
-
-            // Credential should remain unchanged (not expired, no refresh attempted).
-            assert!(
-                matches!(
-                    auth.entries.get("my-ext"),
-                    Some(AuthCredential::OAuth { access_token, .. })
-                        if access_token.eq(&initial_access_token)
-                ),
-                "expected OAuth credential"
-            );
-        });
-    }
-
-    #[test]
-    fn test_refresh_expired_extension_oauth_tokens_skips_unknown_provider() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
-        rt.expect("runtime").block_on(async {
-            let dir = tempfile::tempdir().expect("tmpdir");
-            let auth_path = dir.path().join("auth.json");
-            let mut auth = AuthStorage {
-                path: auth_path,
-                entries: HashMap::new(),
-            };
-            // Expired credential for a provider not in extension_configs.
-            let initial_access_token = next_token();
-            let initial_refresh_token = next_token();
-            auth.entries.insert(
-                "unknown-ext".to_string(),
-                AuthCredential::OAuth {
-                    access_token: initial_access_token.clone(),
-                    refresh_token: initial_refresh_token,
-                    expires: 0,
-                    token_url: None,
-                    client_id: None,
-                },
-            );
-
-            let client = crate::http::client::Client::new();
-            let extension_configs = HashMap::new(); // empty
-
-            let result = auth
-                .refresh_expired_extension_oauth_tokens(&client, &extension_configs)
-                .await;
-            assert!(result.is_ok());
-
-            // Credential should remain unchanged (no config to refresh with).
-            assert!(
-                matches!(
-                    auth.entries.get("unknown-ext"),
-                    Some(AuthCredential::OAuth { access_token, .. })
-                        if access_token.eq(&initial_access_token)
-                ),
-                "expected OAuth credential"
-            );
-        });
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_refresh_expired_extension_oauth_tokens_updates_and_persists() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
-        rt.expect("runtime").block_on(async {
-            let dir = tempfile::tempdir().expect("tmpdir");
-            let auth_path = dir.path().join("auth.json");
-            let mut auth = AuthStorage {
-                path: auth_path.clone(),
-                entries: HashMap::new(),
-            };
-            auth.entries.insert(
-                "my-ext".to_string(),
-                AuthCredential::OAuth {
-                    // ubs:ignore test fixture credential, not live secret.
-                    access_token: "old-access".to_string(),
-                    // ubs:ignore test fixture credential, not live secret.
-                    refresh_token: "old-refresh".to_string(),
-                    expires: 0,
-                    token_url: None,
-                    client_id: None,
-                },
-            );
-
-            let token_url = spawn_json_server(
-                200,
-                r#"{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}"#,
-            );
-            let mut config = sample_oauth_config();
-            config.token_url = token_url;
-
-            let mut extension_configs = HashMap::new();
-            extension_configs.insert("my-ext".to_string(), config);
-
-            let client = crate::http::client::Client::new();
-            auth.refresh_expired_extension_oauth_tokens(&client, &extension_configs)
-                .await
-                .expect("refresh");
-
-            let now = chrono::Utc::now().timestamp_millis();
-            match auth.entries.get("my-ext").expect("credential updated") {
-                AuthCredential::OAuth {
-                    access_token,
-                    refresh_token,
-                    expires,
-                    ..
-                } => {
-                    assert_eq!(access_token, "new-access");
-                    assert_eq!(refresh_token, "new-refresh");
-                    assert!(*expires > now);
-                }
-                other => {
-                    unreachable!("expected oauth credential, got: {other:?}");
-                }
-            }
-
-            let reloaded = AuthStorage::load(auth_path).expect("reload");
-            match reloaded.get("my-ext").expect("persisted credential") {
-                AuthCredential::OAuth {
-                    access_token,
-                    refresh_token,
-                    ..
-                } => {
-                    assert_eq!(access_token, "new-access");
-                    assert_eq!(refresh_token, "new-refresh");
-                }
-                other => {
-                    unreachable!("expected oauth credential, got: {other:?}");
-                }
-            }
-        });
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_refresh_extension_oauth_token_redacts_secret_in_error() {
-        let rt = asupersync::runtime::RuntimeBuilder::current_thread().build();
-        rt.expect("runtime").block_on(async {
-            // ubs:ignore test fixture credential, not live secret.
-            let refresh_secret = "secret-refresh-token-123";
-            let leaked_access = "leaked-access-token-456";
-            let token_url = spawn_json_server(
-                401,
-                &format!(
-                    r#"{{"error":"invalid_grant","echo":"{refresh_secret}","access_token":"{leaked_access}"}}"#
-                ),
-            );
-
-            let mut config = sample_oauth_config();
-            config.token_url = token_url;
-
-            let client = crate::http::client::Client::new();
-            let err = refresh_extension_oauth_token(&client, &config, refresh_secret)
-                .await
-                .expect_err("expected refresh failure");
-            let err_text = err.to_string();
-
-            assert!(
-                err_text.contains("[REDACTED]"),
-                "expected redacted marker in error: {err_text}"
-            );
-            assert!(
-                !err_text.contains(refresh_secret),
-                "refresh token leaked in error: {err_text}"
-            );
-            assert!(
-                !err_text.contains(leaked_access),
-                "access token leaked in error: {err_text}"
-            );
         });
     }
 
@@ -6144,57 +5540,6 @@ mod tests {
         assert!(auth.remove("ext-provider"));
         assert!(auth.get("ext-provider").is_none());
         assert!(!auth.remove("ext-provider")); // already removed
-    }
-
-    #[test]
-    fn test_auth_env_key_returns_none_for_extension_providers() {
-        // Extension providers don't have hard-coded env vars.
-        assert!(env_key_for_provider("my-ext-provider").is_none());
-        assert!(env_key_for_provider("custom-llm").is_none());
-        // Built-in providers do.
-        assert_eq!(env_key_for_provider("anthropic"), Some("ANTHROPIC_API_KEY"));
-        assert_eq!(env_key_for_provider("openai"), Some("OPENAI_API_KEY"));
-    }
-
-    #[test]
-    fn test_extension_oauth_config_special_chars_in_scopes() {
-        let config = crate::models::OAuthConfig {
-            auth_url: "https://auth.example.com/authorize".to_string(),
-            token_url: "https://auth.example.com/token".to_string(),
-            client_id: "ext-client".to_string(),
-            scopes: vec![
-                "api:read".to_string(),
-                "api:write".to_string(),
-                "user:profile".to_string(),
-            ],
-            redirect_uri: None,
-        };
-        let info = start_extension_oauth("scoped", &config).expect("start");
-
-        let (_, query) = info.url.split_once('?').expect("missing query");
-        let params: std::collections::HashMap<_, _> =
-            parse_query_pairs(query).into_iter().collect();
-        assert_eq!(
-            params.get("scope").map(String::as_str),
-            Some("api:read api:write user:profile")
-        );
-    }
-
-    #[test]
-    fn test_extension_oauth_url_encodes_special_chars() {
-        let config = crate::models::OAuthConfig {
-            auth_url: "https://auth.example.com/authorize".to_string(),
-            token_url: "https://auth.example.com/token".to_string(),
-            client_id: "client with spaces".to_string(),
-            scopes: vec!["scope&dangerous".to_string()],
-            redirect_uri: Some("http://localhost:9876/call back".to_string()),
-        };
-        let info = start_extension_oauth("encoded", &config).expect("start");
-
-        // The URL should be valid and contain encoded values.
-        assert!(info.url.contains("client%20with%20spaces"));
-        assert!(info.url.contains("scope%26dangerous"));
-        assert!(info.url.contains("call%20back"));
     }
 
     // ── AuthStorage creation (additional edge cases) ─────────────────
@@ -7938,6 +7283,7 @@ mod tests {
 
     // ── AuthCredential new variant serialization ─────────────────────
 
+    #[cfg(any())]
     #[test]
     fn test_aws_credentials_round_trip() {
         let cred = AuthCredential::AwsCredentials {
@@ -7965,6 +7311,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_credentials_without_optional_fields() {
         let json =
@@ -8072,6 +7419,7 @@ mod tests {
         assert_eq!(auth.api_key("my-gateway").as_deref(), Some("gw-tok-123"));
     }
 
+    #[cfg(any())]
     #[test]
     fn test_api_key_returns_aws_access_key_id() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8115,8 +7463,9 @@ mod tests {
         assert!(auth.api_key("sap-ai-core").is_none());
     }
 
-    // ── AWS Credential Chain ─────────────────────────────────────────
+    // ── Retired AWS Bedrock Credential Chain ─────────────────────────
 
+    #[cfg(any())]
     fn empty_auth() -> AuthStorage {
         let dir = tempfile::tempdir().expect("tmpdir");
         AuthStorage {
@@ -8125,6 +7474,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     /// Acquire the serialisation lock for tests that read/write the
     /// `SSO_PORTAL_BASE_URL_OVERRIDE` static. Without this, parallel test
     /// execution races on the override and produces sporadic 401 responses
@@ -8146,6 +7496,7 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    #[cfg(any())]
     #[test]
     // ubs:ignore test fixture name mentions bearer token but contains no live secret.
     fn test_aws_bearer_token_env_wins() {
@@ -8169,6 +7520,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_env_sigv4_credentials() {
         let auth = empty_auth();
@@ -8192,6 +7544,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_env_sigv4_without_session_token() {
         let auth = empty_auth();
@@ -8213,6 +7566,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_profile_credentials_from_files() {
         let auth = empty_auth();
@@ -8249,6 +7603,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_profile_env_region_overrides_config() {
         let auth = empty_auth();
@@ -8282,6 +7637,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_profile_missing_falls_back_to_auth() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8327,6 +7683,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_default_region_fallback() {
         let auth = empty_auth();
@@ -8345,6 +7702,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_stored_credentials_fallback() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8375,6 +7733,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_stored_credentials_accept_alias_and_case_insensitive_entry() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8405,6 +7764,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_stored_bearer_fallback() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8432,6 +7792,7 @@ mod tests {
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_env_beats_stored() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8463,6 +7824,7 @@ mod tests {
         }
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_no_credentials_returns_none() {
         let auth = empty_auth();
@@ -8470,6 +7832,7 @@ mod tests {
         assert!(result.is_none());
     }
 
+    #[cfg(any())]
     #[test]
     // ubs:ignore test fixture name mentions bearer token but contains no live secret.
     fn test_aws_empty_bearer_token_skipped() {
@@ -8496,6 +7859,7 @@ mod tests {
 
     // ── AWS SSO ──────────────────────────────────────────────────────
 
+    #[cfg(any())]
     /// Helper: build a fully-configured SSO sandbox (config + cache file)
     /// in a fresh temp dir and return env-var overrides for the resolver.
     fn write_sso_sandbox(
@@ -8540,6 +7904,7 @@ mod tests {
         dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_cache_filename_matches_aws_cli() {
         // AWS CLI hashes the literal start-URL (or sso-session name) with SHA1
@@ -8550,6 +7915,7 @@ mod tests {
         assert_eq!(filename, "e8be5486177c5b5392bd9aa76563515b29358e6e.json");
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_detect_session_form() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8590,6 +7956,7 @@ sso_region = us-east-1
         assert_eq!(detected.target_region, "us-west-2");
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_detect_legacy_form() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8626,6 +7993,7 @@ region = eu-west-1
         assert_eq!(detected.target_region, "eu-west-1");
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_non_sso_profile_returns_none() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8647,6 +8015,7 @@ region = eu-west-1
         assert!(detected.is_none());
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_expired_token_returns_error_with_login_command() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8688,6 +8057,7 @@ sso_region = us-east-1
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_missing_cache_returns_error_with_login_command() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8727,6 +8097,7 @@ sso_region = us-east-1
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_sso_session_block_missing_errors() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8757,6 +8128,7 @@ sso_role_name = MyRole
         );
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_missing_role_or_account_errors() {
         let dir = tempfile::tempdir().expect("tmpdir");
@@ -8791,6 +8163,7 @@ sso_region = us-east-1
         );
     }
 
+    #[cfg(any())]
     #[test]
     #[allow(clippy::await_holding_lock)] // intentional — see sso_portal_override_lock docs
     fn test_aws_sso_async_resolver_succeeds_via_mock_portal() {
@@ -8876,6 +8249,7 @@ sso_region = us-east-1
         });
     }
 
+    #[cfg(any())]
     #[test]
     #[allow(clippy::await_holding_lock)] // intentional — see sso_portal_override_lock docs
     fn test_aws_sso_async_resolver_propagates_portal_error() {
@@ -8933,6 +8307,7 @@ sso_region = us-east-1
         });
     }
 
+    #[cfg(any())]
     #[test]
     #[allow(clippy::await_holding_lock)] // intentional — see sso_portal_override_lock docs
     fn test_aws_sso_async_resolver_redacts_access_token_in_errors() {
@@ -8997,6 +8372,7 @@ sso_start_url = https://example.awsapps.com/start
         });
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_async_resolver_falls_through_when_static_creds_present() {
         // Static IAM credentials in env vars must short-circuit the SSO
@@ -9025,6 +8401,7 @@ sso_start_url = https://example.awsapps.com/start
         });
     }
 
+    #[cfg(any())]
     #[test]
     fn test_aws_sso_target_region_overridden_by_env() {
         let dir = tempfile::tempdir().expect("tmpdir");

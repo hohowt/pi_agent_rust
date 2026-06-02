@@ -1493,30 +1493,6 @@ pub const PROVIDER_METADATA: &[ProviderMetadata] = &[
         test_obligations: TEST_REQUIRED,
     },
     ProviderMetadata {
-        canonical_id: "amazon-bedrock",
-        display_name: Some("Amazon Bedrock"),
-        aliases: &["bedrock"],
-        auth_env_keys: &[
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_SESSION_TOKEN",
-            "AWS_BEARER_TOKEN_BEDROCK",
-            "AWS_PROFILE",
-            "AWS_REGION",
-        ],
-        onboarding: ProviderOnboardingMode::NativeAdapterRequired,
-        routing_defaults: Some(ProviderRoutingDefaults {
-            api: "bedrock-converse-stream",
-            base_url: "",
-            auth_header: false,
-            reasoning: true,
-            input: &INPUT_TEXT,
-            context_window: 200_000,
-            max_tokens: 8192,
-        }),
-        test_obligations: TEST_REQUIRED,
-    },
-    ProviderMetadata {
         canonical_id: "sap-ai-core",
         display_name: Some("SAP AI Core"),
         aliases: &["sap"],
@@ -1740,17 +1716,6 @@ mod tests {
             provider_auth_env_keys("vertexai"),
             &["GOOGLE_CLOUD_API_KEY", "VERTEX_API_KEY"]
         );
-        assert_eq!(
-            provider_auth_env_keys("bedrock"),
-            &[
-                "AWS_ACCESS_KEY_ID",
-                "AWS_SECRET_ACCESS_KEY",
-                "AWS_SESSION_TOKEN",
-                "AWS_BEARER_TOKEN_BEDROCK",
-                "AWS_PROFILE",
-                "AWS_REGION",
-            ]
-        );
         assert_eq!(provider_auth_env_keys("azure"), &["AZURE_OPENAI_API_KEY"]);
         assert_eq!(
             provider_auth_env_keys("azure-cognitive-services"),
@@ -1832,14 +1797,6 @@ mod tests {
     #[test]
     fn provider_routing_defaults_absent_for_native_adapter_only_providers() {
         assert!(provider_routing_defaults("azure-openai").is_none());
-    }
-
-    #[test]
-    fn provider_routing_defaults_present_for_bedrock_native_adapter() {
-        let defaults = provider_routing_defaults("amazon-bedrock").expect("bedrock defaults");
-        assert_eq!(defaults.api, "bedrock-converse-stream");
-        assert_eq!(defaults.base_url, "");
-        assert!(!defaults.auth_header);
     }
 
     #[test]
@@ -2771,7 +2728,6 @@ mod tests {
             ("togetherai", "Together AI"),
             ("huggingface", "Hugging Face"),
             ("nvidia", "NVIDIA NIM"),
-            ("amazon-bedrock", "Amazon Bedrock"),
             ("azure-openai", "Azure OpenAI"),
             ("github-copilot", "GitHub Copilot"),
             ("google-vertex", "Google Vertex AI"),

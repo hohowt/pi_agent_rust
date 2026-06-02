@@ -329,8 +329,6 @@ pub struct SessionMetrics {
     pub provider_streaming: TimingCounter,
     /// Built-in/local tool execution latency.
     pub local_tools: TimingCounter,
-    /// Extension event and hostcall dispatch latency around tool activity.
-    pub extension_hostcalls: TimingCounter,
     /// Full TUI view rendering latency.
     pub tui_render: TimingCounter,
     /// Conversation content build latency inside TUI rendering.
@@ -363,7 +361,6 @@ impl SessionMetrics {
             append: TimingCounter::new(),
             provider_streaming: TimingCounter::new(),
             local_tools: TimingCounter::new(),
-            extension_hostcalls: TimingCounter::new(),
             tui_render: TimingCounter::new(),
             tui_content_build: TimingCounter::new(),
             tui_viewport_sync: TimingCounter::new(),
@@ -434,7 +431,6 @@ impl SessionMetrics {
         self.append.reset();
         self.provider_streaming.reset();
         self.local_tools.reset();
-        self.extension_hostcalls.reset();
         self.tui_render.reset();
         self.tui_content_build.reset();
         self.tui_viewport_sync.reset();
@@ -463,7 +459,6 @@ impl SessionMetrics {
             append: self.append.snapshot(),
             provider_streaming: self.provider_streaming.snapshot(),
             local_tools: self.local_tools.snapshot(),
-            extension_hostcalls: self.extension_hostcalls.snapshot(),
             tui_render: self.tui_render.snapshot(),
             tui_content_build: self.tui_content_build.snapshot(),
             tui_viewport_sync: self.tui_viewport_sync.snapshot(),
@@ -497,7 +492,6 @@ impl SessionMetrics {
              Append:           {}\n  \
              Provider stream:  {}\n  \
              Local tools:      {}\n  \
-             Extension calls:  {}\n  \
              TUI render:       {}\n  \
              TUI content:      {}\n  \
              TUI viewport:     {}\n  \
@@ -520,7 +514,6 @@ impl SessionMetrics {
             s.append,
             s.provider_streaming,
             s.local_tools,
-            s.extension_hostcalls,
             s.tui_render,
             s.tui_content_build,
             s.tui_viewport_sync,
@@ -568,7 +561,6 @@ pub struct MetricsSnapshot {
     pub append: TimingSnapshot,
     pub provider_streaming: TimingSnapshot,
     pub local_tools: TimingSnapshot,
-    pub extension_hostcalls: TimingSnapshot,
     pub tui_render: TimingSnapshot,
     pub tui_content_build: TimingSnapshot,
     pub tui_viewport_sync: TimingSnapshot,
@@ -621,11 +613,6 @@ impl MetricsSnapshot {
                     id: "local_tools",
                     label: "Local tools",
                     snapshot: self.local_tools,
-                },
-                TailLatencyMetric {
-                    id: "extension_hostcalls",
-                    label: "Extension hostcalls",
-                    snapshot: self.extension_hostcalls,
                 },
                 TailLatencyMetric {
                     id: "session_append",
@@ -1003,7 +990,6 @@ mod tests {
         assert!(summary.contains("Append:"));
         assert!(summary.contains("Provider stream:"));
         assert!(summary.contains("Local tools:"));
-        assert!(summary.contains("Extension calls:"));
         assert!(summary.contains("TUI render:"));
     }
 
@@ -1013,7 +999,6 @@ mod tests {
         metrics.enable();
         metrics.provider_streaming.record(1_000);
         metrics.local_tools.record(2_000);
-        metrics.extension_hostcalls.record(3_000);
         metrics.tui_render.record(4_000);
 
         let report = metrics.operator_tail_latency_report();
@@ -1032,7 +1017,6 @@ mod tests {
         let metric_ids: Vec<&str> = report.metrics.iter().map(|metric| metric.id).collect();
         assert!(metric_ids.contains(&"provider_streaming"));
         assert!(metric_ids.contains(&"local_tools"));
-        assert!(metric_ids.contains(&"extension_hostcalls"));
         assert!(metric_ids.contains(&"session_append"));
         assert!(metric_ids.contains(&"session_index_upsert"));
         assert!(metric_ids.contains(&"tui_render"));

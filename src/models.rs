@@ -21,8 +21,6 @@ pub struct ModelEntry {
     pub headers: HashMap<String, String>,
     pub auth_header: bool,
     pub compat: Option<CompatConfig>,
-    /// OAuth config for extension-registered providers that require browser-based auth.
-    pub oauth_config: Option<OAuthConfig>,
 }
 
 impl ModelEntry {
@@ -77,16 +75,6 @@ impl ModelEntry {
         }
         thinking
     }
-}
-
-/// OAuth configuration for extension-registered providers.
-#[derive(Debug, Clone)]
-pub struct OAuthConfig {
-    pub auth_url: String,
-    pub token_url: String,
-    pub client_id: String,
-    pub scopes: Vec<String>,
-    pub redirect_uri: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -584,7 +572,6 @@ pub(crate) fn model_requires_configured_credential(entry: &ModelEntry) -> bool {
     entry.auth_header
         || crate::provider_metadata::provider_metadata(provider)
             .is_some_and(|meta| !meta.auth_env_keys.is_empty())
-        || entry.oauth_config.is_some()
 }
 
 pub(crate) fn model_entry_is_ready(entry: &ModelEntry) -> bool {
@@ -698,8 +685,7 @@ impl ModelRegistry {
             .cloned()
     }
 
-    /// Find a model by ID alone (ignoring provider), useful for extension models
-    /// where the provider name may be custom.
+    /// Find a model by ID alone (ignoring provider).
     ///
     /// When multiple providers carry the same model ID, the canonical/primary
     /// provider is preferred (e.g. `anthropic` for Claude models, `openai` for
@@ -731,7 +717,7 @@ impl ModelRegistry {
         best.cloned()
     }
 
-    /// Merge extension-provided model entries into the registry.
+    /// Merge additional model entries into the registry.
     pub fn merge_entries(&mut self, entries: Vec<ModelEntry>) {
         for entry in entries {
             // Skip duplicates (canonical provider + canonical model id, case-insensitive).
@@ -1053,7 +1039,6 @@ fn append_upstream_nonlegacy_models(
                 headers: HashMap::new(),
                 auth_header: defaults.auth_header,
                 compat: None,
-                oauth_config: None,
             });
         }
     }
@@ -1188,7 +1173,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             } else {
                 None
             },
-            oauth_config: None,
         });
     }
 
@@ -1243,7 +1227,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: false,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1292,7 +1275,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1337,7 +1319,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1386,7 +1367,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1431,7 +1411,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1476,7 +1455,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1522,7 +1500,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1567,7 +1544,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1607,7 +1583,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1647,7 +1622,6 @@ fn built_in_models(auth: &AuthStorage, mode: ModelRegistryLoadMode) -> Vec<Model
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -1865,7 +1839,6 @@ fn apply_custom_models(
                 headers: model_headers,
                 auth_header,
                 compat: merge_compat(provider_cfg.compat.as_ref(), model_cfg.compat.as_ref()),
-                oauth_config: None,
             });
         }
     }
@@ -2193,7 +2166,6 @@ where
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         });
     }
 
@@ -2226,7 +2198,6 @@ where
         headers: HashMap::new(),
         auth_header: defaults.auth_header,
         compat: None,
-        oauth_config: None,
     })
 }
 
@@ -2652,7 +2623,6 @@ mod tests {
             headers: HashMap::from([("x-built-in".to_string(), "keep-me".to_string())]),
             auth_header: false,
             compat: None,
-            oauth_config: None,
         }];
 
         let config = ModelsConfig {
@@ -2706,7 +2676,6 @@ mod tests {
             headers: HashMap::from([("x-built-in".to_string(), "remove-me".to_string())]),
             auth_header: false,
             compat: None,
-            oauth_config: None,
         }];
 
         let config = ModelsConfig {
@@ -3109,7 +3078,6 @@ mod tests {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         };
 
         registry.merge_entries(vec![duplicate, new_entry]);
@@ -3421,7 +3389,6 @@ mod tests {
             headers: HashMap::new(),
             auth_header: false,
             compat: None,
-            oauth_config: None,
         }
     }
 
@@ -3557,7 +3524,6 @@ mod tests {
             "openai",
             "google",
             "cohere",
-            "amazon-bedrock",
             "groq",
             "deepinfra",
             "cerebras",
@@ -3804,14 +3770,6 @@ mod tests {
         let defaults = ad_hoc_provider_defaults("groq").unwrap();
         assert_eq!(defaults.api, "openai-completions");
         assert!(defaults.base_url.contains("groq.com"));
-    }
-
-    #[test]
-    fn ad_hoc_bedrock_uses_converse_api() {
-        let defaults = ad_hoc_provider_defaults("amazon-bedrock").unwrap();
-        assert_eq!(defaults.api, "bedrock-converse-stream");
-        assert_eq!(defaults.base_url, "");
-        assert!(!defaults.auth_header);
     }
 
     #[test]
@@ -4373,22 +4331,6 @@ mod tests {
         );
     }
 
-    // ─── OAuthConfig ─────────────────────────────────────────────────
-
-    #[test]
-    fn oauth_config_fields() {
-        let config = OAuthConfig {
-            auth_url: "https://auth.example.com/authorize".to_string(),
-            token_url: "https://auth.example.com/token".to_string(),
-            client_id: "client-123".to_string(),
-            scopes: vec!["read".to_string(), "write".to_string()],
-            redirect_uri: Some("http://localhost:8080/callback".to_string()),
-        };
-        assert_eq!(config.client_id, "client-123");
-        assert_eq!(config.scopes.len(), 2);
-        assert!(config.redirect_uri.is_some());
-    }
-
     // ─── Built-in model properties ───────────────────────────────────
 
     #[test]
@@ -4676,7 +4618,6 @@ mod tests {
                 headers: HashMap::new(),
                 auth_header: false,
                 compat: None,
-                oauth_config: None,
             }
         }
 

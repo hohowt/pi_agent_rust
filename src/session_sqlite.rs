@@ -1,9 +1,7 @@
 use crate::error::{Error, Result};
 use crate::session::{SessionEntry, SessionHeader};
 use crate::session_metrics;
-use sqlmodel_core::{Error as SqliteError, Row as SqliteRow, Value as SqliteValue};
-use sqlmodel_sqlite::{OpenFlags, SqliteConfig, SqliteConnection};
-use std::fmt::Write as _;
+use rusqlite::{Connection, OpenFlags, params};
 use std::path::{Path, PathBuf};
 
 const INIT_SQL: &str = r"
@@ -34,27 +32,26 @@ pub struct SqliteSessionMeta {
     pub name: Option<String>,
 }
 
-fn map_sqlite_result<T>(result: std::result::Result<T, SqliteError>) -> Result<T> {
+fn map_sqlite_result<T>(result: rusqlite::Result<T>) -> Result<T> {
     result.map_err(|err| Error::session(format!("SQLite session error: {err}")))
 }
 
-fn open_sqlite_connection_read_only(path: &Path) -> Result<SqliteConnection> {
-    let config = SqliteConfig::file(path.to_string_lossy()).flags(OpenFlags::read_only());
-    map_sqlite_result(SqliteConnection::open(&config))
+fn open_sqlite_connection_read_only(path: &Path) -> Result<Connection> {
+    map_sqlite_result(Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ))
 }
 
-fn open_sqlite_connection_read_write(path: &Path) -> Result<SqliteConnection> {
-    let config = SqliteConfig::file(path.to_string_lossy()).flags(OpenFlags::create_read_write());
-    map_sqlite_result(SqliteConnection::open(&config))
+fn open_sqlite_connection_read_write(path: &Path) -> Result<Connection> {
+    map_sqlite_result(Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+    ))
 }
 
-fn row_get_string(row: &SqliteRow, column: &str) -> Result<String> {
-    row.get_named::<String>(column)
-        .map_err(|err| Error::session(format!("SQLite row read failed: {err}")))
-}
-
-fn rollback_quietly(conn: &SqliteConnection) {
-    let _ = conn.execute_raw("ROLLBACK");
+fn rollback_quietly(conn: &Connection) {
+    let _ = conn.execute_batch("ROLLBACK");
 }
 
 fn sqlite_artifact_paths(path: &Path) -> [PathBuf; 3] {
@@ -98,14 +95,14 @@ fn ensure_private_sqlite_permissions(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_all_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
-    let entry_rows = map_sqlite_result(
-        conn.query_sync("SELECT json FROM pi_session_entries ORDER BY seq ASC", &[]),
-    )?;
+fn read_all_entries(conn: &Connection) -> Result<Vec<SessionEntry>> {
+    let mut stmt =
+        map_sqlite_result(conn.prepare("SELECT json FROM pi_session_entries ORDER BY seq ASC"))?;
+    let rows = map_sqlite_result(stmt.query_map([], |row| row.get::<_, String>(0)))?;
 
-    let mut entries = Vec::with_capacity(entry_rows.len());
-    for row in entry_rows {
-        let json = row_get_string(&row, "json")?;
+    let mut entries = Vec::new();
+    for json_result in rows {
+        let json = map_sqlite_result(json_result)?;
         let entry: SessionEntry = serde_json::from_str(&json).map_err(|err| {
             Error::session(format!(
                 "Failed to parse session entry: {err}\nJSON: {json}"
@@ -116,21 +113,29 @@ fn read_all_entries(conn: &SqliteConnection) -> Result<Vec<SessionEntry>> {
     Ok(entries)
 }
 
-fn is_missing_meta_table_error(err: &SqliteError) -> bool {
+fn is_missing_meta_table_error(err: &rusqlite::Error) -> bool {
     err.to_string().contains("no such table: pi_session_meta")
 }
 
-fn query_session_meta_rows(conn: &SqliteConnection) -> Result<Vec<SqliteRow>> {
-    match conn.query_sync(
-        "SELECT key,value FROM pi_session_meta WHERE key IN ('message_count','name')",
-        &[],
-    ) {
-        Ok(rows) => Ok(rows),
-        Err(err) if is_missing_meta_table_error(&err) => Ok(Vec::new()),
-        Err(err) => Err(Error::session(format!(
-            "SQLite session meta query failed: {err}"
-        ))),
-    }
+fn query_session_meta_rows(conn: &Connection) -> Result<Vec<(String, String)>> {
+    let mut stmt = match conn
+        .prepare("SELECT key,value FROM pi_session_meta WHERE key IN ('message_count','name')")
+    {
+        Ok(stmt) => stmt,
+        Err(err) if is_missing_meta_table_error(&err) => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(Error::session(format!(
+                "SQLite session meta query failed: {err}"
+            )));
+        }
+    };
+    let rows = map_sqlite_result(stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }))?;
+    rows.map(|row| {
+        row.map_err(|err| Error::session(format!("SQLite session meta row failed: {err}")))
+    })
+    .collect()
 }
 
 fn compute_message_count_and_name(entries: &[SessionEntry]) -> (u64, Option<String>) {
@@ -150,6 +155,18 @@ fn compute_message_count_and_name(entries: &[SessionEntry]) -> (u64, Option<Stri
     (message_count, name)
 }
 
+fn insert_entry_jsons(conn: &Connection, entry_jsons: &[String], start_seq: i64) -> Result<()> {
+    let mut stmt = map_sqlite_result(
+        conn.prepare("INSERT INTO pi_session_entries (seq,json) VALUES (?1,?2)"),
+    )?;
+    let mut seq = start_seq;
+    for json in entry_jsons {
+        map_sqlite_result(stmt.execute(params![seq, json]))?;
+        seq = seq.saturating_add(1);
+    }
+    Ok(())
+}
+
 #[allow(
     clippy::unused_async,
     reason = "session storage keeps an async backend contract"
@@ -166,12 +183,16 @@ pub async fn load_session(path: &Path) -> Result<(SessionHeader, Vec<SessionEntr
 
     let conn = open_sqlite_connection_read_only(path)?;
 
-    let header_row =
-        map_sqlite_result(conn.query_sync("SELECT json FROM pi_session_header LIMIT 1", &[]))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::session("SQLite session missing header row"))?;
-    let header_json = row_get_string(&header_row, "json")?;
+    let header_json = conn
+        .query_row("SELECT json FROM pi_session_header LIMIT 1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => {
+                Error::session("SQLite session missing header row")
+            }
+            other => Error::session(format!("SQLite session header query failed: {other}")),
+        })?;
     let header: SessionHeader = serde_json::from_str(&header_json).map_err(|err| {
         Error::session(format!(
             "Failed to parse session header: {err}\nJSON: {header_json}"
@@ -202,12 +223,16 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
 
     let conn = open_sqlite_connection_read_only(path)?;
 
-    let header_row =
-        map_sqlite_result(conn.query_sync("SELECT json FROM pi_session_header LIMIT 1", &[]))?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::session("SQLite session missing header row"))?;
-    let header_json = row_get_string(&header_row, "json")?;
+    let header_json = conn
+        .query_row("SELECT json FROM pi_session_header LIMIT 1", [], |row| {
+            row.get::<_, String>(0)
+        })
+        .map_err(|err| match err {
+            rusqlite::Error::QueryReturnedNoRows => {
+                Error::session("SQLite session missing header row")
+            }
+            other => Error::session(format!("SQLite session header query failed: {other}")),
+        })?;
     let header: SessionHeader = serde_json::from_str(&header_json).map_err(|err| {
         Error::session(format!(
             "Failed to parse session header: {err}\nJSON: {header_json}"
@@ -221,9 +246,7 @@ pub async fn load_session_meta(path: &Path) -> Result<SqliteSessionMeta> {
 
     let mut message_count: Option<u64> = None;
     let mut name: Option<String> = None;
-    for row in meta_rows {
-        let key = row_get_string(&row, "key")?;
-        let value = row_get_string(&row, "value")?;
+    for (key, value) in meta_rows {
         match key.as_str() {
             "message_count" => message_count = value.parse::<u64>().ok(),
             "name" if !value.is_empty() => {
@@ -452,8 +475,13 @@ mod tests {
 
     #[test]
     fn map_sqlite_result_err() {
-        let config = SqliteConfig::file("bad\0path").flags(OpenFlags::create_read_write());
-        let result = map_sqlite_result::<i32>(SqliteConnection::open(&config).map(|_| 42));
+        let result = map_sqlite_result::<i32>(
+            Connection::open_with_flags(
+                "bad\0path",
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+            )
+            .map(|_| 42),
+        );
         let err = result.unwrap_err();
         match err {
             Error::Session(message) => {
@@ -589,12 +617,10 @@ mod tests {
         };
         let invalid_json =
             serde_json::to_string(&invalid_header).expect("serialize invalid session header");
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_sync(
+        let conn = open_sqlite_connection_read_write(&path).expect("open sqlite db");
+        conn.execute(
             "UPDATE pi_session_header SET json = ?1",
-            &[sqlmodel_core::Value::Text(invalid_json)],
+            params![invalid_json],
         )
         .expect("corrupt sqlite header row");
 
@@ -624,12 +650,10 @@ mod tests {
         futures::executor::block_on(async { save_session(&path, &header, &entries).await })
             .expect("save sqlite session");
 
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_sync(
+        let conn = open_sqlite_connection_read_write(&path).expect("open sqlite db");
+        conn.execute(
             "DELETE FROM pi_session_meta WHERE key = ?1",
-            &[SqliteValue::Text("name".to_string())],
+            params!["name"],
         )
         .expect("delete name meta row");
 
@@ -655,10 +679,8 @@ mod tests {
         futures::executor::block_on(async { save_session(&path, &header, &entries).await })
             .expect("save sqlite session");
 
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_raw("DROP TABLE pi_session_meta")
+        let conn = open_sqlite_connection_read_write(&path).expect("open sqlite db");
+        conn.execute_batch("DROP TABLE pi_session_meta")
             .expect("drop sqlite meta table");
 
         let meta = futures::executor::block_on(async { load_session_meta(&path).await })
@@ -681,12 +703,10 @@ mod tests {
         })
         .expect("save sqlite session");
 
-        let config = sqlmodel_sqlite::SqliteConfig::file(path.to_string_lossy())
-            .flags(sqlmodel_sqlite::OpenFlags::create_read_write());
-        let conn = sqlmodel_sqlite::SqliteConnection::open(&config).expect("open sqlite db");
-        conn.execute_raw("DROP TABLE pi_session_meta")
+        let conn = open_sqlite_connection_read_write(&path).expect("open sqlite db");
+        conn.execute_batch("DROP TABLE pi_session_meta")
             .expect("drop sqlite meta table");
-        conn.execute_raw("CREATE TABLE pi_session_meta (key TEXT PRIMARY KEY)")
+        conn.execute_batch("CREATE TABLE pi_session_meta (key TEXT PRIMARY KEY)")
             .expect("create invalid sqlite meta table");
 
         let err = futures::executor::block_on(async { load_session_meta(&path).await })
@@ -791,15 +811,15 @@ pub async fn save_session(
     }
 
     let conn = open_sqlite_connection_read_write(path)?;
-    map_sqlite_result(conn.execute_raw(INIT_SQL))?;
+    map_sqlite_result(conn.execute_batch(INIT_SQL))?;
     ensure_private_sqlite_permissions(path)?;
-    map_sqlite_result(conn.execute_raw("BEGIN IMMEDIATE"))?;
+    map_sqlite_result(conn.execute_batch("BEGIN IMMEDIATE"))?;
 
     // Serialize header + entries and track serialization time + bytes.
     let save_result = (|| -> Result<()> {
-        map_sqlite_result(conn.execute_sync("DELETE FROM pi_session_entries", &[]))?;
-        map_sqlite_result(conn.execute_sync("DELETE FROM pi_session_header", &[]))?;
-        map_sqlite_result(conn.execute_sync("DELETE FROM pi_session_meta", &[]))?;
+        map_sqlite_result(conn.execute("DELETE FROM pi_session_entries", []))?;
+        map_sqlite_result(conn.execute("DELETE FROM pi_session_header", []))?;
+        map_sqlite_result(conn.execute("DELETE FROM pi_session_meta", []))?;
 
         let serialize_timer = metrics.start_timer(&metrics.sqlite_serialize);
         let header_json = serde_json::to_string(header)?;
@@ -814,46 +834,22 @@ pub async fn save_session(
         serialize_timer.finish();
         metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
 
-        map_sqlite_result(conn.execute_sync(
+        map_sqlite_result(conn.execute(
             "INSERT INTO pi_session_header (id,json) VALUES (?1,?2)",
-            &[
-                SqliteValue::Text(header.id.clone()),
-                SqliteValue::Text(header_json),
-            ],
+            params![header.id, header_json],
         ))?;
 
-        let mut seq = 1_i64;
-        for chunk in entry_jsons.chunks(200) {
-            let mut sql = String::with_capacity(64 + chunk.len() * 16);
-            sql.push_str("INSERT INTO pi_session_entries (seq,json) VALUES ");
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            for (i, json) in chunk.iter().enumerate() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                let _ = write!(sql, "(?{},?{})", i * 2 + 1, i * 2 + 2);
-                params.push(SqliteValue::BigInt(seq));
-                params.push(SqliteValue::Text(json.clone()));
-                seq += 1;
-            }
-            map_sqlite_result(conn.execute_sync(&sql, &params))?;
-        }
+        insert_entry_jsons(&conn, &entry_jsons, 1)?;
 
         let (message_count, name) = compute_message_count_and_name(entries);
-        map_sqlite_result(conn.execute_sync(
+        map_sqlite_result(conn.execute(
             "INSERT INTO pi_session_meta (key,value) VALUES (?1,?2)",
-            &[
-                SqliteValue::Text("message_count".to_string()),
-                SqliteValue::Text(message_count.to_string()),
-            ],
+            params!["message_count", message_count.to_string()],
         ))?;
         let name_value = name.unwrap_or_default();
-        map_sqlite_result(conn.execute_sync(
+        map_sqlite_result(conn.execute(
             "INSERT INTO pi_session_meta (key,value) VALUES (?1,?2)",
-            &[
-                SqliteValue::Text("name".to_string()),
-                SqliteValue::Text(name_value),
-            ],
+            params!["name", name_value],
         ))?;
 
         Ok(())
@@ -861,7 +857,7 @@ pub async fn save_session(
 
     match save_result {
         Ok(()) => {
-            map_sqlite_result(conn.execute_raw("COMMIT"))?;
+            map_sqlite_result(conn.execute_batch("COMMIT"))?;
             ensure_private_sqlite_permissions(path)?;
             Ok(())
         }
@@ -897,9 +893,9 @@ pub async fn append_entries(
     let conn = open_sqlite_connection_read_write(path)?;
 
     // Ensure WAL mode is active and tables exist (especially pi_session_meta for old DBs).
-    map_sqlite_result(conn.execute_raw(INIT_SQL))?;
+    map_sqlite_result(conn.execute_batch(INIT_SQL))?;
     ensure_private_sqlite_permissions(path)?;
-    map_sqlite_result(conn.execute_raw("BEGIN IMMEDIATE"))?;
+    map_sqlite_result(conn.execute_batch("BEGIN IMMEDIATE"))?;
 
     let append_result = (|| -> Result<()> {
         // Serialize and insert only the new entries.
@@ -914,40 +910,20 @@ pub async fn append_entries(
         serialize_timer.finish();
         metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
 
-        let mut seq = i64::try_from(start_seq)
+        let start_seq = i64::try_from(start_seq)
             .unwrap_or(i64::MAX.saturating_sub(1))
             .saturating_add(1);
-        for chunk in entry_jsons.chunks(200) {
-            let mut sql = String::with_capacity(64 + chunk.len() * 16);
-            sql.push_str("INSERT INTO pi_session_entries (seq,json) VALUES ");
-            let mut params = Vec::with_capacity(chunk.len() * 2);
-            for (i, json) in chunk.iter().enumerate() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                let _ = write!(sql, "(?{},?{})", i * 2 + 1, i * 2 + 2);
-                params.push(SqliteValue::BigInt(seq));
-                params.push(SqliteValue::Text(json.clone()));
-                seq += 1;
-            }
-            map_sqlite_result(conn.execute_sync(&sql, &params))?;
-        }
+        insert_entry_jsons(&conn, &entry_jsons, start_seq)?;
 
         // Upsert meta counters (INSERT OR REPLACE).
-        map_sqlite_result(conn.execute_sync(
+        map_sqlite_result(conn.execute(
             "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
-            &[
-                SqliteValue::Text("message_count".to_string()),
-                SqliteValue::Text(message_count.to_string()),
-            ],
+            params!["message_count", message_count.to_string()],
         ))?;
         let name_value = session_name.unwrap_or("");
-        map_sqlite_result(conn.execute_sync(
+        map_sqlite_result(conn.execute(
             "INSERT OR REPLACE INTO pi_session_meta (key,value) VALUES (?1,?2)",
-            &[
-                SqliteValue::Text("name".to_string()),
-                SqliteValue::Text(name_value.to_string()),
-            ],
+            params!["name", name_value],
         ))?;
 
         Ok(())
@@ -955,7 +931,7 @@ pub async fn append_entries(
 
     match append_result {
         Ok(()) => {
-            map_sqlite_result(conn.execute_raw("COMMIT"))?;
+            map_sqlite_result(conn.execute_batch("COMMIT"))?;
             ensure_private_sqlite_permissions(path)?;
             Ok(())
         }

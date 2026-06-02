@@ -1,4 +1,4 @@
-//! Resource loading for skills, prompt templates, themes, and extensions.
+//! Resource loading for skills, prompt templates, and themes.
 //!
 //! Implements a subset of pi-mono's resource discovery behavior:
 //! - Skills (Agent Skills spec)
@@ -7,9 +7,7 @@
 
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::package_manager::{
-    PackageManager, PackageScope, ResolveExtensionSourcesOptions, ResolvedResource, ResourceOrigin,
-};
+use crate::package_manager::{PackageManager, PackageScope, ResolvedResource, ResourceOrigin};
 use crate::theme::Theme;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
@@ -176,11 +174,9 @@ pub struct LoadThemesResult {
 pub struct ResourceCliOptions {
     pub no_skills: bool,
     pub no_prompt_templates: bool,
-    pub no_extensions: bool,
     pub no_themes: bool,
     pub skill_paths: Vec<String>,
     pub prompt_paths: Vec<String>,
-    pub extension_paths: Vec<String>,
     pub theme_paths: Vec<String>,
 }
 
@@ -189,38 +185,21 @@ impl ResourceCliOptions {
     pub fn has_explicit_paths(&self) -> bool {
         !self.skill_paths.is_empty()
             || !self.prompt_paths.is_empty()
-            || !self.extension_paths.is_empty()
             || !self.theme_paths.is_empty()
     }
 
-    /// Returns `true` when every resource category is disabled via `--no-*` flags
-    /// and there are no explicit CLI `-e` extension sources that would require
-    /// package resolution.
+    /// Returns `true` when every resource category is disabled via `--no-*` flags.
     #[must_use]
     pub const fn all_configured_resources_disabled(&self) -> bool {
-        self.no_skills && self.no_prompt_templates && self.no_extensions && self.no_themes
+        self.no_skills && self.no_prompt_templates && self.no_themes
     }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct PackageResources {
-    pub extensions: Vec<PathBuf>,
     pub skills: Vec<PathBuf>,
     pub prompts: Vec<PathBuf>,
     pub themes: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ExtensionResourcePaths {
-    pub skill_paths: Vec<PathBuf>,
-    pub prompt_paths: Vec<PathBuf>,
-    pub theme_paths: Vec<PathBuf>,
-}
-
-impl ExtensionResourcePaths {
-    pub fn is_empty(&self) -> bool {
-        self.skill_paths.is_empty() && self.prompt_paths.is_empty() && self.theme_paths.is_empty()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -231,7 +210,6 @@ pub struct ResourceLoader {
     prompt_diagnostics: Vec<ResourceDiagnostic>,
     themes: Vec<ThemeResource>,
     theme_diagnostics: Vec<ResourceDiagnostic>,
-    extensions: Vec<PathBuf>,
     enable_skill_commands: bool,
 }
 
@@ -244,7 +222,6 @@ impl ResourceLoader {
             prompt_diagnostics: Vec::new(),
             themes: Vec::new(),
             theme_diagnostics: Vec::new(),
-            extensions: Vec::new(),
             enable_skill_commands,
         }
     }
@@ -259,31 +236,15 @@ impl ResourceLoader {
         let enable_skill_commands = config.enable_skill_commands();
 
         // Skip the expensive package/settings resolution when every resource
-        // category is disabled (--no-extensions --no-skills etc.) and there are
-        // no explicit CLI `-e` sources.  This avoids reading settings.json,
-        // running npm lookups, and hitting the network on startup when the user
-        // explicitly opted out of all configured resources (Issue #38).
-        let skip_configured_resolution =
-            cli.all_configured_resources_disabled() && cli.extension_paths.is_empty();
+        // category is disabled. This avoids reading settings.json, running npm
+        // lookups, and hitting the network on startup when the user explicitly
+        // opted out of all configured resources.
+        let skip_configured_resolution = cli.all_configured_resources_disabled();
 
         let resolved = if skip_configured_resolution {
             crate::package_manager::ResolvedPaths::default()
         } else {
             Box::pin(manager.resolve()).await?
-        };
-
-        let cli_extensions = if cli.extension_paths.is_empty() {
-            crate::package_manager::ResolvedPaths::default()
-        } else {
-            validate_non_empty_cli_inputs(&cli.extension_paths, "extension source")?;
-            Box::pin(manager.resolve_extension_sources(
-                &cli.extension_paths,
-                ResolveExtensionSourcesOptions {
-                    local: false,
-                    temporary: true,
-                },
-            ))
-            .await?
         };
 
         validate_non_empty_cli_inputs(&cli.skill_paths, "skill path")?;
@@ -315,42 +276,29 @@ impl ResourceLoader {
 
         // Merge paths with documented precedence semantics:
         // - explicit CLI resources win over everything else
-        // - CLI `-e` resources outrank configured/project/global/package resources
         // - project directories outrank global directories, which outrank installed packages
         // - `--no-skills` / `--no-prompt-templates` / `--no-themes` only disable configured
-        //   resources; explicit CLI paths and CLI `-e` resources still participate
+        //   resources; explicit CLI paths still participate
         let skill_paths = merge_resource_paths(
             &explicit_skill_paths,
-            cli_extensions.skills,
+            Vec::new(),
             resolved.skills,
             !cli.no_skills,
         );
 
         let prompt_paths = merge_resource_paths(
             &explicit_prompt_paths,
-            cli_extensions.prompts,
+            Vec::new(),
             resolved.prompts,
             !cli.no_prompt_templates,
         );
 
         let theme_paths = merge_resource_paths(
             &explicit_theme_paths,
-            cli_extensions.themes,
+            Vec::new(),
             resolved.themes,
             !cli.no_themes,
         );
-
-        // Extension entries:
-        // - `--no-extensions` disables configured + auto discovery but still allows CLI `-e` sources.
-        // - Deduplicate by canonical extension ID so that transpiled cache copies
-        //   in `~/.pi/agent/cache/modules/` don't cause command collisions with
-        //   the original source `.ts` extensions (Issue #37).
-        let extension_entries = dedupe_extension_entries_by_id(merge_resource_paths(
-            &[],
-            cli_extensions.extensions,
-            resolved.extensions,
-            !cli.no_extensions,
-        ));
 
         // Load skills, prompt templates, and themes in parallel — they are independent
         // filesystem walks that benefit from overlapped I/O on multi-core machines.
@@ -444,108 +392,8 @@ impl ResourceLoader {
             prompt_diagnostics,
             themes,
             theme_diagnostics: theme_diags,
-            extensions: extension_entries,
             enable_skill_commands,
         })
-    }
-
-    pub fn extend_with_paths(&mut self, cwd: &Path, paths: &ExtensionResourcePaths) -> Result<()> {
-        if paths.is_empty() {
-            return Ok(());
-        }
-
-        let agent_dir = Config::global_dir();
-        let cwd_buf = cwd.to_path_buf();
-
-        if !paths.skill_paths.is_empty() {
-            let skill_paths = dedupe_paths(paths.skill_paths.clone());
-            if !skill_paths.is_empty() {
-                let result = load_skills(LoadSkillsOptions {
-                    cwd: cwd_buf.clone(),
-                    agent_dir: agent_dir.clone(),
-                    skill_paths,
-                    include_defaults: false,
-                });
-
-                let mut existing_names: HashMap<String, PathBuf> = HashMap::new();
-                let mut existing_paths: HashSet<PathBuf> = HashSet::new();
-                for skill in &self.skills {
-                    existing_names.insert(skill.name.clone(), skill.file_path.clone());
-                    existing_paths.insert(canonical_identity_path(&skill.file_path));
-                }
-
-                let mut collisions = Vec::new();
-                for skill in result.skills {
-                    let real_path = canonical_identity_path(&skill.file_path);
-                    if existing_paths.contains(&real_path) {
-                        continue;
-                    }
-                    if let Some(winner_path) = existing_names.get(&skill.name) {
-                        collisions.push(ResourceDiagnostic {
-                            kind: DiagnosticKind::Collision,
-                            message: format!("name \"{}\" collision", skill.name),
-                            path: skill.file_path.clone(),
-                            collision: Some(CollisionInfo {
-                                resource_type: "skill".to_string(),
-                                name: skill.name.clone(),
-                                winner_path: winner_path.clone(),
-                                loser_path: skill.file_path.clone(),
-                            }),
-                        });
-                    } else {
-                        existing_names.insert(skill.name.clone(), skill.file_path.clone());
-                        existing_paths.insert(real_path);
-                        self.skills.push(skill);
-                    }
-                }
-
-                self.skill_diagnostics.extend(result.diagnostics);
-                self.skill_diagnostics.extend(collisions);
-            }
-        }
-
-        if !paths.prompt_paths.is_empty() {
-            let prompt_paths = dedupe_paths(paths.prompt_paths.clone());
-            if !prompt_paths.is_empty() {
-                let new_prompts = load_prompt_templates(LoadPromptTemplatesOptions {
-                    cwd: cwd_buf.clone(),
-                    agent_dir: agent_dir.clone(),
-                    prompt_paths,
-                    include_defaults: false,
-                });
-                if !new_prompts.is_empty() {
-                    let mut merged = self.prompts.clone();
-                    merged.extend(new_prompts);
-                    let (deduped, diagnostics) = dedupe_prompts(merged);
-                    self.prompts = deduped;
-                    self.prompt_diagnostics.extend(diagnostics);
-                }
-            }
-        }
-
-        if !paths.theme_paths.is_empty() {
-            let theme_paths = dedupe_paths(paths.theme_paths.clone());
-            if !theme_paths.is_empty() {
-                let themes_result = load_themes(LoadThemesOptions {
-                    cwd: cwd_buf,
-                    agent_dir,
-                    theme_paths,
-                    include_defaults: false,
-                });
-                let mut merged = self.themes.clone();
-                merged.extend(themes_result.themes);
-                let (deduped, diagnostics) = dedupe_themes(merged);
-                self.themes = deduped;
-                self.theme_diagnostics.extend(themes_result.diagnostics);
-                self.theme_diagnostics.extend(diagnostics);
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn extensions(&self) -> &[PathBuf] {
-        &self.extensions
     }
 
     pub fn skills(&self) -> &[Skill] {
@@ -715,13 +563,6 @@ fn append_resources_from_manifest(
     append_resource_paths(
         resources,
         root,
-        obj.get("extensions"),
-        ResourceKind::Extensions,
-        "extensions",
-    )?;
-    append_resource_paths(
-        resources,
-        root,
         obj.get("skills"),
         ResourceKind::Skills,
         "skills",
@@ -745,7 +586,6 @@ fn append_resources_from_manifest(
 
 fn append_resources_from_defaults(resources: &mut PackageResources, root: &Path) {
     let candidates = [
-        ("extensions", ResourceKind::Extensions),
         ("skills", ResourceKind::Skills),
         ("prompts", ResourceKind::Prompts),
         ("themes", ResourceKind::Themes),
@@ -755,7 +595,6 @@ fn append_resources_from_defaults(resources: &mut PackageResources, root: &Path)
         let path = root.join(dir);
         if path.exists() {
             match kind {
-                ResourceKind::Extensions => resources.extensions.push(path),
                 ResourceKind::Skills => resources.skills.push(path),
                 ResourceKind::Prompts => resources.prompts.push(path),
                 ResourceKind::Themes => resources.themes.push(path),
@@ -766,7 +605,6 @@ fn append_resources_from_defaults(resources: &mut PackageResources, root: &Path)
 
 #[derive(Clone, Copy)]
 enum ResourceKind {
-    Extensions,
     Skills,
     Prompts,
     Themes,
@@ -791,7 +629,6 @@ fn append_resource_paths(
     for path in paths {
         let resolved = resolve_manifest_resource_path(root, &manifest_path, field_name, &path)?;
         match kind {
-            ResourceKind::Extensions => resources.extensions.push(resolved),
             ResourceKind::Skills => resources.skills.push(resolved),
             ResourceKind::Prompts => resources.prompts.push(resolved),
             ResourceKind::Themes => resources.themes.push(resolved),
@@ -1968,109 +1805,8 @@ fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
     out
 }
 
-/// Resolve the module disk cache directory used by the JS extension runtime.
-///
-/// This mirrors the logic in `extensions_js::runtime_disk_cache_dir()` so that
-/// we can detect cache/modules entries during discovery without depending on the
-/// runtime module.
-fn module_cache_dir() -> Option<PathBuf> {
-    if let Some(raw) = std::env::var_os("PIJS_MODULE_CACHE_DIR") {
-        return if raw.is_empty() {
-            None
-        } else {
-            Some(PathBuf::from(raw))
-        };
-    }
-    dirs::home_dir().map(|home| home.join(".pi").join("agent").join("cache").join("modules"))
-}
-
-fn is_cache_module_path_with_cache_dir(path: &Path, cache_dir: Option<&Path>) -> bool {
-    let Some(cache_dir) = cache_dir else {
-        return false;
-    };
-    let canonical = canonical_identity_path(path);
-    let canonical_cache = canonical_identity_path(cache_dir);
-    canonical.starts_with(&canonical_cache)
-}
-
-/// Derive the canonical extension ID from a filesystem path.
-///
-/// Uses the same heuristic as `JsExtensionLoadSpec::from_entry_path`: if the
-/// file stem is `index`, the parent directory name is the ID; otherwise the
-/// file stem itself is the ID.
-fn extension_id_from_path(path: &Path) -> Option<String> {
-    let canonical = canonical_identity_path(path);
-    let stem = canonical.file_stem().and_then(|s| s.to_str())?.trim();
-    if stem.is_empty() {
-        return None;
-    }
-    if stem.eq_ignore_ascii_case("index") {
-        canonical
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    } else {
-        Some(stem.to_string())
-    }
-}
-
-fn extension_dedupe_key_from_path(path: &Path) -> Option<String> {
-    extension_id_from_path(path).map(|id| id.to_ascii_lowercase())
-}
-
-/// Deduplicate extension entries by canonical extension ID, preferring source
-/// entries over transpiled cache copies (Issue #37).
-///
-/// When both a source `.ts` extension and its transpiled cache copy in
-/// `~/.pi/agent/cache/modules/` are discovered, the cache entry is dropped to
-/// prevent command collisions at load time.
-fn dedupe_extension_entries_by_id(entries: Vec<PathBuf>) -> Vec<PathBuf> {
-    let cache_dir = module_cache_dir();
-    dedupe_extension_entries_by_id_with_cache_dir(entries, cache_dir.as_deref())
-}
-
-fn dedupe_extension_entries_by_id_with_cache_dir(
-    entries: Vec<PathBuf>,
-    cache_dir: Option<&Path>,
-) -> Vec<PathBuf> {
-    // First pass: collect extension IDs and identify cache vs source entries.
-    let mut id_to_source_idx: HashMap<String, usize> = HashMap::new();
-    let mut is_cache = Vec::with_capacity(entries.len());
-
-    for (idx, path) in entries.iter().enumerate() {
-        let cache = is_cache_module_path_with_cache_dir(path, cache_dir);
-        is_cache.push(cache);
-
-        if let Some(id) = extension_dedupe_key_from_path(path) {
-            if !cache {
-                // Source entry wins; record its index.
-                id_to_source_idx.entry(id).or_insert(idx);
-            }
-        }
-    }
-
-    // Second pass: keep entries unless they are cache entries whose ID already
-    // has a source entry.
-    let mut out = Vec::with_capacity(entries.len());
-    for (idx, path) in entries.into_iter().enumerate() {
-        if is_cache[idx] {
-            if let Some(id) = extension_dedupe_key_from_path(&path) {
-                if id_to_source_idx.contains_key(&id) {
-                    // Skip cache entry — source entry is preferred.
-                    continue;
-                }
-            }
-        }
-        out.push(path);
-    }
-    out
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ResourcePathPrecedence {
-    CliExtension,
     ProjectDirectory,
     GlobalDirectory,
     ProjectPackage,
@@ -2082,8 +1818,8 @@ fn precedence_sorted_enabled_paths(resources: Vec<ResolvedResource>) -> Vec<Path
         .into_iter()
         .filter(|resource| resource.enabled)
         .collect::<Vec<_>>();
-    // Preserve source order within a precedence tier so CLI-specified
-    // extension/resource ordering remains behaviorally significant.
+    // Preserve source order within a precedence tier so CLI-specified resource
+    // ordering remains behaviorally significant.
     enabled.sort_by_key(resource_path_precedence);
     enabled.into_iter().map(|resource| resource.path).collect()
 }
@@ -2104,13 +1840,15 @@ fn merge_resource_paths(
 
 const fn resource_path_precedence(resource: &ResolvedResource) -> ResourcePathPrecedence {
     match (resource.metadata.scope, resource.metadata.origin) {
-        (PackageScope::Temporary, _) => ResourcePathPrecedence::CliExtension,
         (PackageScope::Project, ResourceOrigin::TopLevel) => {
             ResourcePathPrecedence::ProjectDirectory
         }
         (PackageScope::User, ResourceOrigin::TopLevel) => ResourcePathPrecedence::GlobalDirectory,
         (PackageScope::Project, ResourceOrigin::Package) => ResourcePathPrecedence::ProjectPackage,
         (PackageScope::User, ResourceOrigin::Package) => ResourcePathPrecedence::GlobalPackage,
+        (PackageScope::Temporary, ResourceOrigin::TopLevel | ResourceOrigin::Package) => {
+            ResourcePathPrecedence::ProjectPackage
+        }
     }
 }
 
@@ -2381,76 +2119,18 @@ mod tests {
         let empty = ResourceCliOptions {
             no_skills: false,
             no_prompt_templates: false,
-            no_extensions: false,
             no_themes: false,
             skill_paths: Vec::new(),
             prompt_paths: Vec::new(),
-            extension_paths: Vec::new(),
             theme_paths: Vec::new(),
         };
         assert!(!empty.has_explicit_paths());
 
-        let with_extension = ResourceCliOptions {
-            extension_paths: vec!["./ext.native.json".to_string()],
+        let with_skill = ResourceCliOptions {
+            skill_paths: vec!["./SKILL.md".to_string()],
             ..empty
         };
-        assert!(with_extension.has_explicit_paths());
-    }
-
-    #[test]
-    fn test_cli_extensions_load_when_no_extensions_flag_set() {
-        run_async(async {
-            let temp_dir = tempfile::tempdir().expect("tempdir");
-            let extension_path = temp_dir.path().join("ext.native.json");
-            fs::write(&extension_path, "{}").expect("write extension");
-
-            let manager = PackageManager::new(temp_dir.path().to_path_buf());
-            let config = Config::default();
-            let cli = ResourceCliOptions {
-                no_skills: true,
-                no_prompt_templates: true,
-                no_extensions: true,
-                no_themes: true,
-                skill_paths: Vec::new(),
-                prompt_paths: Vec::new(),
-                extension_paths: vec![extension_path.to_string_lossy().to_string()],
-                theme_paths: Vec::new(),
-            };
-
-            let loader = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
-                .await
-                .expect("load resources");
-            assert!(loader.extensions().contains(&extension_path));
-        });
-    }
-
-    #[test]
-    fn test_resource_loader_rejects_missing_cli_extension_path() {
-        run_async(async {
-            let temp_dir = tempfile::tempdir().expect("tempdir");
-            let missing_path = temp_dir.path().join("missing.native.json");
-
-            let manager = PackageManager::new(temp_dir.path().to_path_buf());
-            let config = Config::default();
-            let cli = ResourceCliOptions {
-                no_skills: true,
-                no_prompt_templates: true,
-                no_extensions: false,
-                no_themes: true,
-                skill_paths: Vec::new(),
-                prompt_paths: Vec::new(),
-                extension_paths: vec![missing_path.to_string_lossy().to_string()],
-                theme_paths: Vec::new(),
-            };
-
-            let err = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
-                .await
-                .expect_err("missing explicit CLI extension path should fail");
-            assert!(
-                err.to_string().contains("does not exist"),
-                "unexpected error: {err}"
-            );
-        });
+        assert!(with_skill.has_explicit_paths());
     }
 
     #[test]
@@ -2464,11 +2144,9 @@ mod tests {
             let cli = ResourceCliOptions {
                 no_skills: false,
                 no_prompt_templates: true,
-                no_extensions: true,
                 no_themes: true,
                 skill_paths: vec![missing_path.to_string_lossy().to_string()],
                 prompt_paths: Vec::new(),
-                extension_paths: Vec::new(),
                 theme_paths: Vec::new(),
             };
 
@@ -2492,11 +2170,9 @@ mod tests {
             let cli = ResourceCliOptions {
                 no_skills: false,
                 no_prompt_templates: true,
-                no_extensions: true,
                 no_themes: true,
                 skill_paths: vec!["   ".to_string()],
                 prompt_paths: Vec::new(),
-                extension_paths: Vec::new(),
                 theme_paths: Vec::new(),
             };
 
@@ -2506,35 +2182,6 @@ mod tests {
             assert!(
                 err.to_string()
                     .contains("Explicit skill path must be non-empty"),
-                "unexpected error: {err}"
-            );
-        });
-    }
-
-    #[test]
-    fn test_resource_loader_rejects_blank_cli_extension_source() {
-        run_async(async {
-            let temp_dir = tempfile::tempdir().expect("tempdir");
-
-            let manager = PackageManager::new(temp_dir.path().to_path_buf());
-            let config = Config::default();
-            let cli = ResourceCliOptions {
-                no_skills: true,
-                no_prompt_templates: true,
-                no_extensions: false,
-                no_themes: true,
-                skill_paths: Vec::new(),
-                prompt_paths: Vec::new(),
-                extension_paths: vec![" \t ".to_string()],
-                theme_paths: Vec::new(),
-            };
-
-            let err = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
-                .await
-                .expect_err("blank explicit CLI extension source should fail");
-            assert!(
-                err.to_string()
-                    .contains("Explicit extension source must be non-empty"),
                 "unexpected error: {err}"
             );
         });
@@ -2551,11 +2198,9 @@ mod tests {
             let cli = ResourceCliOptions {
                 no_skills: true,
                 no_prompt_templates: false,
-                no_extensions: true,
                 no_themes: true,
                 skill_paths: Vec::new(),
                 prompt_paths: vec![missing_path.to_string_lossy().to_string()],
-                extension_paths: Vec::new(),
                 theme_paths: Vec::new(),
             };
 
@@ -2590,14 +2235,12 @@ mod tests {
             let cli = ResourceCliOptions {
                 no_skills: true,
                 no_prompt_templates: false,
-                no_extensions: true,
                 no_themes: true,
                 skill_paths: Vec::new(),
                 prompt_paths: vec![
                     prompt_path.to_string_lossy().to_string(),
                     alias_path.to_string_lossy().to_string(),
                 ],
-                extension_paths: Vec::new(),
                 theme_paths: Vec::new(),
             };
 
@@ -2624,11 +2267,9 @@ mod tests {
             let cli = ResourceCliOptions {
                 no_skills: false,
                 no_prompt_templates: true,
-                no_extensions: true,
                 no_themes: true,
                 skill_paths: vec![skill_path.to_string_lossy().to_string()],
                 prompt_paths: Vec::new(),
-                extension_paths: Vec::new(),
                 theme_paths: Vec::new(),
             };
 
@@ -2654,11 +2295,9 @@ mod tests {
             let cli = ResourceCliOptions {
                 no_skills: true,
                 no_prompt_templates: true,
-                no_extensions: true,
                 no_themes: false,
                 skill_paths: Vec::new(),
                 prompt_paths: Vec::new(),
-                extension_paths: Vec::new(),
                 theme_paths: vec![theme_path.to_string_lossy().to_string()],
             };
 
@@ -2693,11 +2332,9 @@ mod tests {
             let cli = ResourceCliOptions {
                 no_skills: true,
                 no_prompt_templates: true,
-                no_extensions: true,
                 no_themes: false,
                 skill_paths: Vec::new(),
                 prompt_paths: Vec::new(),
-                extension_paths: Vec::new(),
                 theme_paths: vec![
                     theme_path.to_string_lossy().to_string(),
                     alias_path.to_string_lossy().to_string(),
@@ -2710,50 +2347,6 @@ mod tests {
             assert_eq!(loader.themes().len(), 1);
             assert_eq!(loader.themes()[0].file_path, theme_path);
             assert!(loader.theme_diagnostics().is_empty());
-        });
-    }
-
-    #[test]
-    fn test_extension_paths_deduped_between_settings_and_cli() {
-        run_async(async {
-            let temp_dir = tempfile::tempdir().expect("tempdir");
-            let extension_path = temp_dir.path().join("ext.native.json");
-            fs::write(&extension_path, "{}").expect("write extension");
-
-            let settings_dir = temp_dir.path().join(".pi");
-            fs::create_dir_all(&settings_dir).expect("create settings dir");
-            let settings_path = settings_dir.join("settings.json");
-            let settings = json!({
-                "extensions": [extension_path.to_string_lossy().to_string()]
-            });
-            fs::write(
-                &settings_path,
-                serde_json::to_string_pretty(&settings).expect("serialize settings"),
-            )
-            .expect("write settings");
-
-            let manager = PackageManager::new(temp_dir.path().to_path_buf());
-            let config = Config::default();
-            let cli = ResourceCliOptions {
-                no_skills: true,
-                no_prompt_templates: true,
-                no_extensions: false,
-                no_themes: true,
-                skill_paths: Vec::new(),
-                prompt_paths: Vec::new(),
-                extension_paths: vec![extension_path.to_string_lossy().to_string()],
-                theme_paths: Vec::new(),
-            };
-
-            let loader = ResourceLoader::load(&manager, temp_dir.path(), &config, &cli)
-                .await
-                .expect("load resources");
-            let matches = loader
-                .extensions()
-                .iter()
-                .filter(|path| *path == &extension_path)
-                .count();
-            assert_eq!(matches, 1);
         });
     }
 

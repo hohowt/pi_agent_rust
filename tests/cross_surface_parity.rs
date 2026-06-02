@@ -642,14 +642,12 @@ mod config_types {
         let json = serde_json::json!({
             "defaultProvider": "openai",
             "defaultModel": "gpt-4o",
-            "hideThinkingBlock": true,
-            "checkForUpdates": false
+            "hideThinkingBlock": true
         });
         let config: Config = serde_json::from_value(json).expect("camelCase should work");
         assert_eq!(config.default_provider.as_deref(), Some("openai"));
         assert_eq!(config.default_model.as_deref(), Some("gpt-4o"));
         assert_eq!(config.hide_thinking_block, Some(true));
-        assert_eq!(config.check_for_updates, Some(false));
     }
 
     #[test]

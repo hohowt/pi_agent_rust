@@ -309,9 +309,9 @@ impl PiApp {
             TreeSummaryChoice::Summarize | TreeSummaryChoice::SummarizeWithCustomPrompt
         );
 
-        // Fast path: no summary + no extensions. Keep it synchronous so unit tests can drive it
+        // Fast path: no summary. Keep it synchronous so unit tests can drive it
         // without running the async runtime.
-        if !summary_requested && self.extensions.is_none() {
+        if !summary_requested {
             let Ok(mut session_guard) = self.session.try_lock() else {
                 self.status_message = Some("Session busy; try again".to_string());
                 return false;
@@ -339,7 +339,6 @@ impl PiApp {
             }
 
             self.messages = messages;
-            self.message_render_cache.clear();
             self.total_usage = usage;
             self.current_response.clear();
             self.current_thinking.clear();
@@ -364,7 +363,6 @@ impl PiApp {
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
-        let extensions = self.extensions.clone();
         let reserve_tokens = self.config.branch_summary_reserve_tokens();
         let runtime_handle = self.runtime_handle.clone();
 
@@ -383,38 +381,10 @@ impl PiApp {
         runtime_handle.spawn(async move {
             let cx = Cx::for_request();
 
-            let from_id_for_event = pending
-                .old_leaf_id
-                .clone()
-                .unwrap_or_else(|| "root".to_string());
             let to_id_for_event = pending
                 .new_leaf_id
                 .clone()
                 .unwrap_or_else(|| "root".to_string());
-
-            if let Some(manager) = extensions.clone() {
-                let cancelled = manager
-                    .dispatch_cancellable_event(
-                        ExtensionEventName::SessionBeforeSwitch,
-                        Some(json!({
-                            "fromId": from_id_for_event.clone(),
-                            "toId": to_id_for_event.clone(),
-                            "sessionId": pending.session_id.clone(),
-                        })),
-                        EXTENSION_EVENT_TIMEOUT_MS,
-                    )
-                    .await
-                    .unwrap_or(false);
-                if cancelled {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                        PiMsg::System("Session switch cancelled by extension".to_string()),
-                    )
-                    .await;
-                    return;
-                }
-            }
 
             let summary_skipped =
                 summary_requested && key_opt.is_none() && !pending.entries_to_summarize.is_empty();
@@ -563,39 +533,7 @@ impl PiApp {
                 .await;
             }
 
-            if let Some(manager) = extensions {
-                let new_leaf_id = summary_entry_id
-                    .clone()
-                    .or_else(|| pending.new_leaf_id.clone());
-                let old_leaf_value = pending
-                    .old_leaf_id
-                    .clone()
-                    .map_or(Value::Null, Value::String);
-                let new_leaf_value = new_leaf_id.clone().map_or(Value::Null, Value::String);
-                let mut tree_payload = serde_json::Map::new();
-                tree_payload.insert("newLeafId".to_string(), new_leaf_value);
-                tree_payload.insert("oldLeafId".to_string(), old_leaf_value);
-                if let Some(summary_entry) = summary_entry_payload {
-                    tree_payload.insert("summaryEntry".to_string(), summary_entry);
-                }
-
-                let _ = manager
-                    .dispatch_event(
-                        ExtensionEventName::SessionSwitch,
-                        Some(json!({
-                            "fromId": from_id_for_event,
-                            "toId": to_id_for_event,
-                            "sessionId": pending.session_id,
-                        })),
-                    )
-                    .await;
-                let _ = manager
-                    .dispatch_event(
-                        ExtensionEventName::SessionTree,
-                        Some(Value::Object(tree_payload)),
-                    )
-                    .await;
-            }
+            let _ = (summary_entry_payload, summary_entry_id);
         });
         true
     }

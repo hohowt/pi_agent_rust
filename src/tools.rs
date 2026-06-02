@@ -9,7 +9,6 @@
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::extensions::{safe_canonicalize, strip_unc_prefix};
 use crate::model::{ContentBlock, ImageContent, TextContent};
 use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use asupersync::time::{sleep, wall_now};
@@ -28,6 +27,61 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
+
+/// Canonicalize a path and strip Windows verbatim prefixes.
+///
+/// If canonicalization fails for a non-existent path, resolve the longest
+/// existing ancestor so scope checks still respect symlinks.
+fn safe_canonicalize(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).map_or_else(
+        |_| {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .unwrap_or_else(|_| PathBuf::from("."))
+                    .join(path)
+            };
+
+            for ancestor in absolute.ancestors().skip(1) {
+                if let Ok(canonical_ancestor) = std::fs::canonicalize(ancestor) {
+                    if let Ok(suffix) = absolute.strip_prefix(ancestor) {
+                        return strip_unc_prefix(normalize_dot_segments(
+                            &canonical_ancestor.join(suffix),
+                        ));
+                    }
+                }
+            }
+
+            strip_unc_prefix(normalize_dot_segments(&absolute))
+        },
+        strip_unc_prefix,
+    )
+}
+
+fn strip_unc_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(stripped) = s.strip_prefix(r"\\?\") {
+            if let Some(unc) = stripped.strip_prefix("UNC") {
+                if unc.starts_with('\\') {
+                    return PathBuf::from(format!(r"\{}", unc));
+                }
+            }
+            return PathBuf::from(stripped);
+        }
+        if let Some(stripped) = s.strip_prefix("//?/") {
+            if let Some(unc) = stripped.strip_prefix("UNC") {
+                if unc.starts_with('/') {
+                    return PathBuf::from(format!("/{unc}"));
+                }
+            }
+            return PathBuf::from(stripped);
+        }
+    }
+    path
+}
 
 // ============================================================================
 // Tool Trait
@@ -2052,8 +2106,8 @@ pub(crate) fn resolve_read_path(file_path: &str, cwd: &Path) -> PathBuf {
 }
 
 fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
-    let canonical_path = crate::extensions::safe_canonicalize(path);
-    let canonical_cwd = crate::extensions::safe_canonicalize(cwd);
+    let canonical_path = safe_canonicalize(path);
+    let canonical_cwd = safe_canonicalize(cwd);
     if !canonical_path.starts_with(&canonical_cwd) {
         return Err(Error::validation(format!(
             "Cannot {action} outside the working directory (resolved: {}, cwd: {})",
@@ -2080,13 +2134,13 @@ fn enforce_cwd_scope(path: &Path, cwd: &Path, action: &str) -> Result<PathBuf> {
 /// pointing at `/etc/passwd` resolves to `/etc/passwd` and fails the prefix
 /// test against both cwd and agent dir.
 fn enforce_read_scope_with_roots(path: &Path, cwd: &Path, agent_dir: &Path) -> Result<PathBuf> {
-    let canonical_path = crate::extensions::safe_canonicalize(path);
-    let canonical_cwd = crate::extensions::safe_canonicalize(cwd);
+    let canonical_path = safe_canonicalize(path);
+    let canonical_cwd = safe_canonicalize(cwd);
     if canonical_path.starts_with(&canonical_cwd) {
         return Ok(canonical_path);
     }
 
-    let canonical_agent = crate::extensions::safe_canonicalize(agent_dir);
+    let canonical_agent = safe_canonicalize(agent_dir);
     if canonical_path.starts_with(&canonical_agent) {
         return Ok(canonical_path);
     }
@@ -2156,11 +2210,6 @@ fn normalize_dot_segments(path: &Path) -> PathBuf {
     }
 
     out
-}
-
-#[cfg(feature = "fuzzing")]
-pub fn fuzz_normalize_dot_segments(path: &Path) -> PathBuf {
-    normalize_dot_segments(path)
 }
 
 #[cfg(unix)]
@@ -2378,11 +2427,6 @@ pub fn process_file_arguments(
 /// Public alias for `resolve_to_cwd` used by tools.
 fn resolve_path(file_path: &str, cwd: &Path) -> PathBuf {
     normalize_dot_segments(&resolve_to_cwd(file_path, cwd))
-}
-
-#[cfg(feature = "fuzzing")]
-pub fn fuzz_resolve_path(file_path: &str, cwd: &Path) -> PathBuf {
-    resolve_path(file_path, cwd)
 }
 
 pub(crate) fn detect_supported_image_mime_type_from_bytes(bytes: &[u8]) -> Option<&'static str> {

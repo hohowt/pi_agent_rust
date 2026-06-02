@@ -1174,7 +1174,7 @@ fn handle_session_new(
     let model_entry = select_acp_model_entry(&options.config, &options.available_models)
         .ok_or_else(|| Error::provider("acp", "No models available"))?;
 
-    let provider = providers::create_provider(&model_entry, None)
+    let provider = providers::create_provider(&model_entry)
         .map_err(|e| Error::provider("acp", e.to_string()))?;
 
     // Build system prompt directly (avoids constructing a Cli struct).
@@ -1202,7 +1202,7 @@ fn handle_session_new(
         max_tool_iterations: crate::agent::resolved_max_tool_iterations_default(),
         stream_options,
         block_images: options.config.image_block_images(),
-        fail_closed_hooks: options.config.fail_closed_hooks(),
+        fail_closed_hooks: false,
         tool_approval: permission_client
             .map(|client| client.handler_for_session(session_id.clone())),
     };
@@ -1533,7 +1533,6 @@ mod tests {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         }
     }
 

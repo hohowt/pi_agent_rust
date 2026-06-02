@@ -21,7 +21,6 @@ use pi::model::{Message, UserContent, UserMessage};
 use pi::provider::{Context, Provider, StreamOptions, ToolDef};
 use pi::providers::anthropic::AnthropicProvider;
 use pi::providers::azure::AzureOpenAIProvider;
-use pi::providers::bedrock::BedrockProvider;
 use pi::providers::cohere::CohereProvider;
 use pi::providers::copilot::CopilotProvider;
 use pi::providers::gemini::GeminiProvider;
@@ -122,7 +121,6 @@ fn checklist_all_native_providers_have_identity() {
         ),
         ("gemini", Box::new(GeminiProvider::new("test-model"))),
         ("cohere", Box::new(CohereProvider::new("test-model"))),
-        ("bedrock", Box::new(BedrockProvider::new("test-model"))),
         (
             "vertex",
             Box::new(
@@ -217,20 +215,6 @@ checklist_request_mapping!(
     "cohere"
 );
 
-// Bedrock and GitLab have different build_request signatures
-#[test]
-fn checklist_bedrock_request_mapping() {
-    let context = minimal_context();
-    let options = default_options();
-    let req = BedrockProvider::build_request(&context, &options);
-    let v = serde_json::to_value(&req).expect("bedrock: build_request must serialize to JSON");
-    assert!(v.is_object(), "bedrock: request must be a JSON object");
-    assert!(
-        !v.as_object().unwrap().is_empty(),
-        "bedrock: request object must not be empty"
-    );
-}
-
 #[test]
 fn checklist_gitlab_request_mapping() {
     let context = minimal_context();
@@ -308,24 +292,6 @@ checklist_tool_serialization!(
     |v: &Value| v["tools"].as_array().cloned()
 );
 
-// Bedrock tool serialization
-#[test]
-fn checklist_bedrock_tool_serialization() {
-    let context = context_with_tools();
-    let options = default_options();
-    let req = BedrockProvider::build_request(&context, &options);
-    let v = serde_json::to_value(&req).expect("bedrock: must serialize with tools");
-    let tool_config = &v["toolConfig"]["tools"];
-    assert!(
-        tool_config.is_array(),
-        "bedrock: toolConfig.tools must be an array"
-    );
-    assert!(
-        !tool_config.as_array().unwrap().is_empty(),
-        "bedrock: toolConfig.tools must not be empty"
-    );
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // Checklist: URL/endpoint resolution
 // ═══════════════════════════════════════════════════════════════════════
@@ -334,7 +300,7 @@ fn checklist_bedrock_tool_serialization() {
 #[test]
 fn checklist_providers_have_default_endpoint() {
     // Anthropic, OpenAI, Gemini, Cohere have hardcoded default URLs.
-    // Azure, Vertex, Bedrock need user-provided base_url.
+    // Azure and Vertex need user-provided base_url.
     // GitLab, Copilot have hardcoded URLs.
     //
     // We verify the providers that have defaults produce a non-empty URL
@@ -347,7 +313,6 @@ fn checklist_providers_have_default_endpoint() {
         ("azure", "azure-openai"),
         ("gemini", "google-generative-ai"),
         ("cohere", "cohere-chat"),
-        ("bedrock", "bedrock-converse-stream"),
         ("vertex", "google-vertex"),
         ("gitlab", "gitlab-chat"),
         ("copilot", "openai-completions"),
@@ -363,7 +328,6 @@ fn checklist_providers_have_default_endpoint() {
         ("azure", Box::new(AzureOpenAIProvider::new("r", "m"))),
         ("gemini", Box::new(GeminiProvider::new("m"))),
         ("cohere", Box::new(CohereProvider::new("m"))),
-        ("bedrock", Box::new(BedrockProvider::new("m"))),
         (
             "vertex",
             Box::new(

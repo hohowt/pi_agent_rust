@@ -58,6 +58,18 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
+fn canonical_test_path(path: &Path) -> PathBuf {
+    let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    #[cfg(windows)]
+    {
+        let display = canonical.display().to_string();
+        if let Some(stripped) = display.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    canonical
+}
+
 /// Test harness providing temp directories, logging, and cleanup.
 pub struct TestHarness {
     /// Test name for identification in logs.
@@ -80,10 +92,7 @@ impl TestHarness {
     pub fn new(name: impl Into<String>) -> Self {
         let name = name.into();
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let canonical_dir = pi::extensions::strip_unc_prefix(
-            std::fs::canonicalize(temp_dir.path())
-                .unwrap_or_else(|_| temp_dir.path().to_path_buf()),
-        );
+        let canonical_dir = canonical_test_path(temp_dir.path());
         let logger = Arc::new(TestLogger::new());
         logger.set_test_name(&name);
         logger.set_normalization_root(&canonical_dir);
@@ -453,10 +462,7 @@ impl TestHarnessBuilder {
     /// Build the test harness.
     pub fn build(self) -> TestHarness {
         let temp_dir = TempDir::new().expect("Failed to create temp directory");
-        let canonical_dir = pi::extensions::strip_unc_prefix(
-            std::fs::canonicalize(temp_dir.path())
-                .unwrap_or_else(|_| temp_dir.path().to_path_buf()),
-        );
+        let canonical_dir = canonical_test_path(temp_dir.path());
         let logger = Arc::new(TestLogger::with_min_level(self.min_log_level));
         let name = self.name;
         logger.set_test_name(&name);

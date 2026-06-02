@@ -7,9 +7,7 @@ use crate::agent::QueueMode;
 use crate::autocomplete::{
     AutocompleteCatalog, AutocompleteItem, AutocompleteProvider, AutocompleteResponse,
 };
-use crate::extensions::ExtensionUiRequest;
 use crate::model::{ContentBlock, Message as ModelMessage};
-use crate::models::OAuthConfig;
 use crate::session::SiblingBranch;
 use crate::session_index::{SessionIndex, SessionMeta};
 use crate::session_picker::delete_session_file;
@@ -29,8 +27,6 @@ pub(super) struct PendingOAuth {
     pub(super) provider: String,
     pub(super) kind: PendingLoginKind,
     pub(super) verifier: String,
-    /// OAuth config for extension-registered providers (None for built-in like anthropic).
-    pub(super) oauth_config: Option<OAuthConfig>,
     /// Device code for RFC 8628 device flow providers.
     pub(super) device_code: Option<String>,
     /// The redirect URI used in the authorization request (needed for token exchange per RFC 6749 §4.1.3).
@@ -545,123 +541,6 @@ impl SettingsUiState {
             self.selected - self.max_visible + 1
         }
     }
-}
-
-/// User action choices for a capability prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum CapabilityAction {
-    AllowOnce,
-    AllowAlways,
-    Deny,
-    DenyAlways,
-}
-
-impl CapabilityAction {
-    pub(super) const ALL: [Self; 4] = [
-        Self::AllowOnce,
-        Self::AllowAlways,
-        Self::Deny,
-        Self::DenyAlways,
-    ];
-
-    pub(super) const fn label(self) -> &'static str {
-        match self {
-            Self::AllowOnce => "Allow Once",
-            Self::AllowAlways => "Allow Always",
-            Self::Deny => "Deny",
-            Self::DenyAlways => "Deny Always",
-        }
-    }
-
-    pub(super) const fn is_allow(self) -> bool {
-        matches!(self, Self::AllowOnce | Self::AllowAlways)
-    }
-
-    pub(super) const fn is_persistent(self) -> bool {
-        matches!(self, Self::AllowAlways | Self::DenyAlways)
-    }
-}
-
-/// Modal overlay for extension capability prompts.
-#[derive(Debug)]
-pub(super) struct CapabilityPromptOverlay {
-    /// The underlying UI request (used to send response).
-    pub(super) request: ExtensionUiRequest,
-    /// Extension that requested the capability.
-    pub(super) extension_id: String,
-    /// Capability being requested (e.g. "exec", "http").
-    pub(super) capability: String,
-    /// Human-readable description of what the capability does.
-    pub(super) description: String,
-    /// Which button is focused.
-    pub(super) focused: usize,
-    /// Auto-deny countdown (remaining seconds).  `None` = no timer.
-    pub(super) auto_deny_secs: Option<u32>,
-}
-
-impl CapabilityPromptOverlay {
-    pub(super) fn from_request(request: ExtensionUiRequest) -> Self {
-        let extension_id = request
-            .payload
-            .get("extension_id")
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown>")
-            .to_string();
-        let capability = request
-            .payload
-            .get("capability")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown")
-            .to_string();
-        let description = request
-            .payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        Self {
-            request,
-            extension_id,
-            capability,
-            description,
-            focused: 0,
-            auto_deny_secs: Some(30),
-        }
-    }
-
-    pub(super) const fn focus_next(&mut self) {
-        self.focused = (self.focused + 1) % CapabilityAction::ALL.len();
-    }
-
-    pub(super) fn focus_prev(&mut self) {
-        self.focused = self
-            .focused
-            .checked_sub(1)
-            .unwrap_or(CapabilityAction::ALL.len() - 1);
-    }
-
-    pub(super) const fn selected_action(&self) -> CapabilityAction {
-        CapabilityAction::ALL[self.focused]
-    }
-
-    /// Returns `true` if this is a capability-specific confirm prompt (not a
-    /// generic extension confirm).
-    pub(super) fn is_capability_prompt(request: &ExtensionUiRequest) -> bool {
-        request.method == "confirm"
-            && request.payload.get("capability").is_some()
-            && request.payload.get("extension_id").is_some()
-    }
-}
-
-/// Runtime state for extension-driven `ui.custom()` overlays.
-#[derive(Debug, Clone, Default)]
-pub(super) struct ExtensionCustomOverlay {
-    /// Extension that owns the active custom overlay.
-    pub(super) extension_id: Option<String>,
-    /// Optional overlay title.
-    pub(super) title: Option<String>,
-    /// Latest rendered frame lines.
-    pub(super) lines: Vec<String>,
 }
 
 /// Branch picker overlay for quick branch switching (Ctrl+B).

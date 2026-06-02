@@ -18,22 +18,6 @@ use crate::compaction_worker::{
     CompactionAdmissionSignals, CompactionQuota, CompactionWorkerState,
 };
 use crate::error::{Error, Result};
-use crate::extension_events::{
-    BeforeAgentStartOutcome, InputEventOutcome, SessionBeforeCompactOutcome,
-    apply_before_agent_start_response, apply_input_event_response,
-    apply_session_before_compact_response,
-};
-use crate::extension_tools::collect_extension_tool_wrappers;
-use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionAiCompletionRequest, ExtensionDeliverAs,
-    ExtensionEventName, ExtensionHostActions, ExtensionLoadSpec, ExtensionManager, ExtensionPolicy,
-    ExtensionRegion, ExtensionRuntimeHandle, ExtensionSendMessage, ExtensionSendUserMessage,
-    JsExtensionLoadSpec, JsExtensionRuntimeHandle, NativeRustExtensionLoadSpec,
-    NativeRustExtensionRuntimeHandle, RepairPolicyMode, resolve_extension_load_spec,
-};
-#[cfg(feature = "wasm-host")]
-use crate::extensions::{WasmExtensionHost, WasmExtensionLoadSpec};
-use crate::extensions_js::{PiJsRuntimeConfig, RepairMode};
 use crate::model::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message,
     StopReason, StreamEvent, TextContent, ThinkingContent, ToolCall, ToolResultMessage, Usage,
@@ -44,11 +28,10 @@ use crate::models::{
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
 use crate::semantic_workspace_graph::{ContextBundleItem, SemanticContextBundle};
-use crate::session::{AutosaveFlushTrigger, Session, SessionHandle};
+use crate::session::{AutosaveFlushTrigger, Session};
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
 use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::{Mutex, Notify};
-use async_trait::async_trait;
 use chrono::Utc;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -201,7 +184,7 @@ impl LatencyComponentBreakdown {
     }
 }
 
-/// Per-turn breakdown of provider, tool, extension hook, and persistence budgets.
+/// Per-turn breakdown of provider, tool, and persistence budgets.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TurnLatencyBreakdown {
@@ -213,8 +196,6 @@ pub struct TurnLatencyBreakdown {
     pub provider_streaming: LatencyComponentBreakdown,
     /// Built-in/local tool execution budget.
     pub local_tools: LatencyComponentBreakdown,
-    /// Extension hook dispatch budget around tool calls.
-    pub extension_hostcalls: LatencyComponentBreakdown,
     /// Session persistence budget when measured by the current runtime path.
     pub persistence: LatencyComponentBreakdown,
     /// Component with the largest measured duration.
@@ -228,28 +209,20 @@ impl TurnLatencyBreakdown {
         total_ms: u64,
         provider_streaming_ms: &[u64],
         local_tool_ms: &[u64],
-        extension_hostcall_ms: &[u64],
         persistence_ms: &[u64],
     ) -> Self {
         let provider_streaming =
             LatencyComponentBreakdown::from_millis_samples(provider_streaming_ms);
         let local_tools = LatencyComponentBreakdown::from_millis_samples(local_tool_ms);
-        let extension_hostcalls =
-            LatencyComponentBreakdown::from_millis_samples(extension_hostcall_ms);
         let persistence = LatencyComponentBreakdown::from_millis_samples(persistence_ms);
-        let dominant_component = dominant_latency_component(
-            &provider_streaming,
-            &local_tools,
-            &extension_hostcalls,
-            &persistence,
-        );
+        let dominant_component =
+            dominant_latency_component(&provider_streaming, &local_tools, &persistence);
 
         Self {
             schema: TURN_LATENCY_BREAKDOWN_SCHEMA_V1,
             total_ms,
             provider_streaming,
             local_tools,
-            extension_hostcalls,
             persistence,
             dominant_component,
         }
@@ -291,13 +264,11 @@ fn percentile_nearest_rank_per_mille(samples: &[u64], permille: usize) -> u64 {
 fn dominant_latency_component(
     provider_streaming: &LatencyComponentBreakdown,
     local_tools: &LatencyComponentBreakdown,
-    extension_hostcalls: &LatencyComponentBreakdown,
     persistence: &LatencyComponentBreakdown,
 ) -> String {
     [
         ("provider_streaming", provider_streaming.duration_ms),
         ("local_tools", local_tools.duration_ms),
-        ("extension_hostcalls", extension_hostcalls.duration_ms),
         ("persistence", persistence.duration_ms),
     ]
     .into_iter()
@@ -311,7 +282,6 @@ struct TurnLatencyAccumulator {
     started_at: Instant,
     provider_streaming_ms: Vec<u64>,
     local_tool_ms: Vec<u64>,
-    extension_hostcall_ms: Vec<u64>,
     persistence_ms: Vec<u64>,
 }
 
@@ -321,7 +291,6 @@ impl TurnLatencyAccumulator {
             started_at: Instant::now(),
             provider_streaming_ms: Vec::new(),
             local_tool_ms: Vec::new(),
-            extension_hostcall_ms: Vec::new(),
             persistence_ms: Vec::new(),
         }
     }
@@ -331,7 +300,6 @@ impl TurnLatencyAccumulator {
             duration_millis_saturating(self.started_at.elapsed()),
             &self.provider_streaming_ms,
             &self.local_tool_ms,
-            &self.extension_hostcall_ms,
             &self.persistence_ms,
         )
     }
@@ -363,16 +331,6 @@ fn record_local_tool_latency(latency: &SharedTurnLatencyAccumulator, duration: D
     }
     let metrics = crate::session_metrics::global();
     record_global_latency(&metrics.local_tools, duration);
-}
-
-fn record_extension_hostcall_latency(latency: &SharedTurnLatencyAccumulator, duration: Duration) {
-    if let Ok(mut guard) = latency.lock() {
-        guard
-            .extension_hostcall_ms
-            .push(duration_millis_saturating(duration));
-    }
-    let metrics = crate::session_metrics::global();
-    record_global_latency(&metrics.extension_hostcalls, duration);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -804,7 +762,6 @@ impl QueueMode {
 pub enum InputSource {
     Interactive,
     Rpc,
-    Extension,
 }
 
 impl InputSource {
@@ -812,7 +769,6 @@ impl InputSource {
         match self {
             Self::Interactive => "interactive",
             Self::Rpc => "rpc",
-            Self::Extension => "extension",
         }
     }
 }
@@ -1033,13 +989,6 @@ pub enum AgentEvent {
         #[serde(rename = "finalError", skip_serializing_if = "Option::is_none")]
         final_error: Option<String>,
     },
-    /// Extension error during event dispatch or execution.
-    ExtensionError {
-        #[serde(rename = "extensionId", skip_serializing_if = "Option::is_none")]
-        extension_id: Option<String>,
-        event: String,
-        error: String,
-    },
 }
 
 // ============================================================================
@@ -1120,9 +1069,6 @@ pub struct Agent {
     /// Agent configuration.
     config: AgentConfig,
 
-    /// Optional extension manager for tool/event hooks.
-    extensions: Option<ExtensionManager>,
-
     /// Message history.
     messages: Vec<Message>,
 
@@ -1146,7 +1092,6 @@ impl Agent {
             provider,
             tools,
             config,
-            extensions: None,
             messages: Vec::new(),
             steering_fetchers: Vec::new(),
             follow_up_fetchers: Vec::new(),
@@ -1473,8 +1418,6 @@ impl Agent {
         let agent_start_event = AgentEvent::AgentStart {
             session_id: session_id.clone(),
         };
-        self.dispatch_extension_lifecycle_event(&agent_start_event)
-            .await;
         on_event(agent_start_event);
 
         for prompt in prompts {
@@ -1503,8 +1446,6 @@ impl Agent {
                     turn_index: current_turn_index,
                     timestamp: Utc::now().timestamp_millis(),
                 };
-                self.dispatch_extension_lifecycle_event(&turn_start_event)
-                    .await;
                 on_event(turn_start_event);
 
                 for message in std::mem::take(&mut pending_messages) {
@@ -1538,8 +1479,6 @@ impl Agent {
                         tool_results: Vec::new(),
                         latency_breakdown: snapshot_turn_latency(&turn_latency),
                     };
-                    self.dispatch_extension_lifecycle_event(&turn_end_event)
-                        .await;
                     on_event(turn_end_event);
                     let agent_end_event = AgentEvent::AgentEnd {
                         session_id: session_id.clone(),
@@ -1551,8 +1490,6 @@ impl Agent {
                                 .unwrap_or_else(|| "Aborted".to_string()),
                         ),
                     };
-                    self.dispatch_extension_lifecycle_event(&agent_end_event)
-                        .await;
                     on_event(agent_end_event);
                     return Ok(abort_message);
                 }
@@ -1600,8 +1537,6 @@ impl Agent {
                             tool_results: Vec::new(),
                             latency_breakdown: snapshot_turn_latency(&turn_latency),
                         };
-                        self.dispatch_extension_lifecycle_event(&turn_end_event)
-                            .await;
                         on_event(turn_end_event);
 
                         let agent_end_event = AgentEvent::AgentEnd {
@@ -1609,8 +1544,6 @@ impl Agent {
                             messages: std::mem::take(&mut new_messages),
                             error: Some(err_string),
                         };
-                        self.dispatch_extension_lifecycle_event(&agent_end_event)
-                            .await;
                         on_event(agent_end_event);
                         return Err(err);
                     }
@@ -1646,16 +1579,12 @@ impl Agent {
                         tool_results: Vec::new(),
                         latency_breakdown: snapshot_turn_latency(&turn_latency),
                     };
-                    self.dispatch_extension_lifecycle_event(&turn_end_event)
-                        .await;
                     on_event(turn_end_event);
                     let agent_end_event = AgentEvent::AgentEnd {
                         session_id: session_id.clone(),
                         messages: std::mem::take(&mut new_messages),
                         error: assistant_arc.error_message.clone(),
                     };
-                    self.dispatch_extension_lifecycle_event(&agent_end_event)
-                        .await;
                     on_event(agent_end_event);
                     return Ok(Arc::unwrap_or_clone(assistant_arc));
                 }
@@ -1744,8 +1673,6 @@ impl Agent {
                             tool_results: Vec::new(),
                             latency_breakdown: snapshot_turn_latency(&turn_latency),
                         };
-                        self.dispatch_extension_lifecycle_event(&turn_end_event)
-                            .await;
                         on_event(turn_end_event);
 
                         let agent_end_event = AgentEvent::AgentEnd {
@@ -1753,8 +1680,6 @@ impl Agent {
                             messages: std::mem::take(&mut new_messages),
                             error: Some(error_message),
                         };
-                        self.dispatch_extension_lifecycle_event(&agent_end_event)
-                            .await;
                         on_event(agent_end_event);
 
                         return Ok(stop_message);
@@ -1791,8 +1716,6 @@ impl Agent {
                                 tool_results: Vec::new(),
                                 latency_breakdown: snapshot_turn_latency(&turn_latency),
                             };
-                            self.dispatch_extension_lifecycle_event(&turn_end_event)
-                                .await;
                             on_event(turn_end_event);
 
                             let agent_end_event = AgentEvent::AgentEnd {
@@ -1800,8 +1723,6 @@ impl Agent {
                                 messages: std::mem::take(&mut new_messages),
                                 error: Some(err.to_string()),
                             };
-                            self.dispatch_extension_lifecycle_event(&agent_end_event)
-                                .await;
                             on_event(agent_end_event);
                             return Err(err);
                         }
@@ -1822,8 +1743,6 @@ impl Agent {
                     tool_results: tool_messages,
                     latency_breakdown: snapshot_turn_latency(&turn_latency),
                 };
-                self.dispatch_extension_lifecycle_event(&turn_end_event)
-                    .await;
                 on_event(turn_end_event);
 
                 turn_index = turn_index.saturating_add(1);
@@ -1853,8 +1772,6 @@ impl Agent {
             messages: new_messages,
             error: None,
         };
-        self.dispatch_extension_lifecycle_event(&agent_end_event)
-            .await;
         on_event(agent_end_event);
         Ok(Arc::unwrap_or_clone(final_arc))
     }
@@ -1867,72 +1784,9 @@ impl Agent {
         }
     }
 
-    async fn dispatch_extension_lifecycle_event(&self, event: &AgentEvent) {
-        let Some(extensions) = &self.extensions else {
-            return;
-        };
-
-        let name = match event {
-            AgentEvent::AgentStart { .. } => ExtensionEventName::AgentStart,
-            AgentEvent::AgentEnd { .. } => ExtensionEventName::AgentEnd,
-            AgentEvent::TurnStart { .. } => ExtensionEventName::TurnStart,
-            AgentEvent::TurnEnd { .. } => ExtensionEventName::TurnEnd,
-            _ => return,
-        };
-
-        let payload = match serde_json::to_value(event) {
-            Ok(payload) => payload,
-            Err(err) => {
-                tracing::warn!("failed to serialize agent lifecycle event (fail-open): {err}");
-                return;
-            }
-        };
-
-        if let Err(err) = extensions.dispatch_event(name, Some(payload)).await {
-            tracing::warn!("agent lifecycle extension hook failed (fail-open): {err}");
-        }
-    }
-
     async fn dispatch_context_event(&self, messages: &[Message]) -> Option<Vec<Message>> {
-        let Some(extensions) = &self.extensions else {
-            return None;
-        };
-
-        let payload = json!({ "messages": messages });
-        let response = extensions
-            .dispatch_event_with_response(
-                ExtensionEventName::Context,
-                Some(payload),
-                EXTENSION_EVENT_TIMEOUT_MS,
-            )
-            .await
-            .ok()?;
-
-        let value = response?;
-
-        if value.is_null() {
-            return None;
-        }
-
-        let messages_value = if let Some(obj) = value.as_object() {
-            obj.get("messages").cloned()?
-        } else if value.is_array() {
-            value
-        } else {
-            return None;
-        };
-
-        if messages_value.is_null() {
-            return Some(Vec::new());
-        }
-
-        match serde_json::from_value(messages_value) {
-            Ok(messages) => Some(messages),
-            Err(err) => {
-                tracing::warn!("context extension hook returned invalid messages: {err}");
-                None
-            }
-        }
+        let _ = messages;
+        None
     }
 
     async fn drain_steering_messages(&mut self) -> Vec<Message> {
@@ -2910,34 +2764,12 @@ impl Agent {
         on_event: AgentEventHandler,
         latency: SharedTurnLatencyAccumulator,
     ) -> (ToolOutput, bool) {
-        let extensions = self.extensions.clone();
-
         let approval_denied_output = self
             .request_tool_approval(&tool_call, Arc::clone(&on_event))
             .await;
 
-        let (mut output, is_error) = if let Some(output) = approval_denied_output {
+        if let Some(output) = approval_denied_output {
             (output, true)
-        } else if let Some(extensions) = &extensions {
-            let hook_started_at = Instant::now();
-            let hook_outcome = Self::dispatch_tool_call_hook(
-                extensions,
-                &tool_call,
-                self.config.fail_closed_hooks,
-            )
-            .await;
-            record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
-
-            if let Some(blocked_output) = hook_outcome {
-                (blocked_output, true)
-            } else {
-                let tool_started_at = Instant::now();
-                let outcome = self
-                    .execute_tool_without_hooks(&tool_call, Arc::clone(&on_event))
-                    .await;
-                record_local_tool_latency(&latency, tool_started_at.elapsed());
-                outcome
-            }
         } else {
             let tool_started_at = Instant::now();
             let outcome = self
@@ -2945,15 +2777,7 @@ impl Agent {
                 .await;
             record_local_tool_latency(&latency, tool_started_at.elapsed());
             outcome
-        };
-
-        if let Some(extensions) = &extensions {
-            let hook_started_at = Instant::now();
-            Self::apply_tool_result_hook(extensions, &tool_call, &mut output, is_error).await;
-            record_extension_hostcall_latency(&latency, hook_started_at.elapsed());
         }
-
-        (output, is_error)
     }
 
     async fn request_tool_approval(
@@ -3083,50 +2907,6 @@ impl Agent {
         })
     }
 
-    async fn dispatch_tool_call_hook(
-        extensions: &ExtensionManager,
-        tool_call: &ToolCall,
-        fail_closed_hooks: bool,
-    ) -> Option<ToolOutput> {
-        match extensions
-            .dispatch_tool_call(tool_call, EXTENSION_EVENT_TIMEOUT_MS)
-            .await
-        {
-            Ok(Some(result)) if result.block => {
-                Some(Self::tool_call_blocked_output(result.reason.as_deref()))
-            }
-            Ok(_) => None,
-            Err(err) => {
-                if fail_closed_hooks {
-                    tracing::warn!(
-                        error = ?err,
-                        "tool_call extension hook failed (fail-closed)"
-                    );
-                    Some(Self::tool_call_blocked_output(Some(
-                        "extension hook failed",
-                    )))
-                } else {
-                    tracing::warn!("tool_call extension hook failed (fail-open): {err}");
-                    None
-                }
-            }
-        }
-    }
-
-    fn tool_call_blocked_output(reason: Option<&str>) -> ToolOutput {
-        let reason = reason.map(str::trim).filter(|reason| !reason.is_empty());
-        let message = reason.map_or_else(
-            || "Tool execution was blocked by an extension".to_string(),
-            |reason| format!("Tool execution blocked: {reason}"),
-        );
-
-        ToolOutput {
-            content: vec![ContentBlock::Text(TextContent::new(message))],
-            details: None,
-            is_error: true,
-        }
-    }
-
     fn tool_approval_denied_output(reason: &str) -> ToolOutput {
         let reason = reason.trim();
         let reason = if reason.is_empty() {
@@ -3145,29 +2925,6 @@ impl Agent {
                 "reason": reason,
             })),
             is_error: true,
-        }
-    }
-
-    async fn apply_tool_result_hook(
-        extensions: &ExtensionManager,
-        tool_call: &ToolCall,
-        output: &mut ToolOutput,
-        is_error: bool,
-    ) {
-        match extensions
-            .dispatch_tool_result(tool_call, &*output, is_error, EXTENSION_EVENT_TIMEOUT_MS)
-            .await
-        {
-            Ok(Some(result)) => {
-                if let Some(content) = result.content {
-                    output.content = content;
-                }
-                if let Some(details) = result.details {
-                    output.details = Some(details);
-                }
-            }
-            Ok(None) => {}
-            Err(err) => tracing::warn!("tool_result extension hook failed (fail-open): {err}"),
         }
     }
 
@@ -3231,51 +2988,11 @@ struct ToolExecutionOutcome {
     steering_messages: Option<Vec<Message>>,
 }
 
-/// Pre-created extension runtime state for overlapping startup I/O.
-///
-/// By spawning runtime boot as a background task *before* session creation and
-/// model selection, expensive runtime startup can overlap with other work.
-pub struct PreWarmedExtensionRuntime {
-    /// The extension manager (already has `cwd` and risk config set).
-    pub manager: ExtensionManager,
-    /// The booted runtime handle.
-    pub runtime: ExtensionRuntimeHandle,
-    /// The tool registry passed to the runtime during boot.
-    pub tools: Arc<ToolRegistry>,
-}
-
-/// RAII guard that resets an `AtomicBool` to `false` on drop, ensuring the
-/// flag is cleared even if the enclosing async task is cancelled.
-struct AtomicBoolGuard(Arc<AtomicBool>);
-
-impl AtomicBoolGuard {
-    fn activate(flag: &Arc<AtomicBool>) -> Self {
-        flag.store(true, Ordering::SeqCst);
-        Self(Arc::clone(flag))
-    }
-}
-
-impl Drop for AtomicBoolGuard {
-    fn drop(&mut self) {
-        self.0.store(false, Ordering::SeqCst);
-    }
-}
-
 pub struct AgentSession {
     pub agent: Agent,
     pub session: Arc<Mutex<Session>>,
     save_enabled: bool,
     input_source: InputSource,
-    /// Extension lifecycle region — ensures the JS runtime thread is shut
-    /// down when the session ends.
-    pub extensions: Option<ExtensionRegion>,
-    extensions_is_streaming: Arc<AtomicBool>,
-    extensions_is_compacting: Arc<AtomicBool>,
-    extensions_turn_active: Arc<AtomicBool>,
-    extensions_pending_idle_actions: Arc<StdMutex<VecDeque<PendingIdleAction>>>,
-    extension_queue_modes: Option<Arc<StdMutex<ExtensionQueueModeState>>>,
-    extension_injected_queue: Option<Arc<StdMutex<ExtensionInjectedQueue>>>,
-    extension_ai_completion: Arc<StdMutex<ExtensionAiCompletionHostState>>,
     compaction_settings: ResolvedCompactionSettings,
     compaction_runtime: Option<Runtime>,
     runtime_handle: Option<RuntimeHandle>,
@@ -3284,542 +3001,6 @@ pub struct AgentSession {
     auth_storage: Option<AuthStorage>,
     api_key_override: Option<String>,
     semantic_context_bundle: Option<SemanticContextBundleInjection>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct ExtensionQueueModeState {
-    steering_mode: QueueMode,
-    follow_up_mode: QueueMode,
-}
-
-impl ExtensionQueueModeState {
-    const fn new(steering_mode: QueueMode, follow_up_mode: QueueMode) -> Self {
-        Self {
-            steering_mode,
-            follow_up_mode,
-        }
-    }
-
-    const fn set_modes(&mut self, steering_mode: QueueMode, follow_up_mode: QueueMode) {
-        self.steering_mode = steering_mode;
-        self.follow_up_mode = follow_up_mode;
-    }
-}
-
-#[derive(Debug)]
-struct ExtensionInjectedQueue {
-    steering: VecDeque<Message>,
-    follow_up: VecDeque<Message>,
-    steering_mode: QueueMode,
-    follow_up_mode: QueueMode,
-}
-
-impl ExtensionInjectedQueue {
-    const fn new(steering_mode: QueueMode, follow_up_mode: QueueMode) -> Self {
-        Self {
-            steering: VecDeque::new(),
-            follow_up: VecDeque::new(),
-            steering_mode,
-            follow_up_mode,
-        }
-    }
-
-    const fn set_modes(&mut self, steering_mode: QueueMode, follow_up_mode: QueueMode) {
-        self.steering_mode = steering_mode;
-        self.follow_up_mode = follow_up_mode;
-    }
-
-    fn push_steering(&mut self, message: Message) {
-        if self.steering.len() >= MAX_STEERING_QUEUE_SIZE {
-            tracing::warn!(
-                "Extension steering queue full ({} messages), dropping oldest message",
-                MAX_STEERING_QUEUE_SIZE
-            );
-            self.steering.pop_front();
-        }
-        self.steering.push_back(message);
-    }
-
-    fn push_follow_up(&mut self, message: Message) {
-        if self.follow_up.len() >= MAX_FOLLOW_UP_QUEUE_SIZE {
-            tracing::warn!(
-                "Extension follow-up queue full ({} messages), dropping oldest message",
-                MAX_FOLLOW_UP_QUEUE_SIZE
-            );
-            self.follow_up.pop_front();
-        }
-        self.follow_up.push_back(message);
-    }
-
-    fn pop_steering(&mut self) -> Vec<Message> {
-        match self.steering_mode {
-            QueueMode::All => self.steering.drain(..).collect(),
-            QueueMode::OneAtATime => self.steering.pop_front().into_iter().collect(),
-        }
-    }
-
-    fn pop_follow_up(&mut self) -> Vec<Message> {
-        match self.follow_up_mode {
-            QueueMode::All => self.follow_up.drain(..).collect(),
-            QueueMode::OneAtATime => self.follow_up.pop_front().into_iter().collect(),
-        }
-    }
-}
-
-impl Default for ExtensionInjectedQueue {
-    fn default() -> Self {
-        Self::new(QueueMode::OneAtATime, QueueMode::OneAtATime)
-    }
-}
-
-#[derive(Debug)]
-enum PendingIdleAction {
-    CustomMessage(Message),
-    UserText(String),
-}
-
-#[derive(Clone)]
-struct AgentSessionHostActions {
-    session: Arc<Mutex<Session>>,
-    injected: Arc<StdMutex<ExtensionInjectedQueue>>,
-    is_streaming: Arc<AtomicBool>,
-    is_turn_active: Arc<AtomicBool>,
-    pending_idle_actions: Arc<StdMutex<VecDeque<PendingIdleAction>>>,
-    ai_completion: Arc<StdMutex<ExtensionAiCompletionHostState>>,
-}
-
-#[derive(Clone)]
-struct ExtensionAiCompletionHostState {
-    provider: Arc<dyn Provider>,
-    stream_options: StreamOptions,
-    models: Vec<Value>,
-}
-
-impl AgentSessionHostActions {
-    fn enqueue(&self, deliver_as: Option<ExtensionDeliverAs>, message: Message) {
-        let deliver_as = deliver_as.unwrap_or(ExtensionDeliverAs::Steer);
-        let Ok(mut queue) = self.injected.lock() else {
-            tracing::error!("injected queue mutex poisoned; dropping extension message");
-            return;
-        };
-        match deliver_as {
-            ExtensionDeliverAs::FollowUp => {
-                queue.push_follow_up(message);
-            }
-            ExtensionDeliverAs::Steer | ExtensionDeliverAs::NextTurn => {
-                queue.push_steering(message);
-            }
-        }
-    }
-
-    async fn append_to_session(&self, message: Message) -> Result<()> {
-        let cx = crate::agent_cx::AgentCx::for_current_or_request();
-        let mut session = self
-            .session
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(e.to_string()))?;
-        session.append_model_message(message);
-        Ok(())
-    }
-
-    fn queue_pending_idle_action(&self, action: PendingIdleAction) {
-        let Ok(mut actions) = self.pending_idle_actions.lock() else {
-            tracing::error!("pending idle actions mutex poisoned; dropping idle action");
-            return;
-        };
-        actions.push_back(action);
-    }
-}
-
-#[async_trait]
-impl ExtensionHostActions for AgentSessionHostActions {
-    async fn send_message(&self, message: ExtensionSendMessage) -> Result<()> {
-        let custom_message = Message::Custom(CustomMessage {
-            content: message.content,
-            custom_type: message.custom_type,
-            display: message.display,
-            details: message.details,
-            timestamp: Utc::now().timestamp_millis(),
-        });
-
-        if matches!(message.deliver_as, Some(ExtensionDeliverAs::NextTurn)) {
-            return self.append_to_session(custom_message).await;
-        }
-
-        if self.is_streaming.load(Ordering::SeqCst) {
-            self.enqueue(message.deliver_as, custom_message);
-            return Ok(());
-        }
-
-        if self.is_turn_active.load(Ordering::SeqCst) {
-            return self.append_to_session(custom_message).await;
-        }
-
-        if message.trigger_turn {
-            self.queue_pending_idle_action(PendingIdleAction::CustomMessage(custom_message));
-            return Ok(());
-        }
-
-        self.append_to_session(custom_message).await
-    }
-
-    async fn send_user_message(&self, message: ExtensionSendUserMessage) -> Result<()> {
-        let text = message.text;
-        let user_message = Message::User(UserMessage {
-            content: UserContent::Text(text.clone()),
-            timestamp: Utc::now().timestamp_millis(),
-        });
-
-        if self.is_streaming.load(Ordering::SeqCst) {
-            self.enqueue(message.deliver_as, user_message);
-            return Ok(());
-        }
-
-        if self.is_turn_active.load(Ordering::SeqCst) {
-            return self.append_to_session(user_message).await;
-        }
-
-        self.queue_pending_idle_action(PendingIdleAction::UserText(text));
-        Ok(())
-    }
-
-    async fn complete_ai(&self, request: ExtensionAiCompletionRequest) -> Result<Value> {
-        let (provider, mut stream_options) = {
-            let state = self.ai_completion.lock().map_err(|_| {
-                Error::extension("extension completion host state mutex poisoned".to_string())
-            })?;
-            (Arc::clone(&state.provider), state.stream_options.clone())
-        };
-
-        apply_pi_ai_completion_options(&request.options, &mut stream_options)?;
-        let context = build_pi_ai_completion_context(&request)?;
-        let provider_name = provider.name().to_string();
-        let mut events = provider.stream(&context, &stream_options).await?;
-        let mut streamed_text = String::new();
-
-        while let Some(event) = events.next().await {
-            match event.map_err(|err| Error::provider(provider_name.clone(), err.to_string()))? {
-                StreamEvent::TextDelta { delta, .. } => streamed_text.push_str(&delta),
-                StreamEvent::TextEnd { content, .. } => {
-                    streamed_text.push_str(&content);
-                }
-                StreamEvent::Done { message, .. } => {
-                    if message.stop_reason == StopReason::Error {
-                        return Err(Error::provider(
-                            provider_name,
-                            pi_ai_assistant_error_message(&message),
-                        ));
-                    }
-                    return pi_ai_completion_response(&message, request.simple);
-                }
-                StreamEvent::Error { error, .. } => {
-                    return Err(Error::provider(
-                        provider_name,
-                        pi_ai_assistant_error_message(&error),
-                    ));
-                }
-                StreamEvent::Start { .. }
-                | StreamEvent::TextStart { .. }
-                | StreamEvent::ThinkingStart { .. }
-                | StreamEvent::ThinkingDelta { .. }
-                | StreamEvent::ThinkingEnd { .. }
-                | StreamEvent::ToolCallStart { .. }
-                | StreamEvent::ToolCallDelta { .. }
-                | StreamEvent::ToolCallEnd { .. } => {}
-            }
-        }
-
-        let suffix = if streamed_text.is_empty() {
-            String::new()
-        } else {
-            format!(" after streaming {} text bytes", streamed_text.len())
-        };
-        Err(Error::provider(
-            provider_name,
-            format!("pi-ai completion stream ended without Done event{suffix}"),
-        ))
-    }
-
-    async fn list_ai_models(&self) -> Result<Value> {
-        let state = self.ai_completion.lock().map_err(|_| {
-            Error::extension("extension completion host state mutex poisoned".to_string())
-        })?;
-        if state.models.is_empty() {
-            return Ok(json!([{
-                "id": state.provider.model_id(),
-                "name": state.provider.model_id(),
-                "api": state.provider.api(),
-                "provider": state.provider.name(),
-            }]));
-        }
-        Ok(Value::Array(state.models.clone()))
-    }
-}
-
-fn pi_ai_model_entry_value(entry: &ModelEntry) -> Value {
-    json!({
-        "id": entry.model.id,
-        "name": entry.model.name,
-        "api": entry.model.api,
-        "provider": entry.model.provider,
-        "baseUrl": entry.model.base_url,
-        "reasoning": entry.model.reasoning,
-        "input": entry.model.input,
-        "cost": entry.model.cost,
-        "contextWindow": entry.model.context_window,
-        "maxTokens": entry.model.max_tokens,
-        "authHeader": entry.auth_header,
-        "hasCredentials": entry.api_key.is_some(),
-    })
-}
-
-fn pi_ai_model_registry_values(registry: &ModelRegistry) -> Vec<Value> {
-    registry
-        .models()
-        .iter()
-        .map(pi_ai_model_entry_value)
-        .collect()
-}
-
-fn apply_pi_ai_completion_options(
-    options: &Value,
-    stream_options: &mut StreamOptions,
-) -> Result<()> {
-    if let Some(value) = options
-        .get("temperature")
-        .or_else(|| options.get("temp"))
-        .filter(|value| !value.is_null())
-    {
-        let temperature = serde_json::from_value::<f32>(value.clone()).map_err(|err| {
-            Error::validation(format!(
-                "pi-ai completion temperature must be numeric: {err}"
-            ))
-        })?;
-        if !(0.0..=2.0).contains(&temperature) {
-            return Err(Error::validation(
-                "pi-ai completion temperature must be between 0 and 2".to_string(),
-            ));
-        }
-        stream_options.temperature = Some(temperature);
-    }
-
-    if let Some(value) = options
-        .get("maxTokens")
-        .or_else(|| options.get("max_tokens"))
-        .filter(|value| !value.is_null())
-    {
-        let raw = value.as_u64().ok_or_else(|| {
-            Error::validation("pi-ai completion maxTokens must be an unsigned integer".to_string())
-        })?;
-        let max_tokens = u32::try_from(raw).map_err(|_| {
-            Error::validation("pi-ai completion maxTokens exceeds u32::MAX".to_string())
-        })?;
-        if max_tokens == 0 {
-            return Err(Error::validation(
-                "pi-ai completion maxTokens must be greater than zero".to_string(),
-            ));
-        }
-        stream_options.max_tokens = Some(max_tokens);
-    }
-
-    Ok(())
-}
-
-fn build_pi_ai_completion_context(
-    request: &ExtensionAiCompletionRequest,
-) -> Result<Context<'static>> {
-    let mut system_prompts = Vec::new();
-    let mut messages = Vec::new();
-    collect_pi_ai_context_messages(&request.context, &mut system_prompts, &mut messages)?;
-
-    if messages.is_empty() {
-        return Err(Error::validation(
-            "@mariozechner/pi-ai completion requires at least one user or assistant message"
-                .to_string(),
-        ));
-    }
-
-    let system_prompt = system_prompts
-        .into_iter()
-        .filter(|text| !text.trim().is_empty())
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    Ok(Context::owned(
-        if system_prompt.is_empty() {
-            None
-        } else {
-            Some(system_prompt)
-        },
-        messages,
-        Vec::new(),
-    ))
-}
-
-fn collect_pi_ai_context_messages(
-    value: &Value,
-    system_prompts: &mut Vec<String>,
-    messages: &mut Vec<Message>,
-) -> Result<()> {
-    match value {
-        Value::Null => {}
-        Value::String(text) => push_pi_ai_user_message(text, messages),
-        Value::Array(items) => {
-            for item in items {
-                push_pi_ai_message(item, system_prompts, messages)?;
-            }
-        }
-        Value::Object(map) => {
-            if let Some(system) = map
-                .get("systemPrompt")
-                .or_else(|| map.get("system_prompt"))
-                .or_else(|| map.get("system"))
-                .and_then(pi_ai_text_from_value)
-            {
-                system_prompts.push(system);
-            }
-
-            if let Some(items) = map.get("messages").and_then(Value::as_array) {
-                for item in items {
-                    push_pi_ai_message(item, system_prompts, messages)?;
-                }
-            } else if let Some(prompt) = map
-                .get("prompt")
-                .or_else(|| map.get("input"))
-                .or_else(|| map.get("message"))
-                .and_then(pi_ai_text_from_value)
-            {
-                push_pi_ai_user_message(&prompt, messages);
-            } else if map.contains_key("role") {
-                push_pi_ai_message(value, system_prompts, messages)?;
-            }
-        }
-        Value::Bool(_) | Value::Number(_) => push_pi_ai_user_message(&value.to_string(), messages),
-    }
-    Ok(())
-}
-
-fn push_pi_ai_message(
-    value: &Value,
-    system_prompts: &mut Vec<String>,
-    messages: &mut Vec<Message>,
-) -> Result<()> {
-    let Value::Object(map) = value else {
-        if let Some(text) = pi_ai_text_from_value(value) {
-            push_pi_ai_user_message(&text, messages);
-        }
-        return Ok(());
-    };
-
-    let role = map
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or("user")
-        .trim()
-        .to_ascii_lowercase();
-    let content = map
-        .get("content")
-        .or_else(|| map.get("text"))
-        .and_then(pi_ai_text_from_value)
-        .unwrap_or_default();
-
-    match role.as_str() {
-        "system" => {
-            if !content.trim().is_empty() {
-                system_prompts.push(content);
-            }
-        }
-        "user" => push_pi_ai_user_message(&content, messages),
-        "assistant" => push_pi_ai_assistant_message(&content, messages),
-        other => {
-            return Err(Error::validation(format!(
-                "@mariozechner/pi-ai completion does not support {other:?} context messages"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn push_pi_ai_user_message(text: &str, messages: &mut Vec<Message>) {
-    messages.push(Message::User(UserMessage {
-        content: UserContent::Text(text.to_string()),
-        timestamp: Utc::now().timestamp_millis(),
-    }));
-}
-
-fn push_pi_ai_assistant_message(text: &str, messages: &mut Vec<Message>) {
-    messages.push(Message::assistant(AssistantMessage {
-        content: vec![ContentBlock::Text(TextContent::new(text.to_string()))],
-        timestamp: Utc::now().timestamp_millis(),
-        ..AssistantMessage::default()
-    }));
-}
-
-fn pi_ai_text_from_value(value: &Value) -> Option<String> {
-    match value {
-        Value::Null => None,
-        Value::String(text) => Some(text.clone()),
-        Value::Bool(_) | Value::Number(_) => Some(value.to_string()),
-        Value::Array(items) => {
-            let mut text = String::new();
-            for item in items {
-                if let Some(part) = pi_ai_text_from_value(item)
-                    && !part.is_empty()
-                {
-                    text.push_str(&part);
-                }
-            }
-            Some(text)
-        }
-        Value::Object(map) => map
-            .get("text")
-            .or_else(|| map.get("content"))
-            .or_else(|| map.get("delta"))
-            .and_then(pi_ai_text_from_value),
-    }
-}
-
-fn pi_ai_assistant_text(message: &AssistantMessage) -> String {
-    let mut text = String::new();
-    for block in &message.content {
-        if let ContentBlock::Text(text_block) = block {
-            text.push_str(&text_block.text);
-        }
-    }
-    text
-}
-
-fn pi_ai_assistant_error_message(message: &AssistantMessage) -> String {
-    message
-        .error_message
-        .clone()
-        .filter(|text| !text.trim().is_empty())
-        .unwrap_or_else(|| {
-            let text = pi_ai_assistant_text(message);
-            if text.trim().is_empty() {
-                "provider returned an error without a message".to_string()
-            } else {
-                text
-            }
-        })
-}
-
-fn pi_ai_completion_response(message: &AssistantMessage, simple: bool) -> Result<Value> {
-    let text = pi_ai_assistant_text(message);
-    if simple {
-        return Ok(Value::String(text));
-    }
-
-    Ok(json!({
-        "message": serde_json::to_value(message)?,
-        "content": serde_json::to_value(&message.content)?,
-        "text": text,
-        "usage": serde_json::to_value(&message.usage)?,
-        "model": message.model,
-        "provider": message.provider,
-        "api": message.api,
-        "stopReason": message.stop_reason,
-    }))
 }
 
 #[cfg(test)]
@@ -4457,7 +3638,7 @@ mod tool_effect_batch_planning_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod extensions_integration_tests {
     use super::*;
 
@@ -5659,7 +4840,7 @@ mod extensions_integration_tests {
     #[test]
     fn latency_breakdown_reports_component_tail_percentiles() {
         let breakdown =
-            TurnLatencyBreakdown::from_component_samples(250, &[10, 30, 20], &[40, 5], &[2], &[]);
+            TurnLatencyBreakdown::from_component_samples(250, &[10, 30, 20], &[40, 5], &[]);
 
         assert_eq!(breakdown.schema, TURN_LATENCY_BREAKDOWN_SCHEMA_V1);
         assert_eq!(breakdown.provider_streaming.duration_ms, 60);
@@ -5669,7 +4850,6 @@ mod extensions_integration_tests {
         assert_eq!(breakdown.provider_streaming.tail_percentiles.p99_ms, 30);
         assert_eq!(breakdown.provider_streaming.tail_percentiles.p999_ms, 30);
         assert_eq!(breakdown.local_tools.duration_ms, 45);
-        assert_eq!(breakdown.extension_hostcalls.duration_ms, 2);
         assert_eq!(breakdown.persistence.duration_ms, 0);
         assert_eq!(breakdown.dominant_component, "provider_streaming");
     }
@@ -6761,7 +5941,6 @@ mod abort_tests {
             AgentEvent::AutoCompactionEnd { .. } => "auto_compaction_end",
             AgentEvent::AutoRetryStart { .. } => "auto_retry_start",
             AgentEvent::AutoRetryEnd { .. } => "auto_retry_end",
-            AgentEvent::ExtensionError { .. } => "extension_error",
         }
     }
 
@@ -7694,245 +6873,18 @@ mod turn_event_tests {
     }
 }
 
-#[derive(Clone)]
-struct AgentExtensionSession {
-    handle: SessionHandle,
-    is_streaming: Arc<AtomicBool>,
-    is_compacting: Arc<AtomicBool>,
-    queue_modes: Arc<StdMutex<ExtensionQueueModeState>>,
-    auto_compaction_enabled: bool,
-}
-
-impl AgentExtensionSession {
-    fn current_queue_modes(&self) -> (QueueMode, QueueMode) {
-        self.queue_modes
-            .lock()
-            .map_or((QueueMode::OneAtATime, QueueMode::OneAtATime), |state| {
-                (state.steering_mode, state.follow_up_mode)
-            })
-    }
-
-    fn state_fallback(&self) -> Value {
-        let (steering_mode, follow_up_mode) = self.current_queue_modes();
-        json!({
-            "model": null,
-            "thinkingLevel": "off",
-            "durabilityMode": "balanced",
-            "isStreaming": self.is_streaming.load(std::sync::atomic::Ordering::SeqCst),
-            "isCompacting": self.is_compacting.load(std::sync::atomic::Ordering::SeqCst),
-            "steeringMode": steering_mode.as_str(),
-            "followUpMode": follow_up_mode.as_str(),
-            "sessionFile": null,
-            "sessionId": "",
-            "sessionName": null,
-            "autoCompactionEnabled": self.auto_compaction_enabled,
-            "messageCount": 0,
-            "pendingMessageCount": 0,
-        })
-    }
-}
-
-#[async_trait]
-impl crate::extensions::ExtensionSession for AgentExtensionSession {
-    async fn get_state(&self) -> Value {
-        let (steering_mode, follow_up_mode) = self.current_queue_modes();
-        let mut state =
-            <SessionHandle as crate::extensions::ExtensionSession>::get_state(&self.handle).await;
-        let Some(object) = state.as_object_mut() else {
-            return self.state_fallback();
-        };
-
-        object.insert(
-            "isStreaming".to_string(),
-            Value::Bool(self.is_streaming.load(std::sync::atomic::Ordering::SeqCst)),
-        );
-        object.insert(
-            "isCompacting".to_string(),
-            Value::Bool(self.is_compacting.load(std::sync::atomic::Ordering::SeqCst)),
-        );
-        object.insert(
-            "steeringMode".to_string(),
-            Value::String(steering_mode.as_str().to_string()),
-        );
-        object.insert(
-            "followUpMode".to_string(),
-            Value::String(follow_up_mode.as_str().to_string()),
-        );
-        object.insert(
-            "autoCompactionEnabled".to_string(),
-            Value::Bool(self.auto_compaction_enabled),
-        );
-
-        state
-    }
-
-    async fn get_messages(&self) -> Vec<crate::session::SessionMessage> {
-        <SessionHandle as crate::extensions::ExtensionSession>::get_messages(&self.handle).await
-    }
-
-    async fn get_entries(&self) -> Vec<Value> {
-        <SessionHandle as crate::extensions::ExtensionSession>::get_entries(&self.handle).await
-    }
-
-    async fn get_branch(&self) -> Vec<Value> {
-        <SessionHandle as crate::extensions::ExtensionSession>::get_branch(&self.handle).await
-    }
-
-    async fn set_name(&self, name: String) -> crate::error::Result<()> {
-        <SessionHandle as crate::extensions::ExtensionSession>::set_name(&self.handle, name).await
-    }
-
-    async fn append_message(
-        &self,
-        message: crate::session::SessionMessage,
-    ) -> crate::error::Result<()> {
-        <SessionHandle as crate::extensions::ExtensionSession>::append_message(
-            &self.handle,
-            message,
-        )
-        .await
-    }
-
-    async fn append_custom_entry(
-        &self,
-        custom_type: String,
-        data: Option<Value>,
-    ) -> crate::error::Result<()> {
-        <SessionHandle as crate::extensions::ExtensionSession>::append_custom_entry(
-            &self.handle,
-            custom_type,
-            data,
-        )
-        .await
-    }
-
-    async fn set_model(&self, provider: String, model_id: String) -> crate::error::Result<()> {
-        <SessionHandle as crate::extensions::ExtensionSession>::set_model(
-            &self.handle,
-            provider,
-            model_id,
-        )
-        .await
-    }
-
-    async fn get_model(&self) -> (Option<String>, Option<String>) {
-        <SessionHandle as crate::extensions::ExtensionSession>::get_model(&self.handle).await
-    }
-
-    async fn set_thinking_level(&self, level: String) -> crate::error::Result<()> {
-        <SessionHandle as crate::extensions::ExtensionSession>::set_thinking_level(
-            &self.handle,
-            level,
-        )
-        .await
-    }
-
-    async fn get_thinking_level(&self) -> Option<String> {
-        <SessionHandle as crate::extensions::ExtensionSession>::get_thinking_level(&self.handle)
-            .await
-    }
-
-    async fn set_label(
-        &self,
-        target_id: String,
-        label: Option<String>,
-    ) -> crate::error::Result<()> {
-        <SessionHandle as crate::extensions::ExtensionSession>::set_label(
-            &self.handle,
-            target_id,
-            label,
-        )
-        .await
-    }
-}
-
 impl AgentSession {
-    pub const fn runtime_repair_mode_from_policy_mode(mode: RepairPolicyMode) -> RepairMode {
-        match mode {
-            RepairPolicyMode::Off => RepairMode::Off,
-            RepairPolicyMode::Suggest => RepairMode::Suggest,
-            RepairPolicyMode::AutoSafe => RepairMode::AutoSafe,
-            RepairPolicyMode::AutoStrict => RepairMode::AutoStrict,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn start_js_extension_runtime(
-        stage: &'static str,
-        cwd: &std::path::Path,
-        tools: Arc<ToolRegistry>,
-        manager: ExtensionManager,
-        policy: ExtensionPolicy,
-        repair_mode: RepairMode,
-        memory_limit_bytes: usize,
-    ) -> Result<ExtensionRuntimeHandle> {
-        let mut config = PiJsRuntimeConfig {
-            cwd: cwd.display().to_string(),
-            repair_mode,
-            ..PiJsRuntimeConfig::default()
-        };
-        config.limits.memory_limit_bytes = Some(memory_limit_bytes).filter(|bytes| *bytes > 0);
-
-        let runtime =
-            JsExtensionRuntimeHandle::start_with_policy(config, tools, manager, policy).await?;
-        tracing::info!(
-            event = "pi.extension_runtime.engine_decision",
-            stage,
-            requested = "quickjs",
-            selected = "quickjs",
-            fallback = false,
-            "Extension runtime engine selected (legacy JS/TS)"
-        );
-        Ok(ExtensionRuntimeHandle::Js(runtime))
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn start_native_extension_runtime(
-        stage: &'static str,
-        _cwd: &std::path::Path,
-        _tools: Arc<ToolRegistry>,
-        _manager: ExtensionManager,
-        _policy: ExtensionPolicy,
-        _repair_mode: RepairMode,
-        _memory_limit_bytes: usize,
-    ) -> Result<ExtensionRuntimeHandle> {
-        let runtime = NativeRustExtensionRuntimeHandle::start().await?;
-        tracing::info!(
-            event = "pi.extension_runtime.engine_decision",
-            stage,
-            requested = "native-rust",
-            selected = "native-rust",
-            fallback = false,
-            "Extension runtime engine selected (native-rust)"
-        );
-        Ok(ExtensionRuntimeHandle::NativeRust(runtime))
-    }
-
     pub fn new(
         agent: Agent,
         session: Arc<Mutex<Session>>,
         save_enabled: bool,
         compaction_settings: ResolvedCompactionSettings,
     ) -> Self {
-        let extension_ai_completion = Arc::new(StdMutex::new(ExtensionAiCompletionHostState {
-            provider: agent.provider(),
-            stream_options: agent.stream_options().clone(),
-            models: Vec::new(),
-        }));
-
         Self {
             agent,
             session,
             save_enabled,
             input_source: InputSource::Interactive,
-            extensions: None,
-            extensions_is_streaming: Arc::new(AtomicBool::new(false)),
-            extensions_is_compacting: Arc::new(AtomicBool::new(false)),
-            extensions_turn_active: Arc::new(AtomicBool::new(false)),
-            extensions_pending_idle_actions: Arc::new(StdMutex::new(VecDeque::new())),
-            extension_queue_modes: None,
-            extension_injected_queue: None,
-            extension_ai_completion,
             compaction_settings,
             compaction_runtime: None,
             runtime_handle: None,
@@ -7968,7 +6920,6 @@ impl AgentSession {
     }
 
     pub fn set_model_registry(&mut self, registry: ModelRegistry) {
-        self.set_extension_ai_models(pi_ai_model_registry_values(&registry));
         self.model_registry = Some(registry);
     }
 
@@ -7986,25 +6937,6 @@ impl AgentSession {
         self.api_key_override = normalize_api_key_opt(api_key);
     }
 
-    pub fn refresh_extension_completion_host_state(&self) {
-        let Ok(mut state) = self.extension_ai_completion.lock() else {
-            tracing::error!("extension completion host state mutex poisoned; keeping stale state");
-            return;
-        };
-        state.provider = self.agent.provider();
-        state.stream_options = self.agent.stream_options().clone();
-    }
-
-    fn set_extension_ai_models(&self, models: Vec<Value>) {
-        let Ok(mut state) = self.extension_ai_completion.lock() else {
-            tracing::error!(
-                "extension completion host state mutex poisoned; keeping stale model catalog"
-            );
-            return;
-        };
-        state.models = models;
-    }
-
     pub fn set_semantic_context_bundle(
         &mut self,
         injection: Option<SemanticContextBundleInjection>,
@@ -8018,18 +6950,6 @@ impl AgentSession {
 
     pub fn set_queue_modes(&mut self, steering_mode: QueueMode, follow_up_mode: QueueMode) {
         self.agent.set_queue_modes(steering_mode, follow_up_mode);
-
-        if let Some(queue_modes) = &self.extension_queue_modes
-            && let Ok(mut state) = queue_modes.lock()
-        {
-            state.set_modes(steering_mode, follow_up_mode);
-        }
-
-        if let Some(injected_queue) = &self.extension_injected_queue
-            && let Ok(mut queue) = injected_queue.lock()
-        {
-            queue.set_modes(steering_mode, follow_up_mode);
-        }
     }
 
     pub const fn set_compaction_context_window(&mut self, context_window_tokens: u32) {
@@ -8074,7 +6994,6 @@ impl AgentSession {
             self.apply_session_model_selection(provider_id, model_id)?;
         }
         self.agent.stream_options_mut().thinking_level = Some(next_thinking);
-        self.refresh_extension_completion_host_state();
 
         {
             let cx = crate::agent_cx::AgentCx::for_request();
@@ -8180,7 +7099,6 @@ impl AgentSession {
         };
 
         self.agent.stream_options_mut().thinking_level = Some(effective);
-        self.refresh_extension_completion_host_state();
 
         let thinking_changed = !effective.eq(&current_thinking);
         let persist_needed = if session_thinking.is_some() {
@@ -8241,10 +7159,7 @@ impl AgentSession {
             )));
         }
 
-        match crate::providers::create_provider(
-            &entry,
-            self.extensions.as_ref().map(ExtensionRegion::manager),
-        ) {
+        match crate::providers::create_provider(&entry) {
             Ok(provider) => {
                 tracing::info!("Updating agent provider to {provider_id}/{model_id}");
                 self.agent.set_provider(provider);
@@ -8252,7 +7167,6 @@ impl AgentSession {
                 let stream_options = self.agent.stream_options_mut();
                 stream_options.api_key.clone_from(&resolved_key);
                 stream_options.headers.clone_from(&entry.headers);
-                self.refresh_extension_completion_host_state();
                 Ok(())
             }
             Err(e) => Err(Error::validation(format!(
@@ -8273,59 +7187,6 @@ impl AgentSession {
         self.compact_synchronous(Arc::new(on_event)).await
     }
 
-    pub async fn execute_extension_command(
-        &mut self,
-        command_name: &str,
-        args: &str,
-        timeout_ms: u64,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<Value> {
-        self.execute_extension_command_with_abort(command_name, args, timeout_ms, None, on_event)
-            .await
-    }
-
-    pub async fn execute_extension_command_with_abort(
-        &mut self,
-        command_name: &str,
-        args: &str,
-        timeout_ms: u64,
-        abort: Option<AbortSignal>,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<Value> {
-        let manager = self
-            .extensions
-            .as_ref()
-            .map(ExtensionRegion::manager)
-            .ok_or_else(|| Error::extension("Extensions are disabled"))?
-            .clone();
-        let on_event: AgentEventHandler = Arc::new(on_event);
-
-        self.run_pending_idle_actions_with_abort(abort.clone(), Arc::clone(&on_event))
-            .await?;
-
-        let command_result = manager
-            .execute_command(command_name, args, timeout_ms)
-            .await;
-        let replay_result = self
-            .run_pending_idle_actions_with_abort(abort, Arc::clone(&on_event))
-            .await;
-
-        match command_result {
-            Ok(value) => {
-                replay_result?;
-                Ok(value)
-            }
-            Err(err) => {
-                if let Err(replay_err) = replay_result {
-                    tracing::warn!(
-                        "extension command follow-up replay failed after command error: {replay_err}"
-                    );
-                }
-                Err(err)
-            }
-        }
-    }
-
     /// Two-phase non-blocking compaction.
     ///
     /// **Phase 1** — apply a completed background compaction result (if any).
@@ -8339,8 +7200,6 @@ impl AgentSession {
 
         // Phase 1: apply completed background result.
         if let Some(outcome) = self.compaction_worker.try_recv().await {
-            self.extensions_is_compacting
-                .store(false, std::sync::atomic::Ordering::SeqCst);
             match outcome {
                 Ok(result) => {
                     self.apply_compaction_result(result, Arc::clone(&on_event))
@@ -8362,7 +7221,7 @@ impl AgentSession {
             return Ok(());
         }
 
-        let (entries, preparation) = {
+        let preparation = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = self
                 .session
@@ -8375,8 +7234,7 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
-            (entries, prep)
+            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
         };
 
         if let Some(prep) = preparation {
@@ -8395,47 +7253,6 @@ impl AgentSession {
             on_event(AgentEvent::AutoCompactionStart {
                 reason: format!("threshold;admission={}", admission.reason.as_str()),
             });
-
-            let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
-            if before_outcome.cancel {
-                on_event(AgentEvent::AutoCompactionEnd {
-                    result: None,
-                    aborted: true,
-                    will_retry: false,
-                    error_message: None,
-                });
-                return Ok(());
-            }
-
-            if let Some(compaction) = before_outcome.compaction {
-                let result_value = Some(Self::auto_compaction_result_payload(
-                    compaction.summary.clone(),
-                    compaction.first_kept_entry_id.clone(),
-                    compaction.tokens_before,
-                    compaction.details.clone(),
-                ));
-                self.extensions_is_compacting
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                let apply_result = self
-                    .apply_compaction_entry(
-                        compaction.summary,
-                        compaction.first_kept_entry_id,
-                        compaction.tokens_before,
-                        compaction.details,
-                        true,
-                    )
-                    .await;
-                self.extensions_is_compacting
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                apply_result?;
-                on_event(AgentEvent::AutoCompactionEnd {
-                    result: result_value,
-                    aborted: false,
-                    will_retry: false,
-                    error_message: None,
-                });
-                return Ok(());
-            }
 
             let provider = self.agent.provider();
             let credential = self
@@ -8460,8 +7277,6 @@ impl AgentSession {
 
             self.compaction_worker
                 .start(&runtime_handle, prep, provider, credential, None);
-            self.extensions_is_compacting
-                .store(true, std::sync::atomic::Ordering::SeqCst);
         }
 
         Ok(())
@@ -8516,7 +7331,7 @@ impl AgentSession {
             .map_err(|e| Error::session(e.to_string()))?;
 
         let from_hook = if from_extension { Some(true) } else { None };
-        let entry_id = session.append_compaction(
+        session.append_compaction(
             summary,
             first_kept_entry_id,
             tokens_before,
@@ -8528,29 +7343,6 @@ impl AgentSession {
             session
                 .flush_autosave(AutosaveFlushTrigger::Periodic)
                 .await?;
-        }
-
-        let compaction_entry = session.get_entry(&entry_id).and_then(|entry| {
-            if let crate::session::SessionEntry::Compaction(compaction) = entry {
-                Some(compaction.clone())
-            } else {
-                None
-            }
-        });
-        drop(session);
-
-        if let (Some(region), Some(compaction_entry)) = (&self.extensions, compaction_entry) {
-            let payload = json!({
-                "compactionEntry": compaction_entry,
-                "fromExtension": from_extension,
-            });
-            if let Err(err) = region
-                .manager()
-                .dispatch_event(ExtensionEventName::SessionCompact, Some(payload))
-                .await
-            {
-                tracing::warn!("session_compact extension hook failed (fail-open): {err}");
-            }
         }
 
         Ok(())
@@ -8595,7 +7387,7 @@ impl AgentSession {
             return Ok(());
         }
 
-        let (entries, preparation) = {
+        let preparation = {
             let cx = crate::agent_cx::AgentCx::for_request();
             let mut session = self
                 .session
@@ -8608,57 +7400,13 @@ impl AgentSession {
                 .into_iter()
                 .cloned()
                 .collect::<Vec<_>>();
-            let prep = compaction::prepare_compaction(&entries, self.compaction_settings.clone());
-            (entries, prep)
+            compaction::prepare_compaction(&entries, self.compaction_settings.clone())
         };
 
         if let Some(prep) = preparation {
             on_event(AgentEvent::AutoCompactionStart {
                 reason: "threshold".to_string(),
             });
-
-            let before_outcome = self.dispatch_before_compact(&prep, &entries, None).await;
-            if before_outcome.cancel {
-                on_event(AgentEvent::AutoCompactionEnd {
-                    result: None,
-                    aborted: true,
-                    will_retry: false,
-                    error_message: None,
-                });
-                return Err(Error::extension("Compaction cancelled".to_string()));
-            }
-
-            if let Some(compaction) = before_outcome.compaction {
-                let result_value = Some(Self::auto_compaction_result_payload(
-                    compaction.summary.clone(),
-                    compaction.first_kept_entry_id.clone(),
-                    compaction.tokens_before,
-                    compaction.details.clone(),
-                ));
-                self.extensions_is_compacting
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
-                let apply_result = self
-                    .apply_compaction_entry(
-                        compaction.summary,
-                        compaction.first_kept_entry_id,
-                        compaction.tokens_before,
-                        compaction.details,
-                        true,
-                    )
-                    .await;
-                self.extensions_is_compacting
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
-                apply_result?;
-                on_event(AgentEvent::AutoCompactionEnd {
-                    result: result_value,
-                    aborted: false,
-                    will_retry: false,
-                    error_message: None,
-                });
-                return Ok(());
-            }
-            self.extensions_is_compacting
-                .store(true, std::sync::atomic::Ordering::SeqCst);
 
             let provider = self.agent.provider();
             let credential = self
@@ -8669,8 +7417,6 @@ impl AgentSession {
                 .unwrap_or_default();
 
             let compaction_result = compaction::compact(prep, provider, &credential, None).await;
-            self.extensions_is_compacting
-                .store(false, std::sync::atomic::Ordering::SeqCst);
 
             match compaction_result {
                 Ok(result) => {
@@ -8688,336 +7434,6 @@ impl AgentSession {
                 }
             }
         }
-        Ok(())
-    }
-
-    fn resolve_extension_policy_for_enable(
-        config: Option<&crate::config::Config>,
-        policy: Option<ExtensionPolicy>,
-    ) -> ExtensionPolicy {
-        policy.unwrap_or_else(|| {
-            config.map_or_else(
-                || crate::config::Config::default().resolve_extension_policy(None),
-                |cfg| cfg.resolve_extension_policy(None),
-            )
-        })
-    }
-
-    pub async fn enable_extensions(
-        &mut self,
-        enabled_tools: &[&str],
-        cwd: &std::path::Path,
-        config: Option<&crate::config::Config>,
-        extension_entries: &[std::path::PathBuf],
-    ) -> Result<()> {
-        self.enable_extensions_with_policy(
-            enabled_tools,
-            cwd,
-            config,
-            extension_entries,
-            None,
-            None,
-            None,
-        )
-        .await
-    }
-
-    #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-    pub async fn enable_extensions_with_policy(
-        &mut self,
-        enabled_tools: &[&str],
-        cwd: &std::path::Path,
-        config: Option<&crate::config::Config>,
-        extension_entries: &[std::path::PathBuf],
-        policy: Option<ExtensionPolicy>,
-        repair_policy: Option<RepairPolicyMode>,
-        pre_warmed: Option<PreWarmedExtensionRuntime>,
-    ) -> Result<()> {
-        let mut js_specs: Vec<JsExtensionLoadSpec> = Vec::new();
-        let mut native_specs: Vec<NativeRustExtensionLoadSpec> = Vec::new();
-        #[cfg(feature = "wasm-host")]
-        let mut wasm_specs: Vec<WasmExtensionLoadSpec> = Vec::new();
-
-        for entry in extension_entries {
-            match resolve_extension_load_spec(entry)? {
-                ExtensionLoadSpec::Js(spec) => js_specs.push(spec),
-                ExtensionLoadSpec::NativeRust(spec) => native_specs.push(spec),
-                #[cfg(feature = "wasm-host")]
-                ExtensionLoadSpec::Wasm(spec) => wasm_specs.push(spec),
-            }
-        }
-
-        if !js_specs.is_empty() && !native_specs.is_empty() {
-            return Err(Error::validation(
-                "Mixed extension runtimes are not supported in one session yet. Use either JS/TS extensions (QuickJS) or native-rust descriptors (*.native.json), but not both at once."
-                    .to_string(),
-            ));
-        }
-
-        #[cfg(feature = "wasm-host")]
-        if js_specs.is_empty() && native_specs.is_empty() && wasm_specs.is_empty() {
-            self.extensions = None;
-            self.agent.extensions = None;
-            self.extension_queue_modes = None;
-            self.extension_injected_queue = None;
-            return Ok(());
-        }
-
-        #[cfg(not(feature = "wasm-host"))]
-        if js_specs.is_empty() && native_specs.is_empty() {
-            self.extensions = None;
-            self.agent.extensions = None;
-            self.extension_queue_modes = None;
-            self.extension_injected_queue = None;
-            return Ok(());
-        }
-
-        let resolved_policy = Self::resolve_extension_policy_for_enable(config, policy);
-        let resolved_repair_policy = repair_policy
-            .or_else(|| config.map(|cfg| cfg.resolve_repair_policy(None)))
-            .unwrap_or(RepairPolicyMode::AutoSafe);
-        let runtime_repair_mode =
-            Self::runtime_repair_mode_from_policy_mode(resolved_repair_policy);
-        let memory_limit_bytes =
-            (resolved_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
-        let wants_js_runtime = !js_specs.is_empty();
-
-        // Either use the pre-warmed extension runtime (booted concurrently with startup)
-        // or create a fresh runtime inline.
-        #[allow(unused_variables)]
-        let (manager, tools) = if let Some(pre) = pre_warmed {
-            let manager = pre.manager;
-            let tools = pre.tools;
-            let runtime = match pre.runtime {
-                ExtensionRuntimeHandle::NativeRust(runtime) => {
-                    if wants_js_runtime {
-                        tracing::warn!(
-                            event = "pi.extension_runtime.prewarm.mismatch",
-                            expected = "quickjs",
-                            got = "native-rust",
-                            "Pre-warmed runtime mismatched requested JS mode; creating quickjs runtime"
-                        );
-                        Self::start_js_extension_runtime(
-                            "agent_enable_extensions_prewarm_mismatch",
-                            cwd,
-                            Arc::clone(&tools),
-                            manager.clone(),
-                            resolved_policy.clone(),
-                            runtime_repair_mode,
-                            memory_limit_bytes,
-                        )
-                        .await?
-                    } else {
-                        tracing::info!(
-                            event = "pi.extension_runtime.engine_decision",
-                            stage = "agent_enable_extensions_prewarmed",
-                            requested = "native-rust",
-                            selected = "native-rust",
-                            fallback = false,
-                            "Using pre-warmed extension runtime"
-                        );
-                        ExtensionRuntimeHandle::NativeRust(runtime)
-                    }
-                }
-                ExtensionRuntimeHandle::Js(runtime) => {
-                    if wants_js_runtime {
-                        tracing::info!(
-                            event = "pi.extension_runtime.engine_decision",
-                            stage = "agent_enable_extensions_prewarmed",
-                            requested = "quickjs",
-                            selected = "quickjs",
-                            fallback = false,
-                            "Using pre-warmed extension runtime"
-                        );
-                        ExtensionRuntimeHandle::Js(runtime)
-                    } else {
-                        tracing::warn!(
-                            event = "pi.extension_runtime.prewarm.mismatch",
-                            expected = "native-rust",
-                            got = "quickjs",
-                            "Pre-warmed runtime mismatched requested native mode; creating native-rust runtime"
-                        );
-                        Self::start_native_extension_runtime(
-                            "agent_enable_extensions_prewarm_mismatch",
-                            cwd,
-                            Arc::clone(&tools),
-                            manager.clone(),
-                            resolved_policy.clone(),
-                            runtime_repair_mode,
-                            memory_limit_bytes,
-                        )
-                        .await?
-                    }
-                }
-            };
-            manager.set_runtime(runtime);
-            (manager, tools)
-        } else {
-            let manager = ExtensionManager::new();
-            manager.set_cwd(cwd.display().to_string());
-            let tools = Arc::new(ToolRegistry::new(enabled_tools, cwd, config));
-
-            if let Some(cfg) = config {
-                let resolved_risk = cfg.resolve_extension_risk_with_metadata();
-                tracing::info!(
-                    event = "pi.extension_runtime_risk.config",
-                    source = resolved_risk.source,
-                    enabled = resolved_risk.settings.enabled,
-                    alpha = resolved_risk.settings.alpha,
-                    window_size = resolved_risk.settings.window_size,
-                    ledger_limit = resolved_risk.settings.ledger_limit,
-                    fail_closed = resolved_risk.settings.fail_closed,
-                    "Resolved extension runtime risk settings"
-                );
-                manager.set_runtime_risk_config(resolved_risk.settings);
-            }
-
-            let runtime = if wants_js_runtime {
-                Self::start_js_extension_runtime(
-                    "agent_enable_extensions_boot",
-                    cwd,
-                    Arc::clone(&tools),
-                    manager.clone(),
-                    resolved_policy.clone(),
-                    runtime_repair_mode,
-                    memory_limit_bytes,
-                )
-                .await?
-            } else {
-                Self::start_native_extension_runtime(
-                    "agent_enable_extensions_boot",
-                    cwd,
-                    Arc::clone(&tools),
-                    manager.clone(),
-                    resolved_policy.clone(),
-                    runtime_repair_mode,
-                    memory_limit_bytes,
-                )
-                .await?
-            };
-            manager.set_runtime(runtime);
-            (manager, tools)
-        };
-
-        // Session, host actions, and message fetchers are always set here
-        // (after runtime boot) — the JS runtime only needs these when
-        // dispatching hostcalls, which happens during extension loading.
-        let (steering_mode, follow_up_mode) = self.agent.queue_modes();
-        let queue_modes = Arc::new(StdMutex::new(ExtensionQueueModeState::new(
-            steering_mode,
-            follow_up_mode,
-        )));
-        manager.set_session(Arc::new(AgentExtensionSession {
-            handle: SessionHandle(self.session.clone()),
-            is_streaming: Arc::clone(&self.extensions_is_streaming),
-            is_compacting: Arc::clone(&self.extensions_is_compacting),
-            queue_modes: Arc::clone(&queue_modes),
-            auto_compaction_enabled: self.compaction_settings.enabled,
-        }));
-
-        let injected = Arc::new(StdMutex::new(ExtensionInjectedQueue::new(
-            steering_mode,
-            follow_up_mode,
-        )));
-        let host_actions = AgentSessionHostActions {
-            session: Arc::clone(&self.session),
-            injected: Arc::clone(&injected),
-            is_streaming: Arc::clone(&self.extensions_is_streaming),
-            is_turn_active: Arc::clone(&self.extensions_turn_active),
-            pending_idle_actions: Arc::clone(&self.extensions_pending_idle_actions),
-            ai_completion: Arc::clone(&self.extension_ai_completion),
-        };
-        self.extension_queue_modes = Some(Arc::clone(&queue_modes));
-        self.extension_injected_queue = Some(Arc::clone(&injected));
-        manager.set_host_actions(Arc::new(host_actions));
-        {
-            let steering_queue = Arc::clone(&injected);
-            let follow_up_queue = Arc::clone(&injected);
-            let steering_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
-                let steering_queue = Arc::clone(&steering_queue);
-                Box::pin(async move {
-                    let Ok(mut queue) = steering_queue.lock() else {
-                        return Vec::new();
-                    };
-                    queue.pop_steering()
-                })
-            };
-            let follow_up_fetcher = move || -> BoxFuture<'static, Vec<Message>> {
-                let follow_up_queue = Arc::clone(&follow_up_queue);
-                Box::pin(async move {
-                    let Ok(mut queue) = follow_up_queue.lock() else {
-                        return Vec::new();
-                    };
-                    queue.pop_follow_up()
-                })
-            };
-            self.agent.register_message_fetchers(
-                Some(Arc::new(steering_fetcher)),
-                Some(Arc::new(follow_up_fetcher)),
-            );
-        }
-
-        if !js_specs.is_empty() {
-            manager.load_js_extensions(js_specs).await?;
-        }
-
-        if !native_specs.is_empty() {
-            manager.load_native_extensions(native_specs).await?;
-        }
-
-        // Drain and log auto-repair diagnostics (bd-k5q5.8.11).
-        if let Some(rt) = manager.runtime() {
-            let events = rt.drain_repair_events().await;
-            if !events.is_empty() {
-                log_repair_diagnostics(&events);
-            }
-        }
-
-        #[cfg(feature = "wasm-host")]
-        if !wasm_specs.is_empty() {
-            let host = WasmExtensionHost::new(cwd, resolved_policy.clone())?;
-            manager
-                .load_wasm_extensions(&host, wasm_specs, Arc::clone(&tools))
-                .await?;
-        }
-
-        // Fire the `startup` lifecycle hook once extensions are loaded.
-        // Fail-open: extension errors must not prevent the agent from running.
-        let session_path = {
-            let cx = crate::agent_cx::AgentCx::for_request();
-            let session = self
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| Error::extension(e.to_string()))?;
-            session.path.as_ref().map(|p| p.display().to_string())
-        };
-
-        if let Err(err) = manager
-            .dispatch_event(
-                ExtensionEventName::Startup,
-                Some(serde_json::json!({
-                    "version": env!("CARGO_PKG_VERSION"),
-                    "sessionFile": session_path,
-                })),
-            )
-            .await
-        {
-            tracing::warn!("startup extension hook failed (fail-open): {err}");
-        }
-
-        if let Err(err) = manager
-            .dispatch_event(ExtensionEventName::SessionStart, None)
-            .await
-        {
-            tracing::warn!("session_start extension hook failed (fail-open): {err}");
-        }
-
-        let ctx_payload = serde_json::json!({ "cwd": cwd.display().to_string() });
-        let wrappers = collect_extension_tool_wrappers(&manager, ctx_payload).await?;
-        self.agent.extend_tools(wrappers);
-        self.agent.extensions = Some(manager.clone());
-        self.extensions = Some(ExtensionRegion::new(manager));
         Ok(())
     }
 
@@ -9066,49 +7482,8 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.extensions_turn_active.store(true, Ordering::SeqCst);
-        let result = async {
-            let outcome = self.dispatch_input_event(input, Vec::new()).await?;
-            let (text, images) = match outcome {
-                InputEventOutcome::Continue { text, images } => (text, images),
-                InputEventOutcome::Block { reason } => {
-                    let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                    return Err(Error::extension(message));
-                }
-            };
-
-            let base_system_prompt = self.agent.system_prompt().map(str::to_string);
-            let BeforeAgentStartOutcome {
-                messages: custom_messages,
-                system_prompt,
-            } = self
-                .dispatch_before_agent_start(
-                    &text,
-                    &images,
-                    base_system_prompt.as_deref().unwrap_or(""),
-                )
-                .await;
-            if let Some(prompt) = system_prompt {
-                self.agent.set_system_prompt(Some(prompt));
-            } else {
-                self.agent.set_system_prompt(base_system_prompt.clone());
-            }
-
-            let result = if images.is_empty() {
-                self.run_agent_with_text(text, abort, on_event, custom_messages)
-                    .await
-            } else {
-                let content = Self::build_content_blocks_for_input(&text, &images);
-                self.run_agent_with_content(content, abort, on_event, custom_messages)
-                    .await
-            };
-
-            self.agent.set_system_prompt(base_system_prompt);
-            result
-        }
-        .await;
-        self.extensions_turn_active.store(false, Ordering::SeqCst);
-        result
+        self.run_agent_with_text(input, abort, on_event, Vec::new())
+            .await
     }
 
     pub async fn run_with_content(
@@ -9126,46 +7501,8 @@ impl AgentSession {
         abort: Option<AbortSignal>,
         on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
     ) -> Result<AssistantMessage> {
-        self.extensions_turn_active.store(true, Ordering::SeqCst);
-        let result = async {
-            let (text, images) = Self::split_content_blocks_for_input(&content);
-            let outcome = self.dispatch_input_event(text, images).await?;
-            let (text, images) = match outcome {
-                InputEventOutcome::Continue { text, images } => (text, images),
-                InputEventOutcome::Block { reason } => {
-                    let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                    return Err(Error::extension(message));
-                }
-            };
-
-            let base_system_prompt = self.agent.system_prompt().map(str::to_string);
-            let BeforeAgentStartOutcome {
-                messages: custom_messages,
-                system_prompt,
-            } = self
-                .dispatch_before_agent_start(
-                    &text,
-                    &images,
-                    base_system_prompt.as_deref().unwrap_or(""),
-                )
-                .await;
-            if let Some(prompt) = system_prompt {
-                self.agent.set_system_prompt(Some(prompt));
-            } else {
-                self.agent.set_system_prompt(base_system_prompt.clone());
-            }
-
-            let content_for_agent = Self::build_content_blocks_for_input(&text, &images);
-            let result = self
-                .run_agent_with_content(content_for_agent, abort, on_event, custom_messages)
-                .await;
-
-            self.agent.set_system_prompt(base_system_prompt);
-            result
-        }
-        .await;
-        self.extensions_turn_active.store(false, Ordering::SeqCst);
-        result
+        self.run_agent_with_content(content, abort, on_event, Vec::new())
+            .await
     }
 
     pub async fn revert_last_user_message(&mut self) -> Result<bool> {
@@ -9182,120 +7519,6 @@ impl AgentSession {
             self.agent.replace_messages(messages);
         }
         Ok(reverted)
-    }
-
-    async fn dispatch_input_event(
-        &self,
-        text: String,
-        images: Vec<ImageContent>,
-    ) -> Result<InputEventOutcome> {
-        let Some(region) = &self.extensions else {
-            return Ok(InputEventOutcome::Continue { text, images });
-        };
-
-        let images_value = serde_json::to_value(&images).unwrap_or(Value::Null);
-        let attachments_value = images_value.clone();
-        let text_clone = text.clone();
-        let payload = json!({
-            "text": text,
-            "content": text_clone,
-            "images": images_value,
-            "attachments": attachments_value,
-            "source": self.input_source.as_str(),
-        });
-
-        let response = region
-            .manager()
-            .dispatch_event_with_response(
-                ExtensionEventName::Input,
-                Some(payload),
-                EXTENSION_EVENT_TIMEOUT_MS,
-            )
-            .await?;
-
-        Ok(apply_input_event_response(response, text, images))
-    }
-
-    async fn dispatch_before_agent_start(
-        &self,
-        prompt: &str,
-        images: &[ImageContent],
-        system_prompt: &str,
-    ) -> BeforeAgentStartOutcome {
-        let Some(region) = &self.extensions else {
-            return BeforeAgentStartOutcome {
-                messages: Vec::new(),
-                system_prompt: None,
-            };
-        };
-
-        let images_value = serde_json::to_value(images).unwrap_or(Value::Null);
-        let payload = json!({
-            "prompt": prompt,
-            "images": images_value,
-            "systemPrompt": system_prompt,
-        });
-
-        let response = region
-            .manager()
-            .dispatch_event_with_response(
-                ExtensionEventName::BeforeAgentStart,
-                Some(payload),
-                EXTENSION_EVENT_TIMEOUT_MS,
-            )
-            .await;
-
-        match response {
-            Ok(value) => apply_before_agent_start_response(value, Utc::now().timestamp_millis()),
-            Err(err) => {
-                tracing::warn!("before_agent_start extension hook failed (fail-open): {err}");
-                BeforeAgentStartOutcome {
-                    messages: Vec::new(),
-                    system_prompt: None,
-                }
-            }
-        }
-    }
-
-    async fn dispatch_before_compact(
-        &self,
-        preparation: &compaction::CompactionPreparation,
-        branch_entries: &[crate::session::SessionEntry],
-        custom_instructions: Option<&str>,
-    ) -> SessionBeforeCompactOutcome {
-        let Some(region) = &self.extensions else {
-            return SessionBeforeCompactOutcome::default();
-        };
-
-        let prep_value = compaction::compaction_preparation_to_value(preparation);
-        let branch_entries_value =
-            serde_json::to_value(branch_entries).unwrap_or(Value::Array(Vec::new()));
-        let mut payload = serde_json::Map::new();
-        payload.insert("preparation".to_string(), prep_value);
-        payload.insert("branchEntries".to_string(), branch_entries_value);
-        if let Some(custom_instructions) = custom_instructions {
-            payload.insert(
-                "customInstructions".to_string(),
-                Value::String(custom_instructions.to_string()),
-            );
-        }
-
-        let response = region
-            .manager()
-            .dispatch_event_with_response(
-                ExtensionEventName::SessionBeforeCompact,
-                Some(Value::Object(payload)),
-                EXTENSION_EVENT_TIMEOUT_MS,
-            )
-            .await;
-
-        match response {
-            Ok(value) => apply_session_before_compact_response(value, preparation.tokens_before),
-            Err(err) => {
-                tracing::warn!("session_before_compact extension hook failed (fail-open): {err}");
-                SessionBeforeCompactOutcome::default()
-            }
-        }
     }
 
     fn prepare_semantic_context_prompt(&self) -> Option<PreparedSemanticContextPrompt> {
@@ -9467,84 +7690,6 @@ impl AgentSession {
         content
     }
 
-    fn take_pending_idle_actions(&self) -> Vec<PendingIdleAction> {
-        let Ok(mut actions) = self.extensions_pending_idle_actions.lock() else {
-            return Vec::new();
-        };
-        actions.drain(..).collect()
-    }
-
-    async fn run_pending_idle_actions_with_abort(
-        &mut self,
-        abort: Option<AbortSignal>,
-        on_event: AgentEventHandler,
-    ) -> Result<()> {
-        let actions = self.take_pending_idle_actions();
-        if actions.is_empty() {
-            return Ok(());
-        }
-
-        let previous_source = self.input_source;
-        self.input_source = InputSource::Extension;
-        let result = async {
-            for action in actions {
-                match action {
-                    PendingIdleAction::CustomMessage(message) => {
-                        let handler = Arc::clone(&on_event);
-                        self.run_custom_message_with_abort(message, abort.clone(), move |event| {
-                            handler(event);
-                        })
-                        .await?;
-                    }
-                    PendingIdleAction::UserText(text) => {
-                        let handler = Arc::clone(&on_event);
-                        self.run_text_with_abort(text, abort.clone(), move |event| {
-                            handler(event);
-                        })
-                        .await?;
-                    }
-                }
-            }
-            Ok(())
-        }
-        .await;
-        self.input_source = previous_source;
-        result
-    }
-
-    async fn run_custom_message_with_abort(
-        &mut self,
-        message: Message,
-        abort: Option<AbortSignal>,
-        on_event: impl Fn(AgentEvent) + Send + Sync + 'static,
-    ) -> Result<AssistantMessage> {
-        self.extensions_turn_active.store(true, Ordering::SeqCst);
-        let result = async {
-            let base_system_prompt = self.agent.system_prompt().map(str::to_string);
-            let BeforeAgentStartOutcome {
-                messages: custom_messages,
-                system_prompt,
-            } = self
-                .dispatch_before_agent_start("", &[], base_system_prompt.as_deref().unwrap_or(""))
-                .await;
-            if let Some(prompt) = system_prompt {
-                self.agent.set_system_prompt(Some(prompt));
-            } else {
-                self.agent.set_system_prompt(base_system_prompt.clone());
-            }
-
-            let result = self
-                .run_agent_with_prompt_message(message, abort, on_event, custom_messages)
-                .await;
-
-            self.agent.set_system_prompt(base_system_prompt);
-            result
-        }
-        .await;
-        self.extensions_turn_active.store(false, Ordering::SeqCst);
-        result
-    }
-
     async fn run_agent_with_prompt_message(
         &mut self,
         prompt_message: Message,
@@ -9592,7 +7737,6 @@ impl AgentSession {
                 Self::semantic_context_prompt_messages(prepared, Utc::now().timestamp_millis())
             })
             .unwrap_or_default();
-        let streaming_guard = AtomicBoolGuard::activate(&self.extensions_is_streaming);
         let base_system_prompt = self.agent.system_prompt().map(str::to_string);
         self.agent
             .set_system_prompt(Self::semantic_context_system_prompt_for_turn(
@@ -9607,7 +7751,6 @@ impl AgentSession {
                 on_event_for_run(event);
             })
             .await;
-        drop(streaming_guard);
         self.agent.set_system_prompt(base_system_prompt);
 
         let persist_result = self
@@ -9673,7 +7816,6 @@ impl AgentSession {
             }
         }
 
-        let streaming_guard = AtomicBoolGuard::activate(&self.extensions_is_streaming);
         let base_system_prompt = self.agent.system_prompt().map(str::to_string);
         self.agent
             .set_system_prompt(Self::semantic_context_system_prompt_for_turn(
@@ -9687,7 +7829,6 @@ impl AgentSession {
                 on_event_for_run(event);
             })
             .await;
-        drop(streaming_guard);
         self.agent.set_system_prompt(base_system_prompt);
 
         // Persist any NEW messages (assistant/tools) generated before the agent stopped,
@@ -9755,7 +7896,6 @@ impl AgentSession {
             }
         }
 
-        let streaming_guard = AtomicBoolGuard::activate(&self.extensions_is_streaming);
         let base_system_prompt = self.agent.system_prompt().map(str::to_string);
         self.agent
             .set_system_prompt(Self::semantic_context_system_prompt_for_turn(
@@ -9769,7 +7909,6 @@ impl AgentSession {
                 on_event_for_run(event);
             })
             .await;
-        drop(streaming_guard);
         self.agent.set_system_prompt(base_system_prompt);
 
         // Persist any NEW messages (assistant/tools) generated before the agent stopped,
@@ -9820,7 +7959,7 @@ fn is_synthetic_empty_error_assistant(message: &Message) -> bool {
 
 fn semantic_context_prompt_shape_for_provider(api: &str) -> SemanticContextPromptShape {
     match api {
-        "bedrock-converse-stream" | "gitlab-chat" => SemanticContextPromptShape::SystemPromptAppend,
+        "gitlab-chat" => SemanticContextPromptShape::SystemPromptAppend,
         _ => SemanticContextPromptShape::CustomUserMessage,
     }
 }
@@ -9831,14 +7970,14 @@ fn semantic_context_prompt_budget_for_provider(
 ) -> SemanticContextPromptBudget {
     let provider_max_bytes = match api {
         "gitlab-chat" => 8 * 1024,
-        "bedrock-converse-stream" | "google-gemini" | "google-vertex" => 12 * 1024,
+        "google-gemini" | "google-vertex" => 12 * 1024,
         "openai-responses" | "openai-completions" | "azure-openai" => 24 * 1024,
         "anthropic" => 32 * 1024,
         _ => DEFAULT_SEMANTIC_CONTEXT_PROMPT_MAX_BYTES,
     };
     let provider_max_items = match api {
         "gitlab-chat" => 8,
-        "bedrock-converse-stream" | "google-gemini" | "google-vertex" => 12,
+        "google-gemini" | "google-vertex" => 12,
         _ => DEFAULT_SEMANTIC_CONTEXT_PROMPT_MAX_ITEMS,
     };
 
@@ -10133,65 +8272,6 @@ fn safe_context_field(value: &str) -> String {
 // ============================================================================
 // Helper Functions
 // ============================================================================
-
-/// Log a summary of auto-repair events that fired during extension loading.
-///
-/// Default: one-line summary.  Set `PI_AUTO_REPAIR_VERBOSE=1` for per-extension
-/// detail.  Structured tracing events are always emitted regardless of verbosity.
-fn log_repair_diagnostics(events: &[crate::extensions_js::ExtensionRepairEvent]) {
-    use std::collections::BTreeMap;
-
-    // Always emit structured tracing events for each repair.
-    for ev in events {
-        tracing::info!(
-            event = "extension.auto_repair",
-            extension_id = %ev.extension_id,
-            pattern = %ev.pattern,
-            success = ev.success,
-            original_error = %ev.original_error,
-            repair_action = %ev.repair_action,
-        );
-    }
-
-    // Group by pattern for the summary line.
-    let mut by_pattern: BTreeMap<String, Vec<&str>> = BTreeMap::new();
-    for ev in events {
-        by_pattern
-            .entry(ev.pattern.to_string())
-            .or_default()
-            .push(&ev.extension_id);
-    }
-
-    let verbose = std::env::var("PI_AUTO_REPAIR_VERBOSE")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-
-    if verbose {
-        warn!(
-            "[auto-repair] {} extension{} auto-repaired:",
-            events.len(),
-            if events.len() == 1 { "" } else { "s" }
-        );
-        for ev in events {
-            warn!(
-                "  {}: {} ({})",
-                ev.pattern, ev.extension_id, ev.repair_action
-            );
-        }
-    } else {
-        // Compact one-line summary.
-        let patterns: Vec<String> = by_pattern
-            .iter()
-            .map(|(pat, ids)| format!("{pat}:{}", ids.len()))
-            .collect();
-        tracing::info!(
-            event = "extension.auto_repair.summary",
-            count = events.len(),
-            patterns = %patterns.join(", "),
-            "auto-repaired {} extension(s)",
-            events.len(),
-        );
-    }
-}
 
 const BLOCK_IMAGES_PLACEHOLDER: &str = "Image reading is disabled.";
 
@@ -10813,48 +8893,6 @@ mod tests {
     }
 
     #[test]
-    fn enable_extensions_policy_resolution_defaults_to_permissive() {
-        let policy = AgentSession::resolve_extension_policy_for_enable(None, None);
-        assert_eq!(
-            policy.mode,
-            crate::extensions::ExtensionPolicyMode::Permissive
-        );
-    }
-
-    #[test]
-    fn enable_extensions_policy_resolution_respects_config_default_toggle() {
-        let config = crate::config::Config {
-            extension_policy: Some(crate::config::ExtensionPolicyConfig {
-                profile: None,
-                default_permissive: Some(false),
-                allow_dangerous: None,
-            }),
-            ..Default::default()
-        };
-        let policy = AgentSession::resolve_extension_policy_for_enable(Some(&config), None);
-        assert_eq!(policy.mode, crate::extensions::ExtensionPolicyMode::Strict);
-    }
-
-    #[test]
-    fn enable_extensions_policy_resolution_prefers_explicit_policy() {
-        let config = crate::config::Config {
-            extension_policy: Some(crate::config::ExtensionPolicyConfig {
-                profile: None,
-                default_permissive: Some(false),
-                allow_dangerous: None,
-            }),
-            ..Default::default()
-        };
-        let explicit = crate::extensions::PolicyProfile::Permissive.to_policy();
-        let policy =
-            AgentSession::resolve_extension_policy_for_enable(Some(&config), Some(explicit));
-        assert_eq!(
-            policy.mode,
-            crate::extensions::ExtensionPolicyMode::Permissive
-        );
-    }
-
-    #[test]
     fn test_extract_tool_calls() {
         let content = vec![
             ContentBlock::Text(TextContent::new("Hello")),
@@ -11344,8 +9382,8 @@ mod tests {
         let current_entry = registry
             .find("anthropic", "claude-sonnet-4-5")
             .expect("anthropic model in registry");
-        let provider = crate::providers::create_provider(&current_entry, None)
-            .expect("create anthropic provider");
+        let provider =
+            crate::providers::create_provider(&current_entry).expect("create anthropic provider");
         let tools = ToolRegistry::new(&[], Path::new("."), None);
         let mut stream_options = StreamOptions {
             api_key: Some("stale-key".to_string()),
@@ -11473,7 +9511,6 @@ mod tests {
             headers: HashMap::new(),
             auth_header: false,
             compat: None,
-            oauth_config: None,
         }]);
 
         let mut agent_session = build_switch_test_session(&auth);
@@ -11520,7 +9557,6 @@ mod tests {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         }]);
 
         let mut agent_session = build_switch_test_session(&auth);
@@ -11681,7 +9717,6 @@ mod tests {
                 headers: HashMap::new(),
                 auth_header: false,
                 compat: None,
-                oauth_config: None,
             }]);
 
             let mut agent_session = build_switch_test_session(&auth);
@@ -11806,7 +9841,6 @@ mod tests {
                 headers: HashMap::new(),
                 auth_header: false,
                 compat: None,
-                oauth_config: None,
             }]);
 
             let mut agent_session = build_switch_test_session(&auth);
@@ -11891,7 +9925,6 @@ mod tests {
                 headers: HashMap::new(),
                 auth_header: false,
                 compat: None,
-                oauth_config: None,
             }]);
 
             let mut agent_session = build_switch_test_session(&auth);

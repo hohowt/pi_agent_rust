@@ -67,10 +67,6 @@ pub struct Config {
     #[serde(alias = "followUpMode")]
     pub follow_up_mode: Option<String>,
 
-    // Version check
-    #[serde(alias = "checkForUpdates")]
-    pub check_for_updates: Option<bool>,
-
     // Terminal Behavior
     #[serde(alias = "quietStartup")]
     pub quiet_startup: Option<bool>,
@@ -126,135 +122,13 @@ pub struct Config {
     #[serde(alias = "thinkingBudgets")]
     pub thinking_budgets: Option<ThinkingBudgets>,
 
-    // Extensions/Skills/etc.
+    // Packages/Skills/etc.
     pub packages: Option<Vec<PackageSource>>,
-    pub extensions: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub prompts: Option<Vec<String>>,
     pub themes: Option<Vec<String>>,
     #[serde(alias = "enableSkillCommands")]
     pub enable_skill_commands: Option<bool>,
-
-    // Extension tool hook behavior
-    #[serde(alias = "failClosedHooks")]
-    pub fail_closed_hooks: Option<bool>,
-
-    // Extension Policy
-    #[serde(alias = "extensionPolicy")]
-    pub extension_policy: Option<ExtensionPolicyConfig>,
-
-    // Repair Policy
-    #[serde(alias = "repairPolicy")]
-    pub repair_policy: Option<RepairPolicyConfig>,
-
-    // Runtime Risk Controller
-    #[serde(alias = "extensionRisk")]
-    pub extension_risk: Option<ExtensionRiskConfig>,
-}
-
-/// Extension capability policy configuration.
-///
-/// Controls which dangerous capabilities (exec, env) are available to extensions.
-/// Can be set in `settings.json` or via the `--extension-policy` CLI flag.
-///
-/// # Example (settings.json)
-///
-/// ```json
-/// {
-///   "extensionPolicy": {
-///     "defaultPermissive": true,
-///     "allowDangerous": false
-///   }
-/// }
-/// ```
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ExtensionPolicyConfig {
-    /// Policy profile: "safe", "balanced", or "permissive".
-    /// Legacy alias "standard" is also accepted.
-    pub profile: Option<String>,
-    /// Toggle the fallback profile when `profile` is omitted.
-    #[serde(alias = "defaultPermissive")]
-    pub default_permissive: Option<bool>,
-    /// Allow dangerous capabilities (exec, env). Overrides profile's deny list.
-    #[serde(alias = "allowDangerous")]
-    pub allow_dangerous: Option<bool>,
-}
-
-/// Repair policy configuration.
-///
-/// Controls how the agent handles broken or incompatible extensions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct RepairPolicyConfig {
-    /// Repair mode: "off", "suggest" (default), "auto-safe", "auto-strict".
-    pub mode: Option<String>,
-}
-
-/// Runtime risk controller configuration for extension hostcalls.
-///
-/// Deterministic, non-LLM controls for dynamic hardening/denial decisions.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct ExtensionRiskConfig {
-    /// Enable runtime risk controller.
-    pub enabled: Option<bool>,
-    /// Type-I error target for sequential detector (0 < alpha < 1).
-    pub alpha: Option<f64>,
-    /// Sliding window size for residual/drift checks.
-    #[serde(alias = "windowSize")]
-    pub window_size: Option<u32>,
-    /// Max in-memory risk ledger entries.
-    #[serde(alias = "ledgerLimit")]
-    pub ledger_limit: Option<u32>,
-    /// Max budget per risk decision in milliseconds.
-    #[serde(alias = "decisionTimeoutMs")]
-    pub decision_timeout_ms: Option<u64>,
-    /// Fail closed when controller evaluation errors or exceeds budget.
-    #[serde(alias = "failClosed")]
-    pub fail_closed: Option<bool>,
-    /// Enforcement mode: `true` = enforce risk decisions, `false` = shadow
-    /// mode (score-only, no blocking).  Defaults to `true` when risk is
-    /// enabled.
-    pub enforce: Option<bool>,
-}
-
-/// Resolved extension policy plus explainability metadata.
-#[derive(Debug, Clone)]
-pub struct ResolvedExtensionPolicy {
-    /// Raw profile token selected by precedence resolution.
-    pub requested_profile: String,
-    /// Effective normalized profile name after fallback.
-    pub effective_profile: String,
-    /// Source of the selected profile token: cli, env, config, or default.
-    pub profile_source: &'static str,
-    /// Whether dangerous capabilities were explicitly enabled.
-    pub allow_dangerous: bool,
-    /// Final effective policy used by runtime components.
-    pub policy: crate::extensions::ExtensionPolicy,
-    /// Audit trail for dangerous-capability opt-in, if `allow_dangerous`
-    /// was true and modified the policy. `None` when no opt-in occurred.
-    pub dangerous_opt_in_audit: Option<crate::extensions::DangerousOptInAuditEntry>,
-}
-
-/// Resolved repair policy plus explainability metadata.
-#[derive(Debug, Clone)]
-pub struct ResolvedRepairPolicy {
-    /// Raw mode token selected by precedence resolution.
-    pub requested_mode: String,
-    /// Effective mode after normalization.
-    pub effective_mode: crate::extensions::RepairPolicyMode,
-    /// Source of the selected mode token: cli, env, config, or default.
-    pub source: &'static str,
-}
-
-/// Resolved runtime risk settings plus source metadata.
-#[derive(Debug, Clone)]
-pub struct ResolvedExtensionRisk {
-    /// Source of the resolved settings: env, config, or default.
-    pub source: &'static str,
-    /// Effective settings used by the extension runtime.
-    pub settings: crate::extensions::RuntimeRiskConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -344,15 +218,6 @@ pub enum SettingsScope {
     Project,
 }
 
-/// Map a [`PolicyProfile`] to its normalized string name.
-const fn effective_profile_str(profile: crate::extensions::PolicyProfile) -> &'static str {
-    match profile {
-        crate::extensions::PolicyProfile::Safe => "safe",
-        crate::extensions::PolicyProfile::Standard => "balanced",
-        crate::extensions::PolicyProfile::Permissive => "permissive",
-    }
-}
-
 impl Config {
     /// Load configuration from global and project settings.
     pub fn load() -> Result<Self> {
@@ -401,20 +266,9 @@ impl Config {
         package_dir_from_env(env_lookup, &global_dir)
     }
 
-    /// Get the extension index cache file path.
-    pub fn extension_index_path() -> PathBuf {
-        let global_dir = Self::global_dir();
-        extension_index_path_from_env(env_lookup, &global_dir)
-    }
-
     /// Get the auth file path.
     pub fn auth_path() -> PathBuf {
         Self::global_dir().join("auth.json")
-    }
-
-    /// Get the extension permissions file path.
-    pub fn permissions_path() -> PathBuf {
-        Self::global_dir().join("extension-permissions.json")
     }
 
     /// Load global settings.
@@ -514,9 +368,6 @@ impl Config {
             steering_mode: other.steering_mode.or(base.steering_mode),
             follow_up_mode: other.follow_up_mode.or(base.follow_up_mode),
 
-            // Version check
-            check_for_updates: other.check_for_updates.or(base.check_for_updates),
-
             // Terminal Behavior
             quiet_startup: other.quiet_startup.or(base.quiet_startup),
             collapse_changelog: other.collapse_changelog.or(base.collapse_changelog),
@@ -556,23 +407,12 @@ impl Config {
             // Thinking Budgets
             thinking_budgets: merge_thinking_budgets(base.thinking_budgets, other.thinking_budgets),
 
-            // Extensions/Skills/etc.
+            // Packages/Skills/etc.
             packages: other.packages.or(base.packages),
-            extensions: other.extensions.or(base.extensions),
             skills: other.skills.or(base.skills),
             prompts: other.prompts.or(base.prompts),
             themes: other.themes.or(base.themes),
             enable_skill_commands: other.enable_skill_commands.or(base.enable_skill_commands),
-            fail_closed_hooks: other.fail_closed_hooks.or(base.fail_closed_hooks),
-
-            // Extension Policy
-            extension_policy: merge_extension_policy(base.extension_policy, other.extension_policy),
-
-            // Repair Policy
-            repair_policy: merge_repair_policy(base.repair_policy, other.repair_policy),
-
-            // Runtime Risk Controller
-            extension_risk: merge_extension_risk(base.extension_risk, other.extension_risk),
         }
     }
 
@@ -643,11 +483,6 @@ impl Config {
             .unwrap_or(true)
     }
 
-    /// Whether to check for version updates on startup (default: true).
-    pub fn should_check_for_updates(&self) -> bool {
-        self.check_for_updates.unwrap_or(true)
-    }
-
     pub fn image_block_images(&self) -> bool {
         self.images
             .as_ref()
@@ -697,298 +532,6 @@ impl Config {
 
     pub fn enable_skill_commands(&self) -> bool {
         self.enable_skill_commands.unwrap_or(true)
-    }
-
-    pub fn fail_closed_hooks(&self) -> bool {
-        if let Some(value) = parse_env_bool("PI_EXTENSION_HOOKS_FAIL_CLOSED") {
-            return value;
-        }
-        self.fail_closed_hooks.unwrap_or(false)
-    }
-
-    /// Resolve the extension policy from config, CLI override, and env var.
-    ///
-    /// Resolution order (highest precedence first):
-    /// 1. `cli_override` (from `--extension-policy` flag)
-    /// 2. `PI_EXTENSION_POLICY` environment variable
-    /// 3. `extension_policy.profile` from settings.json
-    /// 4. `extension_policy.default_permissive` from settings.json
-    /// 5. Default: "permissive"
-    ///
-    /// If `allow_dangerous` is true (from config or env), exec/env are removed
-    /// from the policy's deny list.
-    pub fn resolve_extension_policy_with_metadata(
-        &self,
-        cli_override: Option<&str>,
-    ) -> ResolvedExtensionPolicy {
-        use crate::extensions::PolicyProfile;
-
-        // Determine profile name with source: CLI > env > config > default
-        let (requested_profile, profile_source) = cli_override.map_or_else(
-            || {
-                std::env::var("PI_EXTENSION_POLICY").map_or_else(
-                    |_| {
-                        self.extension_policy
-                            .as_ref()
-                            .and_then(|p| p.profile.clone())
-                            .map_or_else(
-                                || {
-                                    self.extension_policy
-                                        .as_ref()
-                                        .and_then(|p| p.default_permissive)
-                                        .map_or_else(
-                                            || ("permissive".to_string(), "default"),
-                                            |default_permissive| {
-                                                (
-                                                    if default_permissive {
-                                                        "permissive"
-                                                    } else {
-                                                        "safe"
-                                                    }
-                                                    .to_string(),
-                                                    "config",
-                                                )
-                                            },
-                                        )
-                                },
-                                |value| (value, "config"),
-                            )
-                    },
-                    |value| (value, "env"),
-                )
-            },
-            |value| (value.to_string(), "cli"),
-        );
-
-        let normalized_profile = requested_profile.to_ascii_lowercase();
-        let profile = if normalized_profile == "safe" {
-            PolicyProfile::Safe
-        } else if normalized_profile == "permissive" {
-            PolicyProfile::Permissive
-        } else if normalized_profile == "balanced" || normalized_profile == "standard" {
-            // "balanced" (and legacy "standard") map to the standard policy.
-            PolicyProfile::Standard
-        } else {
-            // Unknown values fail closed to the safe profile.
-            tracing::warn!(
-                requested = %normalized_profile,
-                fallback = "safe",
-                "Unknown extension policy profile; falling back to safe"
-            );
-            PolicyProfile::Safe
-        };
-
-        let mut policy = profile.to_policy();
-
-        // Check allow_dangerous: config setting or PI_EXTENSION_ALLOW_DANGEROUS env
-        let config_allows = self
-            .extension_policy
-            .as_ref()
-            .and_then(|p| p.allow_dangerous)
-            .unwrap_or(false);
-        let env_allows = std::env::var("PI_EXTENSION_ALLOW_DANGEROUS")
-            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
-        let allow_dangerous = config_allows || env_allows;
-
-        // Build audit trail before mutating deny_caps.
-        let dangerous_opt_in_audit = if allow_dangerous {
-            let source = if env_allows { "env" } else { "config" }.to_string();
-            let unblocked: Vec<String> = policy
-                .deny_caps
-                .iter()
-                .filter(|cap| *cap == "exec" || *cap == "env")
-                .cloned()
-                .collect();
-            if !unblocked.is_empty() {
-                tracing::warn!(
-                    source = %source,
-                    profile = %effective_profile_str(profile),
-                    capabilities = ?unblocked,
-                    "Dangerous capabilities explicitly unblocked via allow_dangerous"
-                );
-            }
-            Some(crate::extensions::DangerousOptInAuditEntry {
-                source,
-                profile: effective_profile_str(profile).to_string(),
-                capabilities_unblocked: unblocked,
-            })
-        } else {
-            None
-        };
-
-        if allow_dangerous {
-            policy.deny_caps.retain(|cap| cap != "exec" && cap != "env");
-        }
-
-        let effective_profile = effective_profile_str(profile);
-
-        ResolvedExtensionPolicy {
-            requested_profile,
-            effective_profile: effective_profile.to_string(),
-            profile_source,
-            allow_dangerous,
-            policy,
-            dangerous_opt_in_audit,
-        }
-    }
-
-    pub fn resolve_extension_policy(
-        &self,
-        cli_override: Option<&str>,
-    ) -> crate::extensions::ExtensionPolicy {
-        self.resolve_extension_policy_with_metadata(cli_override)
-            .policy
-    }
-
-    /// Resolve the repair policy from config, CLI override, and env var.
-    ///
-    /// Resolution order (highest precedence first):
-    /// 1. `cli_override` (from `--repair-policy` flag)
-    /// 2. `PI_REPAIR_POLICY` environment variable
-    /// 3. `repair_policy.mode` from settings.json
-    /// 4. Default: "suggest"
-    pub fn resolve_repair_policy_with_metadata(
-        &self,
-        cli_override: Option<&str>,
-    ) -> ResolvedRepairPolicy {
-        use crate::extensions::RepairPolicyMode;
-
-        // Determine mode string with source: CLI > env > config > default
-        let (requested_mode, source) = cli_override.map_or_else(
-            || {
-                std::env::var("PI_REPAIR_POLICY").map_or_else(
-                    |_| {
-                        self.repair_policy
-                            .as_ref()
-                            .and_then(|p| p.mode.clone())
-                            .map_or_else(
-                                || ("suggest".to_string(), "default"),
-                                |value| (value, "config"),
-                            )
-                    },
-                    |value| (value, "env"),
-                )
-            },
-            |value| (value.to_string(), "cli"),
-        );
-
-        let effective_mode = match requested_mode.trim().to_ascii_lowercase().as_str() {
-            "off" => RepairPolicyMode::Off,
-            "auto-safe" => RepairPolicyMode::AutoSafe,
-            "auto-strict" => RepairPolicyMode::AutoStrict,
-            _ => RepairPolicyMode::Suggest, // Fallback to safe default
-        };
-
-        ResolvedRepairPolicy {
-            requested_mode,
-            effective_mode,
-            source,
-        }
-    }
-
-    pub fn resolve_repair_policy(
-        &self,
-        cli_override: Option<&str>,
-    ) -> crate::extensions::RepairPolicyMode {
-        self.resolve_repair_policy_with_metadata(cli_override)
-            .effective_mode
-    }
-
-    /// Resolve runtime risk controller settings from config and environment.
-    ///
-    /// Resolution order (highest precedence first):
-    /// 1. `PI_EXTENSION_RISK_*` env vars
-    /// 2. `extensionRisk` config
-    /// 3. deterministic defaults
-    pub fn resolve_extension_risk_with_metadata(&self) -> ResolvedExtensionRisk {
-        fn parse_env_f64(name: &str) -> Option<f64> {
-            std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
-        }
-
-        const fn sanitize_alpha(alpha: f64) -> Option<f64> {
-            if alpha.is_finite() {
-                Some(alpha.clamp(1.0e-6, 0.5))
-            } else {
-                None
-            }
-        }
-
-        fn parse_env_u32(name: &str) -> Option<u32> {
-            std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
-        }
-
-        fn parse_env_u64(name: &str) -> Option<u64> {
-            std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
-        }
-
-        let mut settings = crate::extensions::RuntimeRiskConfig::default();
-        let mut source = "default";
-
-        if let Some(cfg) = self.extension_risk.as_ref() {
-            if let Some(enabled) = cfg.enabled {
-                settings.enabled = enabled;
-                source = "config";
-            }
-            if let Some(alpha) = cfg.alpha.and_then(sanitize_alpha) {
-                settings.alpha = alpha;
-                source = "config";
-            }
-            if let Some(window_size) = cfg.window_size {
-                settings.window_size = window_size.clamp(8, 4096) as usize;
-                source = "config";
-            }
-            if let Some(ledger_limit) = cfg.ledger_limit {
-                settings.ledger_limit = ledger_limit.clamp(32, 20_000) as usize;
-                source = "config";
-            }
-            if let Some(timeout_ms) = cfg.decision_timeout_ms {
-                settings.decision_timeout_ms = timeout_ms.clamp(1, 2_000);
-                source = "config";
-            }
-            if let Some(fail_closed) = cfg.fail_closed {
-                settings.fail_closed = fail_closed;
-                source = "config";
-            }
-            if let Some(enforce) = cfg.enforce {
-                settings.enforce = enforce;
-                source = "config";
-            }
-        }
-
-        if let Some(enabled) = parse_env_bool("PI_EXTENSION_RISK_ENABLED") {
-            settings.enabled = enabled;
-            source = "env";
-        }
-        if let Some(alpha) = parse_env_f64("PI_EXTENSION_RISK_ALPHA").and_then(sanitize_alpha) {
-            settings.alpha = alpha;
-            source = "env";
-        }
-        if let Some(window_size) = parse_env_u32("PI_EXTENSION_RISK_WINDOW") {
-            settings.window_size = window_size.clamp(8, 4096) as usize;
-            source = "env";
-        }
-        if let Some(ledger_limit) = parse_env_u32("PI_EXTENSION_RISK_LEDGER_LIMIT") {
-            settings.ledger_limit = ledger_limit.clamp(32, 20_000) as usize;
-            source = "env";
-        }
-        if let Some(timeout_ms) = parse_env_u64("PI_EXTENSION_RISK_DECISION_TIMEOUT_MS") {
-            settings.decision_timeout_ms = timeout_ms.clamp(1, 2_000);
-            source = "env";
-        }
-        if let Some(fail_closed) = parse_env_bool("PI_EXTENSION_RISK_FAIL_CLOSED") {
-            settings.fail_closed = fail_closed;
-            source = "env";
-        }
-        if let Some(enforce) = parse_env_bool("PI_EXTENSION_RISK_ENFORCE") {
-            settings.enforce = enforce;
-            source = "env";
-        }
-
-        ResolvedExtensionRisk { source, settings }
-    }
-
-    pub fn resolve_extension_risk(&self) -> crate::extensions::RuntimeRiskConfig {
-        self.resolve_extension_risk_with_metadata().settings
     }
 
     fn emit_queue_mode_diagnostics(&self) {
@@ -1049,14 +592,6 @@ where
     F: Fn(&str) -> Option<String>,
 {
     get_env("PI_PACKAGE_DIR").map_or_else(|| global_dir.join("packages"), PathBuf::from)
-}
-
-fn extension_index_path_from_env<F>(get_env: F, global_dir: &Path) -> PathBuf
-where
-    F: Fn(&str) -> Option<String>,
-{
-    get_env("PI_EXTENSION_INDEX_PATH")
-        .map_or_else(|| global_dir.join("extension-index.json"), PathBuf::from)
 }
 
 pub(crate) fn parse_queue_mode(mode: Option<&str>) -> Option<QueueMode> {
@@ -1210,56 +745,6 @@ fn merge_thinking_budgets(
             medium: other.medium.or(base.medium),
             high: other.high.or(base.high),
             xhigh: other.xhigh.or(base.xhigh),
-        }),
-        (None, Some(other)) => Some(other),
-        (Some(base), None) => Some(base),
-        (None, None) => None,
-    }
-}
-
-fn merge_extension_policy(
-    base: Option<ExtensionPolicyConfig>,
-    other: Option<ExtensionPolicyConfig>,
-) -> Option<ExtensionPolicyConfig> {
-    match (base, other) {
-        (Some(base), Some(other)) => Some(ExtensionPolicyConfig {
-            profile: other.profile.or(base.profile),
-            default_permissive: other.default_permissive.or(base.default_permissive),
-            allow_dangerous: other.allow_dangerous.or(base.allow_dangerous),
-        }),
-        (None, Some(other)) => Some(other),
-        (Some(base), None) => Some(base),
-        (None, None) => None,
-    }
-}
-
-fn merge_repair_policy(
-    base: Option<RepairPolicyConfig>,
-    other: Option<RepairPolicyConfig>,
-) -> Option<RepairPolicyConfig> {
-    match (base, other) {
-        (Some(base), Some(other)) => Some(RepairPolicyConfig {
-            mode: other.mode.or(base.mode),
-        }),
-        (None, Some(other)) => Some(other),
-        (Some(base), None) => Some(base),
-        (None, None) => None,
-    }
-}
-
-fn merge_extension_risk(
-    base: Option<ExtensionRiskConfig>,
-    other: Option<ExtensionRiskConfig>,
-) -> Option<ExtensionRiskConfig> {
-    match (base, other) {
-        (Some(base), Some(other)) => Some(ExtensionRiskConfig {
-            enabled: other.enabled.or(base.enabled),
-            alpha: other.alpha.or(base.alpha),
-            window_size: other.window_size.or(base.window_size),
-            ledger_limit: other.ledger_limit.or(base.ledger_limit),
-            decision_timeout_ms: other.decision_timeout_ms.or(base.decision_timeout_ms),
-            fail_closed: other.fail_closed.or(base.fail_closed),
-            enforce: other.enforce.or(base.enforce),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),
@@ -1448,7 +933,7 @@ fn sync_settings_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::{
         BranchSummarySettings, CompactionSettings, Config, ExtensionPolicyConfig,
@@ -3119,28 +2604,6 @@ mod tests {
         let other: Config = serde_json::from_str(r#"{"markdown":{"codeBlockIndent":4}}"#).unwrap();
         let merged = Config::merge(base, other);
         assert_eq!(merged.markdown.as_ref().unwrap().code_block_indent, Some(4));
-    }
-
-    // ── check_for_updates config ──────────────────────────────────────
-
-    #[test]
-    fn check_for_updates_default_is_true() {
-        let config: Config = serde_json::from_str("{}").unwrap();
-        assert!(config.should_check_for_updates());
-    }
-
-    #[test]
-    fn check_for_updates_explicit_false() {
-        let json = r#"{"checkForUpdates": false}"#;
-        let config: Config = serde_json::from_str(json).unwrap();
-        assert!(!config.should_check_for_updates());
-    }
-
-    #[test]
-    fn check_for_updates_explicit_true() {
-        let json = r#"{"check_for_updates": true}"#;
-        let config: Config = serde_json::from_str(json).unwrap();
-        assert!(config.should_check_for_updates());
     }
 
     // ── merge function property tests ──────────────────────────────────

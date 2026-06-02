@@ -5,12 +5,10 @@ use std::sync::Arc;
 use crate::model::{ContentBlock, UserContent};
 use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::theme::TuiStyles;
-use serde_json::json;
 
 use super::conversation::{assistant_content_to_text, user_content_to_text};
 use super::{
-    AgentState, Cmd, ConversationMessage, EXTENSION_EVENT_TIMEOUT_MS, MessageRole, PiApp, PiMsg,
-    conversation_from_session,
+    AgentState, Cmd, ConversationMessage, MessageRole, PiApp, PiMsg, conversation_from_session,
 };
 
 #[derive(Debug, Clone)]
@@ -343,11 +341,10 @@ impl PiApp {
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
-        let extensions = self.extensions.clone();
         let model_provider = self.model_entry.model.provider.clone();
         let model_id = self.model_entry.model.id.clone();
-        let (thinking_level, session_id) = if let Ok(guard) = self.session.try_lock() {
-            (guard.header.thinking_level.clone(), guard.header.id.clone())
+        let thinking_level = if let Ok(guard) = self.session.try_lock() {
+            guard.header.thinking_level.clone()
         } else {
             self.status_message = Some("Session busy; try again".to_string());
             return None;
@@ -359,30 +356,6 @@ impl PiApp {
         let runtime_handle = self.runtime_handle.clone();
         runtime_handle.spawn(async move {
             let cx = asupersync::Cx::for_request();
-            if let Some(manager) = extensions.clone() {
-                let cancelled = manager
-                    .dispatch_cancellable_event(
-                        crate::extensions::ExtensionEventName::SessionBeforeFork,
-                        Some(json!({
-                            "entryId": selection.id.clone(),
-                            "summary": selection.summary.clone(),
-                            "sessionId": session_id.clone(),
-                        })),
-                        EXTENSION_EVENT_TIMEOUT_MS,
-                    )
-                    .await
-                    .unwrap_or(false);
-                if cancelled {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &cx,
-                        PiMsg::System("Fork cancelled by extension".to_string()),
-                    )
-                    .await;
-                    return;
-                }
-            }
-
             let (fork_plan, parent_path, session_dir) = {
                 let guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
@@ -424,8 +397,6 @@ impl PiApp {
                 new_session.set_branched_from(Some(parent_path));
             }
             new_session.init_from_fork_plan(fork_plan);
-            let new_session_id = new_session.header.id.clone();
-
             if let Err(err) = new_session.save().await {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
@@ -502,20 +473,6 @@ impl PiApp {
                 PiMsg::SetEditorText(selected_text),
             )
             .await;
-
-            if let Some(manager) = extensions {
-                let _ = manager
-                    .dispatch_event(
-                        crate::extensions::ExtensionEventName::SessionFork,
-                        Some(json!({
-                            "entryId": selection.id,
-                            "summary": selection.summary,
-                            "sessionId": session_id,
-                            "newSessionId": new_session_id,
-                        })),
-                    )
-                    .await;
-            }
         });
         None
     }

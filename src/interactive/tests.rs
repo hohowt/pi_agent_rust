@@ -74,7 +74,6 @@ fn test_model_entry() -> ModelEntry {
         headers: std::collections::HashMap::new(),
         auth_header: false,
         compat: None,
-        oauth_config: None,
     }
 }
 
@@ -90,11 +89,9 @@ fn build_test_app(cwd: PathBuf) -> PiApp {
     let resource_cli = ResourceCliOptions {
         no_skills: false,
         no_prompt_templates: false,
-        no_extensions: false,
         no_themes: false,
         skill_paths: Vec::new(),
         prompt_paths: Vec::new(),
-        extension_paths: Vec::new(),
         theme_paths: Vec::new(),
     };
     let model_entry = test_model_entry();

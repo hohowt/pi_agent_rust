@@ -15,7 +15,6 @@ use asupersync::Cx;
 use asupersync::channel::mpsc;
 use asupersync::runtime::RuntimeHandle;
 use asupersync::sync::Mutex;
-use async_trait::async_trait;
 use bubbles::spinner::{SpinnerModel, TickMsg as SpinnerTickMsg, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
@@ -35,21 +34,14 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
-use crate::config::{Config, ExtensionPolicyConfig, SettingsScope, parse_queue_mode_or_default};
-use crate::extension_events::{InputEventOutcome, apply_input_event_response};
-use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionDeliverAs, ExtensionEventName, ExtensionHostActions,
-    ExtensionManager, ExtensionSendMessage, ExtensionSendUserMessage, ExtensionSession,
-    ExtensionUiRequest, ExtensionUiResponse,
-};
+use crate::config::{Config, SettingsScope, parse_queue_mode_or_default};
 use crate::keybindings::{AppAction, KeyBinding, KeyBindings};
 use crate::model::{
-    AssistantMessageEvent, ContentBlock, CustomMessage, ImageContent, Message as ModelMessage,
-    StopReason, TextContent, ThinkingLevel, Usage, UserContent, UserMessage,
+    AssistantMessageEvent, ContentBlock, Message as ModelMessage, StopReason, TextContent,
+    ThinkingLevel, Usage, UserContent, UserMessage,
 };
 use crate::models::{ModelEntry, ModelRegistry, default_models_path};
 use crate::package_manager::PackageManager;
@@ -66,11 +58,9 @@ use arboard::Clipboard as ArboardClipboard;
 mod agent;
 mod commands;
 mod conversation;
-mod ext_session;
 mod file_refs;
 mod keybindings;
 mod model_selector_ui;
-mod perf;
 mod share;
 mod state;
 mod text_utils;
@@ -79,34 +69,26 @@ mod tree;
 mod tree_ui;
 mod view;
 
-use self::agent::{build_user_message, extension_commands_for_catalog};
+use self::agent::build_user_message;
 pub use self::commands::{
     SlashCommand, model_entry_matches, parse_scoped_model_patterns, resolve_scoped_model_entries,
     strip_thinking_level_suffix,
 };
 use self::commands::{
-    format_startup_oauth_hint, parse_bash_command, parse_extension_command,
-    should_show_startup_oauth_hint,
+    format_startup_oauth_hint, parse_bash_command, should_show_startup_oauth_hint,
 };
 use self::conversation::conversation_from_session;
-use self::ext_session::{InteractiveExtensionHostActions, InteractiveExtensionSession};
-pub use self::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
 use self::file_refs::{
     file_url_to_path, format_file_ref, is_file_ref_boundary, next_non_whitespace_token,
     parse_quoted_file_ref, path_for_display, split_trailing_punct, strip_wrapping_quotes,
     unescape_dragged_path,
 };
-use self::perf::{
-    CRITICAL_KEEP_MESSAGES, FrameTimingStats, MemoryLevel, MemoryMonitor, MessageRenderCache,
-    RenderBuffers, TuiPressureController, micros_as_u64,
-};
 pub use self::state::{AgentState, InputMode, PendingInput};
 use self::state::{
-    AutocompleteState, BranchPickerOverlay, CapabilityAction, CapabilityPromptOverlay,
-    ExtensionCustomOverlay, HistoryList, InjectedMessageQueue, InteractiveMessageQueue,
-    PendingLoginKind, PendingOAuth, QueuedMessageKind, SessionPickerOverlay, SettingsUiEntry,
-    SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES, ThemePickerItem, ThemePickerOverlay,
-    ToolProgress, format_count,
+    AutocompleteState, BranchPickerOverlay, HistoryList, InjectedMessageQueue,
+    InteractiveMessageQueue, PendingLoginKind, PendingOAuth, QueuedMessageKind,
+    SessionPickerOverlay, SettingsUiEntry, SettingsUiState, TOOL_COLLAPSE_PREVIEW_LINES,
+    ThemePickerItem, ThemePickerOverlay, ToolProgress, format_count,
 };
 pub use self::state::{ConversationMessage, MessageRole};
 use self::text_utils::{queued_message_preview, truncate};
@@ -400,12 +382,6 @@ impl PiApp {
     /// If `follow_tail` is true the viewport is scrolled to the very bottom;
     /// otherwise the current scroll position is preserved.
     fn refresh_conversation_viewport(&mut self, follow_tail: bool) {
-        let vp_start = if self.frame_timing.enabled {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-
         // When the user has scrolled away (follow_tail == false), preserve
         // the absolute y_offset so new content appended at the bottom does
         // not shift the lines the user is reading.
@@ -428,11 +404,6 @@ impl PiApp {
             // Restore the exact scroll position. set_y_offset() clamps to
             // max_y_offset internally, so this is safe even if content shrank.
             self.conversation_viewport.set_y_offset(offset);
-        }
-
-        if let Some(start) = vp_start {
-            self.frame_timing
-                .record_viewport_sync(micros_as_u64(start.elapsed().as_micros()));
         }
     }
 
@@ -554,7 +525,6 @@ impl PiApp {
         self.spinner =
             SpinnerModel::with_spinner(spinners::dot()).style(self.styles.accent.clone());
 
-        self.message_render_cache.invalidate_all();
         let content = self.build_conversation_content();
         let effective = self.view_effective_conversation_height().max(1);
         self.conversation_viewport.height = effective;
@@ -669,35 +639,6 @@ impl PiApp {
         })
     }
 
-    fn effective_default_permissive(&self) -> bool {
-        self.config
-            .extension_policy
-            .as_ref()
-            .and_then(|policy| policy.default_permissive)
-            .unwrap_or(true)
-    }
-
-    fn has_loaded_extensions(&self) -> bool {
-        self.extensions
-            .as_ref()
-            .is_some_and(ExtensionManager::has_loaded_extensions)
-    }
-
-    fn default_permissive_changes_require_extension_restart(&self) -> bool {
-        self.has_loaded_extensions()
-    }
-
-    fn default_permissive_update_status(&self, next: bool) -> String {
-        let mut status = format!(
-            "Updated extensionPolicy.defaultPermissive: {}",
-            bool_label(next)
-        );
-        if self.default_permissive_changes_require_extension_restart() {
-            status.push_str(" (restart active extensions/session to apply)");
-        }
-        status
-    }
-
     fn apply_hardware_cursor(show: bool) {
         let mut stdout = std::io::stdout();
         if show {
@@ -713,20 +654,7 @@ impl PiApp {
             SettingsUiEntry::SteeringMode | SettingsUiEntry::FollowUpMode => {
                 self.toggle_queue_mode_setting(entry);
             }
-            SettingsUiEntry::DefaultPermissive => {
-                let next = !self.effective_default_permissive();
-                if self.persist_project_settings_patch(
-                    "extensionPolicy.defaultPermissive",
-                    json!({ "extensionPolicy": { "defaultPermissive": next } }),
-                ) {
-                    let policy = self
-                        .config
-                        .extension_policy
-                        .get_or_insert_with(ExtensionPolicyConfig::default);
-                    policy.default_permissive = Some(next);
-                    self.status_message = Some(self.default_permissive_update_status(next));
-                }
-            }
+            SettingsUiEntry::DefaultPermissive => {}
             SettingsUiEntry::QuietStartup => {
                 let next = !self.config.quiet_startup.unwrap_or(false);
                 if self.persist_project_settings_patch(
@@ -757,7 +685,6 @@ impl PiApp {
                 ) {
                     self.config.hide_thinking_block = Some(next);
                     self.thinking_visible = !next;
-                    self.message_render_cache.invalidate_all();
                     self.scroll_to_bottom();
                     self.status_message =
                         Some(format!("Updated hideThinkingBlock: {}", bool_label(next)));
@@ -843,73 +770,6 @@ impl PiApp {
         }
     }
 
-    // ========================================================================
-    // Memory pressure actions (PERF-6)
-    // ========================================================================
-
-    /// Run memory pressure actions: progressive collapse (Pressure) and
-    /// conversation truncation (Critical). Called from update_inner().
-    fn run_memory_pressure_actions(&mut self) {
-        let level = self.memory_monitor.level;
-
-        // Progressive collapse: one tool output per second, oldest first.
-        if self.memory_monitor.collapsing
-            && self.memory_monitor.last_collapse.elapsed() >= std::time::Duration::from_secs(1)
-        {
-            if let Some(idx) = self.find_next_uncollapsed_tool_output() {
-                self.messages[idx].collapsed = true;
-                let placeholder = "[tool output collapsed due to memory pressure]".to_string();
-                self.messages[idx].content = placeholder;
-                self.messages[idx].thinking = None;
-                self.memory_monitor.next_collapse_index = idx + 1;
-                self.memory_monitor.last_collapse = std::time::Instant::now();
-                self.memory_monitor.resample_now();
-            } else {
-                self.memory_monitor.collapsing = false;
-            }
-        }
-
-        // Pressure level: remove thinking from messages older than last 10 turns.
-        if level == MemoryLevel::Pressure || level == MemoryLevel::Critical {
-            let msg_count = self.messages.len();
-            if msg_count > 10 {
-                for msg in &mut self.messages[..msg_count - 10] {
-                    if msg.thinking.is_some() {
-                        msg.thinking = None;
-                    }
-                }
-            }
-        }
-
-        // Critical: truncate old messages (keep last CRITICAL_KEEP_MESSAGES).
-        if level == MemoryLevel::Critical && !self.memory_monitor.truncated {
-            let msg_count = self.messages.len();
-            if msg_count > CRITICAL_KEEP_MESSAGES {
-                let remove_count = msg_count - CRITICAL_KEEP_MESSAGES;
-                self.messages.drain(..remove_count);
-                self.messages.insert(
-                    0,
-                    ConversationMessage::new(
-                        MessageRole::System,
-                        "[conversation history truncated due to memory pressure — see session file for full history]".to_string(),
-                        None,
-                    ),
-                );
-                self.memory_monitor.next_collapse_index = 0;
-                self.message_render_cache.clear();
-            }
-            self.memory_monitor.truncated = true;
-            self.memory_monitor.resample_now();
-        }
-    }
-
-    /// Find the next uncollapsed Tool message starting from `next_collapse_index`.
-    fn find_next_uncollapsed_tool_output(&self) -> Option<usize> {
-        let start = self.memory_monitor.next_collapse_index;
-        (start..self.messages.len())
-            .find(|&i| self.messages[i].role == MessageRole::Tool && !self.messages[i].collapsed)
-    }
-
     fn format_settings_summary(&self) -> String {
         let theme_setting = self
             .config
@@ -929,7 +789,6 @@ impl PiApp {
         let keep_recent = self.config.compaction_keep_recent_tokens();
         let steering = self.config.steering_queue_mode();
         let follow_up = self.config.follow_up_queue_mode();
-        let default_permissive = self.effective_default_permissive();
         let quiet_startup = self.config.quiet_startup.unwrap_or(false);
         let collapse_changelog = self.config.collapse_changelog.unwrap_or(false);
         let hide_thinking_block = self.config.hide_thinking_block.unwrap_or(false);
@@ -954,16 +813,6 @@ impl PiApp {
         );
         let _ = writeln!(output, "  steeringMode: {}", steering.as_str());
         let _ = writeln!(output, "  followUpMode: {}", follow_up.as_str());
-        let _ = writeln!(
-            output,
-            "  extensionPolicy.defaultPermissive: {}{}",
-            bool_label(default_permissive),
-            if self.default_permissive_changes_require_extension_restart() {
-                " (future changes apply after extension restart)"
-            } else {
-                ""
-            }
-        );
         let _ = writeln!(output, "  quietStartup: {}", bool_label(quiet_startup));
         let _ = writeln!(
             output,
@@ -1148,43 +997,8 @@ impl PiApp {
             && self.session_picker.is_none()
             && self.settings_ui.is_none()
             && self.theme_picker.is_none()
-            && self.capability_prompt.is_none()
-            && self.extension_custom_overlay.is_none()
             && self.branch_picker.is_none()
             && self.model_selector.is_none()
-    }
-
-    /// Return whether a custom extension overlay should currently receive
-    /// keyboard input.
-    ///
-    /// Higher-priority modal overlays must win when they are present;
-    /// otherwise the prompt renders but can never be answered.
-    const fn custom_overlay_input_is_available(&self) -> bool {
-        self.extension_custom_active
-            && self.tree_ui.is_none()
-            && self.session_picker.is_none()
-            && self.settings_ui.is_none()
-            && self.theme_picker.is_none()
-            && self.capability_prompt.is_none()
-            && self.branch_picker.is_none()
-            && self.model_selector.is_none()
-    }
-
-    /// Approximate how many rows the custom extension overlay renders.
-    ///
-    /// `render_extension_custom_overlay()` emits:
-    /// - a leading blank spacer row plus the title row
-    /// - the source row
-    /// - either the waiting line or the visible frame tail
-    /// - the help row
-    fn extension_custom_overlay_rows(&self) -> usize {
-        let Some(overlay) = self.extension_custom_overlay.as_ref() else {
-            return 0;
-        };
-
-        let max_lines = self.term_height.saturating_sub(12).max(4);
-        let visible_lines = overlay.lines.len().min(max_lines).max(1);
-        4 + visible_lines
     }
 
     /// Compute the effective conversation viewport height for the current
@@ -1214,14 +1028,6 @@ impl PiApp {
         if self.status_message.is_some() {
             chrome += 2;
         }
-
-        // Capability prompt overlay: ~8 lines (title, ext name, desc, blank, buttons, timer, help, blank).
-        if self.capability_prompt.is_some() {
-            chrome += 8;
-        }
-
-        // Custom extension overlay: spacer + title + source + content/help.
-        chrome += self.extension_custom_overlay_rows();
 
         // Branch picker overlay: header + N visible branches + help line + padding.
         if let Some(ref picker) = self.branch_picker {
@@ -1260,8 +1066,6 @@ impl PiApp {
         let any_overlay = self.session_picker.is_some()
             || self.settings_ui.is_some()
             || self.theme_picker.is_some()
-            || self.capability_prompt.is_some()
-            || self.extension_custom_overlay.is_some()
             || self.branch_picker.is_some()
             || self.model_selector.is_some();
         if any_overlay {
@@ -1330,7 +1134,6 @@ impl PiApp {
             );
         }
 
-        self.message_render_cache.invalidate_all();
         self.resize_conversation_viewport();
 
         // Adapt open overlay pickers to the new terminal height.
@@ -1498,46 +1301,19 @@ impl PiApp {
         let path = path.to_string();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
-        let extensions = self.extensions.clone();
         let event_tx = self.event_tx.clone();
         let runtime_handle = self.runtime_handle.clone();
 
-        let (session_dir, previous_session_file) = {
+        let session_dir = {
             let Ok(guard) = self.session.try_lock() else {
                 self.status_message = Some("Session busy; try again".to_string());
                 return None;
             };
-            (
-                guard.session_dir.clone(),
-                guard.path.as_ref().map(|p| p.display().to_string()),
-            )
+            guard.session_dir.clone()
         };
 
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            if let Some(manager) = extensions.clone() {
-                let cancelled = manager
-                    .dispatch_cancellable_event(
-                        ExtensionEventName::SessionBeforeSwitch,
-                        Some(json!({
-                            "reason": "resume",
-                            "targetSessionFile": path.clone(),
-                        })),
-                        EXTENSION_EVENT_TIMEOUT_MS,
-                    )
-                    .await
-                    .unwrap_or(false);
-                if cancelled {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::System("Session switch cancelled by extension".to_string()),
-                    )
-                    .await;
-                    return;
-                }
-            }
-
             let mut loaded_session = match Session::open(&path).await {
                 Ok(session) => session,
                 Err(err) => {
@@ -1550,7 +1326,6 @@ impl PiApp {
                     return;
                 }
             };
-            let new_session_id = loaded_session.header.id.clone();
             loaded_session.session_dir = session_dir;
 
             let messages_for_agent = loaded_session.to_messages_for_current_path();
@@ -1615,20 +1390,6 @@ impl PiApp {
                 },
             )
             .await;
-
-            if let Some(manager) = extensions {
-                let _ = manager
-                    .dispatch_event(
-                        ExtensionEventName::SessionSwitch,
-                        Some(json!({
-                            "reason": "resume",
-                            "previousSessionFile": previous_session_file,
-                            "targetSessionFile": path,
-                            "sessionId": new_session_id,
-                        })),
-                    )
-                    .await;
-            }
         });
 
         self.status_message = Some("Loading session...".to_string());
@@ -1653,11 +1414,9 @@ pub async fn run_interactive(
     save_enabled: bool,
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
-    extensions: Option<ExtensionManager>,
     cwd: PathBuf,
     runtime_handle: RuntimeHandle,
 ) -> anyhow::Result<()> {
-    let should_check_for_updates = config.should_check_for_updates();
     let show_hardware_cursor = config.show_hardware_cursor.unwrap_or_else(|| {
         std::env::var("PI_HARDWARE_CURSOR")
             .ok()
@@ -1695,36 +1454,6 @@ pub async fn run_interactive(
         }
     });
 
-    if should_check_for_updates {
-        runtime_handle.spawn(async move {
-            let client = crate::http::client::Client::new();
-            let _ = crate::version_check::refresh_cache_if_stale(&client).await;
-        });
-    }
-
-    let extensions = extensions;
-
-    if let Some(manager) = &extensions {
-        let (extension_ui_tx, mut extension_ui_rx) = mpsc::channel::<ExtensionUiRequest>(64);
-        manager.set_ui_sender(extension_ui_tx);
-
-        let extension_event_tx = event_tx.clone();
-        let extension_ui_cx = Cx::current().unwrap_or_else(Cx::for_request);
-        runtime_handle.spawn(async move {
-            while let Ok(request) = extension_ui_rx.recv(&extension_ui_cx).await {
-                if !enqueue_pi_event(
-                    &extension_event_tx,
-                    &extension_ui_cx,
-                    PiMsg::ExtensionUiRequest(request),
-                )
-                .await
-                {
-                    break;
-                }
-            }
-        });
-    }
-
     let (messages, usage) = {
         let cx = Cx::for_request();
         let guard = session
@@ -1756,7 +1485,6 @@ pub async fn run_interactive(
             runtime_handle,
             save_enabled,
             true,
-            extensions,
             None,
             messages,
             usage,
@@ -1797,7 +1525,7 @@ pub enum PiMsg {
     AgentStart,
     /// Trigger processing of the next queued input (CLI startup messages).
     RunPending,
-    /// Enqueue a pending input (extensions may inject while idle).
+    /// Enqueue a pending input while idle.
     EnqueuePendingInput(PendingInput),
     /// Internal: shut down the async→UI message bridge (used for clean exit).
     UiShutdown,
@@ -1864,19 +1592,11 @@ pub enum PiMsg {
         initial_selected_id: Option<String>,
         label: Option<String>,
     },
-    /// Reloaded skills/prompts/themes/extensions.
+    /// Reloaded skills/prompts/themes.
     ResourcesReloaded {
         resources: ResourceLoader,
         status: String,
         diagnostics: Option<String>,
-    },
-    /// Extension UI request (select/confirm/input/editor/custom/notify).
-    ExtensionUiRequest(ExtensionUiRequest),
-    /// Extension command finished execution.
-    ExtensionCommandDone {
-        command: String,
-        display: String,
-        is_error: bool,
     },
     /// OAuth callback server received the browser redirect.
     /// The string is the full callback URL (e.g. `http://localhost:1455/auth/callback?code=abc&state=xyz`).
@@ -2301,23 +2021,11 @@ pub struct PiApp {
     event_tx: mpsc::Sender<PiMsg>,
     runtime_handle: RuntimeHandle,
 
-    // Extension session state
-    extension_streaming: Arc<AtomicBool>,
-    extension_compacting: Arc<AtomicBool>,
-    extension_ui_queue: VecDeque<ExtensionUiRequest>,
-    active_extension_ui: Option<ExtensionUiRequest>,
-    extension_custom_overlay: Option<ExtensionCustomOverlay>,
-    extension_custom_active: bool,
-    extension_custom_key_queue: VecDeque<String>,
-
     // Status message (for slash command feedback)
     status_message: Option<String>,
 
     // Login flow state (awaiting sensitive credential input)
     pending_oauth: Option<PendingOAuth>,
-
-    // Extension system
-    extensions: Option<ExtensionManager>,
 
     // Keybindings for action dispatch
     keybindings: crate::keybindings::KeyBindings,
@@ -2342,27 +2050,11 @@ pub struct PiApp {
     // Tree navigation UI state (for /tree command)
     tree_ui: Option<TreeUiState>,
 
-    // Capability prompt overlay (extension permission request)
-    capability_prompt: Option<CapabilityPromptOverlay>,
-
     // Branch picker overlay (Ctrl+B quick branch switching)
     branch_picker: Option<BranchPickerOverlay>,
 
     // Model selector overlay (Ctrl+L)
     model_selector: Option<crate::model_selector::ModelSelectorOverlay>,
-
-    // Frame timing telemetry (PERF-3)
-    frame_timing: FrameTimingStats,
-    tui_pressure_frame_p99_us: Arc<AtomicU64>,
-
-    // Memory pressure monitoring (PERF-6)
-    memory_monitor: MemoryMonitor,
-
-    // Per-message render cache (PERF-1)
-    message_render_cache: MessageRenderCache,
-
-    // Pre-allocated reusable buffers for view() hot path (PERF-7)
-    render_buffers: RenderBuffers,
 
     // Current VCS info for the status bar (refreshed on startup + after
     // each agent turn). Shows `jj:<change_id> <description>` in jj repos
@@ -2437,7 +2129,6 @@ impl PiApp {
         runtime_handle: RuntimeHandle,
         save_enabled: bool,
         persist_startup_settings: bool,
-        extensions: Option<ExtensionManager>,
         keybindings_override: Option<KeyBindings>,
         messages: Vec<ConversationMessage>,
         total_usage: Usage,
@@ -2484,8 +2175,6 @@ impl PiApp {
         );
 
         let model_entry_shared = Arc::new(StdMutex::new(model_entry.clone()));
-        let extension_streaming = Arc::new(AtomicBool::new(false));
-        let extension_compacting = Arc::new(AtomicBool::new(false));
         let steering_mode = parse_queue_mode_or_default(config.steering_mode.as_deref());
         let follow_up_mode = parse_queue_mode_or_default(config.follow_up_mode.as_deref());
         let message_queue = Arc::new(StdMutex::new(InteractiveMessageQueue::new(
@@ -2551,10 +2240,7 @@ impl PiApp {
         });
 
         // Initialize autocomplete with catalog from resources
-        let mut autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
-        if let Some(manager) = &extensions {
-            autocomplete_catalog.extension_commands = extension_commands_for_catalog(manager);
-        }
+        let autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
         let mut autocomplete = AutocompleteState::new(cwd.clone(), autocomplete_catalog);
         autocomplete.max_visible = autocomplete_max_visible;
         if std::env::var_os("PI_TEST_MODE").is_none() {
@@ -2614,19 +2300,11 @@ impl PiApp {
             total_usage,
             event_tx,
             runtime_handle,
-            extension_streaming: extension_streaming.clone(),
-            extension_compacting: extension_compacting.clone(),
-            extension_ui_queue: VecDeque::new(),
-            active_extension_ui: None,
-            extension_custom_overlay: None,
-            extension_custom_active: false,
-            extension_custom_key_queue: VecDeque::new(),
             status_message: None,
             save_enabled,
             abort_handle: None,
             bash_running: false,
             pending_oauth: None,
-            extensions,
             keybindings,
             last_ctrlc_time: None,
             last_escape_time: None,
@@ -2635,54 +2313,15 @@ impl PiApp {
             settings_ui: None,
             theme_picker: None,
             tree_ui: None,
-            capability_prompt: None,
             branch_picker: None,
             model_selector: None,
-            frame_timing: FrameTimingStats::new(),
-            tui_pressure_frame_p99_us: Arc::new(AtomicU64::new(0)),
-            memory_monitor: MemoryMonitor::new_default(),
-            message_render_cache: MessageRenderCache::new(),
-            render_buffers: RenderBuffers::new(),
             vcs_info,
             startup_welcome,
             startup_changelog,
             tmux_wheel_guard: TmuxWheelGuard::install(),
         };
 
-        if let Some(manager) = app.extensions.clone() {
-            let session_handle = Arc::new(InteractiveExtensionSession {
-                session: Arc::clone(&app.session),
-                model_entry: model_entry_shared,
-                is_streaming: extension_streaming,
-                is_compacting: extension_compacting,
-                config: app.config.clone(),
-                save_enabled: app.save_enabled,
-            });
-            manager.set_session(session_handle);
-
-            manager.set_host_actions(Arc::new(InteractiveExtensionHostActions {
-                session: Arc::clone(&app.session),
-                agent: Arc::clone(&app.agent),
-                event_tx: app.event_tx.clone(),
-                extension_streaming: Arc::clone(&app.extension_streaming),
-                user_queue: Arc::clone(&app.message_queue),
-                injected_queue,
-            }));
-        }
-
         app.scroll_to_bottom();
-
-        // Version update check (non-blocking, cache-only on startup)
-        if app.config.should_check_for_updates() {
-            if let crate::version_check::VersionCheckResult::UpdateAvailable { latest } =
-                crate::version_check::check_cached()
-            {
-                app.status_message = Some(format!(
-                    "New version {latest} available (current: {})",
-                    crate::version_check::CURRENT_VERSION
-                ));
-            }
-        }
 
         app
     }
@@ -2707,56 +2346,6 @@ impl PiApp {
         &self.messages
     }
 
-    /// Return the memory summary string (integration test helper).
-    pub fn memory_summary_for_test(&self) -> String {
-        self.memory_monitor.summary()
-    }
-
-    /// Enable frame timing telemetry for integration tests without mutating
-    /// process environment.
-    pub const fn enable_frame_timing_for_test(&mut self) {
-        self.frame_timing.enable_for_test();
-    }
-
-    /// Clear frame timing samples for the next integration-test surface.
-    pub fn reset_frame_timing_for_test(&mut self) {
-        self.frame_timing.reset_for_test();
-    }
-
-    /// Return a redaction-safe frame-budget snapshot for integration tests.
-    pub fn frame_budget_snapshot_for_test(&self, surface: &str, fixture: &Value) -> Value {
-        self.frame_timing.snapshot_json(surface, fixture)
-    }
-
-    /// Install a deterministic RSS sampler for integration tests.
-    ///
-    /// This replaces `/proc/self` RSS sampling with a caller-provided function
-    /// and enables immediate sampling cadence (`sample_interval = 0`).
-    pub fn install_memory_rss_reader_for_test(
-        &mut self,
-        read_fn: Box<dyn Fn() -> Option<usize> + Send>,
-    ) {
-        let mut monitor = MemoryMonitor::new_with_reader_fn(read_fn);
-        monitor.sample_interval = std::time::Duration::ZERO;
-        monitor.last_collapse = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
-        self.memory_monitor = monitor;
-    }
-
-    /// Force a memory monitor sample + action pass (integration test helper).
-    pub fn force_memory_cycle_for_test(&mut self) {
-        self.memory_monitor.maybe_sample();
-        self.run_memory_pressure_actions();
-    }
-
-    /// Force progressive-collapse timing eligibility (integration test helper).
-    pub fn force_memory_collapse_tick_for_test(&mut self) {
-        self.memory_monitor.last_collapse = std::time::Instant::now()
-            .checked_sub(std::time::Duration::from_secs(1))
-            .unwrap_or_else(std::time::Instant::now);
-    }
-
     /// Get a reference to the model selector overlay (for testing).
     pub const fn model_selector(&self) -> Option<&crate::model_selector::ModelSelectorOverlay> {
         self.model_selector.as_ref()
@@ -2765,24 +2354,6 @@ impl PiApp {
     /// Check if the branch picker is currently open (for testing).
     pub const fn has_branch_picker(&self) -> bool {
         self.branch_picker.is_some()
-    }
-
-    /// Return whether the conversation prefix cache is currently valid for
-    /// the current message count (integration test helper for PERF-2).
-    pub fn prefix_cache_valid_for_test(&self) -> bool {
-        self.message_render_cache.prefix_valid(self.messages.len())
-    }
-
-    /// Return the length of the cached conversation prefix
-    /// (integration test helper for PERF-2).
-    pub fn prefix_cache_len_for_test(&self) -> usize {
-        self.message_render_cache.prefix_get().len()
-    }
-
-    /// Return the current view capacity hint from render buffers
-    /// (integration test helper for PERF-7).
-    pub fn render_buffer_capacity_hint_for_test(&self) -> usize {
-        self.render_buffers.view_capacity_hint()
     }
 
     /// Initialize the application.
@@ -2815,35 +2386,21 @@ impl PiApp {
     /// Handle messages (keyboard input, async events, etc.).
     #[allow(clippy::too_many_lines)]
     fn update(&mut self, msg: Message) -> Option<Cmd> {
-        let update_start = if self.frame_timing.enabled {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
         let was_busy = !matches!(self.agent_state, AgentState::Idle);
         let was_spinner_visible = self.spinner_visible();
         let result = self.update_inner(msg);
         let became_busy = !was_busy && !matches!(self.agent_state, AgentState::Idle);
         let spinner_became_visible = !was_spinner_visible && self.spinner_visible();
-        let result = if became_busy || spinner_became_visible {
+        if became_busy || spinner_became_visible {
             batch(vec![result, self.spinner_init_cmd()])
         } else {
             result
-        };
-        if let Some(start) = update_start {
-            self.frame_timing
-                .record_update(micros_as_u64(start.elapsed().as_micros()));
         }
-        result
     }
 
     /// Inner update handler (extracted for frame timing instrumentation).
     #[allow(clippy::too_many_lines)]
     fn update_inner(&mut self, msg: Message) -> Option<Cmd> {
-        // Memory pressure sampling + progressive collapse (PERF-6)
-        self.memory_monitor.maybe_sample();
-        self.run_memory_pressure_actions();
-
         // Handle our custom Pi messages (take ownership to avoid per-token clone).
         if msg.is::<PiMsg>() {
             let pi_msg = msg
@@ -2882,18 +2439,9 @@ impl PiApp {
                 self.last_escape_time = None;
             }
 
-            if self.handle_custom_extension_key(key) {
-                return None;
-            }
-
             // /tree modal captures all input while active.
             if self.tree_ui.is_some() {
                 return self.handle_tree_ui_key(key);
-            }
-
-            // Capability prompt modal captures all input while active.
-            if self.capability_prompt.is_some() {
-                return self.handle_capability_prompt_key(key);
             }
 
             // Branch picker modal captures all input while active.
@@ -3224,16 +2772,6 @@ impl PiApp {
                         return None;
                     }
                 }
-
-                // Extension shortcuts: check if unhandled key matches an extension shortcut
-                if matches!(self.agent_state, AgentState::Idle) {
-                    let key_id = binding.to_string().to_lowercase();
-                    if let Some(manager) = &self.extensions {
-                        if manager.has_shortcut(&key_id) {
-                            return self.dispatch_extension_shortcut(&key_id);
-                        }
-                    }
-                }
             }
 
             // Handle raw keys that don't map to actions but need special behavior
@@ -3276,6 +2814,3 @@ impl PiApp {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

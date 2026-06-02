@@ -9,8 +9,6 @@
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::extension_index::ExtensionIndexStore;
-use crate::extensions::{CompatibilityScanner, load_extension_manifest};
 use asupersync::channel::oneshot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -22,7 +20,6 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use tracing::{info, warn};
 
 fn finish_package_task<T, E>(
     handle: thread::JoinHandle<()>,
@@ -52,10 +49,9 @@ pub struct PackageEntry {
 /// Optional per-resource filters for packages in settings.
 ///
 /// Mirrors pi-mono's `PackageSource` object form:
-/// `{ source, extensions?, skills?, prompts?, themes? }`.
+/// `{ source, skills?, prompts?, themes? }`.
 #[derive(Debug, Clone, Default)]
 pub struct PackageFilter {
-    pub extensions: Option<Vec<String>>,
     pub skills: Option<Vec<String>>,
     pub prompts: Option<Vec<String>>,
     pub themes: Option<Vec<String>>,
@@ -84,7 +80,6 @@ pub struct ResolvedResource {
 
 #[derive(Debug, Clone, Default)]
 pub struct ResolvedPaths {
-    pub extensions: Vec<ResolvedResource>,
     pub skills: Vec<ResolvedResource>,
     pub prompts: Vec<ResolvedResource>,
     pub themes: Vec<ResolvedResource>,
@@ -237,12 +232,9 @@ impl PackageManager {
         Self { cwd }
     }
 
-    /// Resolve a shorthand source (`id`/`name`) via the local extension index when possible.
-    ///
-    /// Returns the original source when no unique alias mapping exists.
+    /// Resolve a package source alias.
     pub fn resolve_install_source_alias(&self, source: &str) -> String {
-        let source = source.trim();
-        resolve_install_source_alias(source, &self.cwd).unwrap_or_else(|| source.to_string())
+        source.trim().to_string()
     }
 
     /// Get a stable identity for a package source, ignoring version/ref.
@@ -520,12 +512,15 @@ impl PackageManager {
 
             match parsed {
                 ParsedSource::Local { path } => {
-                    Self::resolve_local_extension_source(
+                    if !path.exists() {
+                        return Ok(None);
+                    }
+                    metadata.base_dir = Some(path.clone());
+                    Self::collect_package_resources(
                         &path,
                         &mut accumulator,
                         entry.pkg.filter.as_ref(),
-                        &mut metadata,
-                        entry.scope == PackageScope::Temporary,
+                        &metadata,
                     )?;
                 }
                 ParsedSource::Npm { name, .. } => {
@@ -638,7 +633,7 @@ impl PackageManager {
         Ok(installed)
     }
 
-    /// Resolve all resources (extensions/skills/prompts/themes) from:
+    /// Resolve all resources (skills/prompts/themes) from:
     /// - packages in global + project settings (deduped by identity; project wins)
     /// - local resource entries from settings (with pattern filtering)
     /// - auto-discovered resources from standard directories (with override patterns)
@@ -747,7 +742,6 @@ impl PackageManager {
 
             let resolved = accumulator.clone().into_resolved_paths();
             drop(accumulator);
-            maybe_emit_compat_ledgers(&resolved.extensions);
             let cx = AgentCx::for_request();
             let _ = tx.send(cx.cx(), Ok(resolved));
         });
@@ -755,58 +749,6 @@ impl PackageManager {
         let cx = AgentCx::for_request();
         let recv_result = rx.recv(cx.cx()).await;
         finish_package_task(handle, recv_result, "Resolve processing task cancelled")
-    }
-
-    /// Resolve resources for extension sources specified via CLI `-e/--extension`.
-    ///
-    /// Mirrors pi-mono's `resolveExtensionSources(..., { temporary: true })`.
-    pub async fn resolve_extension_sources(
-        &self,
-        sources: &[String],
-        options: ResolveExtensionSourcesOptions,
-    ) -> Result<ResolvedPaths> {
-        let scope = if options.temporary {
-            PackageScope::Temporary
-        } else if options.local {
-            PackageScope::Project
-        } else {
-            PackageScope::User
-        };
-
-        let mut accumulator = ResourceAccumulator::new();
-        let package_sources = sources
-            .iter()
-            .map(|source| {
-                Ok(ScopedPackage {
-                    pkg: PackageSpec {
-                        source: validate_non_empty_source(source, "Extension source")?.to_string(),
-                        filter: None,
-                    },
-                    scope,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        Box::pin(self.resolve_package_sources(&package_sources, &mut accumulator)).await?;
-
-        let (tx, mut rx) = oneshot::channel();
-        let accumulator = std::sync::Mutex::new(accumulator);
-
-        let handle = thread::spawn(move || {
-            let resolved = {
-                let accumulator = accumulator
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                accumulator.clone().into_resolved_paths()
-            };
-            maybe_emit_compat_ledgers(&resolved.extensions);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), Ok(resolved));
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "Resolve extensions task cancelled")
     }
 
     pub async fn add_package_source(&self, source: &str, scope: PackageScope) -> Result<()> {
@@ -1554,12 +1496,6 @@ impl PackageManager {
 // Resource resolution (pi-mono parity)
 // ============================================================================
 
-#[derive(Debug, Clone, Default)]
-pub struct ResolveExtensionSourcesOptions {
-    pub local: bool,
-    pub temporary: bool,
-}
-
 #[derive(Debug, Clone)]
 struct PackageSpec {
     source: String,
@@ -1569,7 +1505,6 @@ struct PackageSpec {
 #[derive(Debug, Clone, Default)]
 struct SettingsSnapshot {
     packages: Vec<PackageSpec>,
-    extensions: Vec<String>,
     skills: Vec<String>,
     prompts: Vec<String>,
     themes: Vec<String>,
@@ -1578,7 +1513,6 @@ struct SettingsSnapshot {
 impl SettingsSnapshot {
     fn entries_for(&self, resource_type: ResourceType) -> &[String] {
         match resource_type {
-            ResourceType::Extensions => &self.extensions,
             ResourceType::Skills => &self.skills,
             ResourceType::Prompts => &self.prompts,
             ResourceType::Themes => &self.themes,
@@ -1603,7 +1537,6 @@ fn read_settings_snapshot(path: &Path) -> Result<SettingsSnapshot> {
 
     Ok(SettingsSnapshot {
         packages,
-        extensions: extract_string_array(value.get("extensions")),
         skills: extract_string_array(value.get("skills")),
         prompts: extract_string_array(value.get("prompts")),
         themes: extract_string_array(value.get("themes")),
@@ -1649,7 +1582,6 @@ fn extract_package_spec(value: &Value) -> Option<PackageSpec> {
     }
 
     let filter = PackageFilter {
-        extensions: extract_filter_field(obj, "extensions"),
         skills: extract_filter_field(obj, "skills"),
         prompts: extract_filter_field(obj, "prompts"),
         themes: extract_filter_field(obj, "themes"),
@@ -1686,20 +1618,18 @@ struct ScopedPackage {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResourceType {
-    Extensions,
     Skills,
     Prompts,
     Themes,
 }
 
 impl ResourceType {
-    const fn all() -> [Self; 4] {
-        [Self::Extensions, Self::Skills, Self::Prompts, Self::Themes]
+    const fn all() -> [Self; 3] {
+        [Self::Skills, Self::Prompts, Self::Themes]
     }
 
     const fn as_str(self) -> &'static str {
         match self {
-            Self::Extensions => "extensions",
             Self::Skills => "skills",
             Self::Prompts => "prompts",
             Self::Themes => "themes",
@@ -1709,7 +1639,6 @@ impl ResourceType {
 
 #[derive(Debug, Default, Clone)]
 struct ResourceAccumulator {
-    extensions: ResourceList,
     skills: ResourceList,
     prompts: ResourceList,
     themes: ResourceList,
@@ -1723,7 +1652,6 @@ impl ResourceAccumulator {
     #[allow(clippy::missing_const_for_fn)] // const fn with &mut is unstable
     fn target_mut(&mut self, resource_type: ResourceType) -> &mut ResourceList {
         match resource_type {
-            ResourceType::Extensions => &mut self.extensions,
             ResourceType::Skills => &mut self.skills,
             ResourceType::Prompts => &mut self.prompts,
             ResourceType::Themes => &mut self.themes,
@@ -1732,7 +1660,6 @@ impl ResourceAccumulator {
 
     fn into_resolved_paths(mut self) -> ResolvedPaths {
         for items in [
-            &mut self.extensions.items,
             &mut self.skills.items,
             &mut self.prompts.items,
             &mut self.themes.items,
@@ -1741,7 +1668,6 @@ impl ResourceAccumulator {
         }
 
         ResolvedPaths {
-            extensions: self.extensions.items,
             skills: self.skills.items,
             prompts: self.prompts.items,
             themes: self.themes.items,
@@ -1816,12 +1742,15 @@ impl PackageManager {
 
             match parsed {
                 ParsedSource::Local { path } => {
-                    Self::resolve_local_extension_source(
+                    if !path.exists() {
+                        continue;
+                    }
+                    metadata.base_dir = Some(path.clone());
+                    Self::collect_package_resources(
                         &path,
                         accumulator,
                         entry.pkg.filter.as_ref(),
-                        &mut metadata,
-                        entry.scope == PackageScope::Temporary,
+                        &metadata,
                     )?;
                 }
                 ParsedSource::Npm { spec, name, pinned } => {
@@ -1891,75 +1820,6 @@ impl PackageManager {
             .is_ok_and(|latest| latest != installed_version)
     }
 
-    fn resolve_local_extension_source(
-        resolved: &Path,
-        accumulator: &mut ResourceAccumulator,
-        filter: Option<&PackageFilter>,
-        metadata: &mut PathMetadata,
-        strict: bool,
-    ) -> Result<()> {
-        if !resolved.exists() {
-            if strict {
-                return Err(Error::config(format!(
-                    "Extension source '{}' does not exist",
-                    resolved.display()
-                )));
-            }
-            return Ok(());
-        }
-
-        let stats = match fs::metadata(resolved) {
-            Ok(stats) => stats,
-            Err(err) => {
-                if strict {
-                    return Err(Error::config(format!(
-                        "Failed to inspect extension source '{}': {err}",
-                        resolved.display()
-                    )));
-                }
-                return Ok(());
-            }
-        };
-
-        if stats.is_file() {
-            if !is_supported_extension_file(resolved) {
-                let message = format!(
-                    "Unsupported extension source file '{}'; use extension.json, JS/TS entrypoints, *.native.json, or *.wasm",
-                    resolved.display()
-                );
-                if strict {
-                    return Err(Error::config(message));
-                }
-                warn!(path = %resolved.display(), "{message}");
-                return Ok(());
-            }
-            metadata.base_dir = resolved.parent().map(Path::to_path_buf);
-            accumulator
-                .extensions
-                .add(resolved.to_path_buf(), metadata, true);
-            return Ok(());
-        }
-
-        if !stats.is_dir() {
-            if strict {
-                return Err(Error::config(format!(
-                    "Extension source '{}' is neither a file nor a directory",
-                    resolved.display()
-                )));
-            }
-            return Ok(());
-        }
-
-        metadata.base_dir = Some(resolved.to_path_buf());
-        let had_any = Self::collect_package_resources(resolved, accumulator, filter, metadata)?;
-        if !had_any {
-            accumulator
-                .extensions
-                .add(resolved.to_path_buf(), metadata, true);
-        }
-        Ok(())
-    }
-
     fn resolve_local_entries(
         entries: &[String],
         resource_type: ResourceType,
@@ -2014,10 +1874,6 @@ impl PackageManager {
         for resource_type in ResourceType::all() {
             let target = accumulator.target_mut(resource_type);
             let (user_paths, user_overrides) = match resource_type {
-                ResourceType::Extensions => (
-                    collect_auto_extension_entries(&user_dirs.extensions),
-                    &global.extensions,
-                ),
                 ResourceType::Skills => (
                     collect_auto_skill_entries(&user_dirs.skills),
                     &global.skills,
@@ -2038,10 +1894,6 @@ impl PackageManager {
 
             if project_settings_enabled {
                 let (project_paths, project_overrides) = match resource_type {
-                    ResourceType::Extensions => (
-                        collect_auto_extension_entries(&project_dirs.extensions),
-                        &project.extensions,
-                    ),
                     ResourceType::Skills => (
                         collect_auto_skill_entries(&project_dirs.skills),
                         &project.skills,
@@ -2074,7 +1926,6 @@ impl PackageManager {
             for resource_type in ResourceType::all() {
                 let target = accumulator.target_mut(resource_type);
                 let patterns = match resource_type {
-                    ResourceType::Extensions => filter.extensions.as_ref(),
                     ResourceType::Skills => filter.skills.as_ref(),
                     ResourceType::Prompts => filter.prompts.as_ref(),
                     ResourceType::Themes => filter.themes.as_ref(),
@@ -2249,7 +2100,6 @@ impl PackageManager {
 
 #[derive(Debug, Default)]
 struct AutoDirs {
-    extensions: PathBuf,
     skills: PathBuf,
     prompts: PathBuf,
     themes: PathBuf,
@@ -2258,7 +2108,6 @@ struct AutoDirs {
 impl AutoDirs {
     fn new(base_dir: &Path) -> Self {
         Self {
-            extensions: base_dir.join("extensions"),
             skills: base_dir.join("skills"),
             prompts: base_dir.join("prompts"),
             themes: base_dir.join("themes"),
@@ -2268,7 +2117,6 @@ impl AutoDirs {
 
 #[derive(Debug, Clone, Default)]
 struct PiManifest {
-    extensions: Option<Vec<String>>,
     skills: Option<Vec<String>>,
     prompts: Option<Vec<String>>,
     themes: Option<Vec<String>>,
@@ -2277,7 +2125,6 @@ struct PiManifest {
 impl PiManifest {
     fn entries_for(&self, resource_type: ResourceType) -> Option<Vec<String>> {
         match resource_type {
-            ResourceType::Extensions => self.extensions.clone(),
             ResourceType::Skills => self.skills.clone(),
             ResourceType::Prompts => self.prompts.clone(),
             ResourceType::Themes => self.themes.clone(),
@@ -2434,7 +2281,6 @@ fn read_pi_manifest(package_root: &Path) -> Result<Option<PiManifest>> {
     };
 
     Ok(Some(PiManifest {
-        extensions: parse_manifest_entries_field(obj, "extensions", &manifest_path, package_root)?,
         skills: parse_manifest_entries_field(obj, "skills", &manifest_path, package_root)?,
         prompts: parse_manifest_entries_field(obj, "prompts", &manifest_path, package_root)?,
         themes: parse_manifest_entries_field(obj, "themes", &manifest_path, package_root)?,
@@ -2448,7 +2294,7 @@ fn temporary_dir(prefix: &str, suffix: Option<&str>) -> PathBuf {
     let short = hex_encode(&digest)[..8].to_string();
 
     let mut dir = std::env::temp_dir()
-        .join("pi-extensions")
+        .join("pi-packages")
         .join(prefix)
         .join(short);
     if let Some(suffix) = suffix {
@@ -2714,7 +2560,6 @@ fn apply_patterns(
 fn collect_resource_files(dir: &Path, resource_type: ResourceType) -> Vec<PathBuf> {
     match resource_type {
         ResourceType::Skills => collect_skill_entries(dir),
-        ResourceType::Extensions => collect_auto_extension_entries(dir),
         ResourceType::Prompts => collect_files_recursive(dir, "md"),
         ResourceType::Themes => collect_files_recursive(dir, "json"),
     }
@@ -2730,13 +2575,6 @@ fn collect_files_from_paths(paths: &[PathBuf], resource_type: ResourceType) -> V
             continue;
         };
         if stats.is_file() {
-            if resource_type == ResourceType::Extensions && !is_supported_extension_file(p) {
-                warn!(
-                    path = %p.display(),
-                    "Ignoring unsupported extension file entry; use extension.json, JS/TS entrypoints, *.native.json, or *.wasm"
-                );
-                continue;
-            }
             out.push(p.clone());
         } else if stats.is_dir() {
             out.extend(collect_resource_files(p, resource_type));
@@ -2750,10 +2588,6 @@ fn collect_files_from_manifest_entries(
     root: &Path,
     resource_type: ResourceType,
 ) -> Vec<PathBuf> {
-    if resource_type == ResourceType::Extensions {
-        return collect_extension_manifest_entries(entries, root);
-    }
-
     let plain = entries
         .iter()
         .filter(|e| !is_pattern(e))
@@ -2772,50 +2606,6 @@ fn collect_files_from_manifest_entries(
         .collect::<Vec<_>>();
 
     collect_files_from_paths(&resolved, resource_type)
-}
-
-fn collect_extension_manifest_entries(entries: &[String], root: &Path) -> Vec<PathBuf> {
-    let plain = entries
-        .iter()
-        .filter(|entry| !is_pattern(entry))
-        .map(|entry| root.join(entry))
-        .collect::<Vec<_>>();
-
-    let mut out = Vec::new();
-    let root_identity = canonical_identity_path(root);
-    for path in plain {
-        if !path.exists() {
-            continue;
-        }
-
-        let Ok(stats) = fs::metadata(&path) else {
-            continue;
-        };
-        if stats.is_file() {
-            if !is_supported_extension_file(&path) {
-                warn!(
-                    path = %path.display(),
-                    "Ignoring unsupported package.json#pi.extensions entry; use extension.json, JS/TS entrypoints, *.native.json, or *.wasm"
-                );
-                continue;
-            }
-            out.push(path);
-            continue;
-        }
-
-        if !stats.is_dir() {
-            continue;
-        }
-
-        if canonical_identity_path(&path) == root_identity {
-            out.push(path);
-            continue;
-        }
-
-        out.extend(collect_auto_extension_entries(&path));
-    }
-
-    out
 }
 
 fn collect_files_recursive(dir: &Path, ext: &str) -> Vec<PathBuf> {
@@ -2964,161 +2754,6 @@ fn collect_auto_theme_entries(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-fn is_supported_extension_file(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-
-    if name.eq_ignore_ascii_case("extension.json") || name.ends_with(".native.json") {
-        return true;
-    }
-
-    let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
-        return false;
-    };
-
-    if ext.eq_ignore_ascii_case("wasm") {
-        return true;
-    }
-
-    ["ts", "tsx", "js", "mjs", "cjs", "mts", "cts"]
-        .iter()
-        .any(|candidate| ext.eq_ignore_ascii_case(candidate))
-}
-
-fn resolve_extension_entries(dir: &Path) -> Option<Vec<PathBuf>> {
-    match load_extension_manifest(dir) {
-        Ok(Some(_)) => {
-            return Some(vec![dir.to_path_buf()]);
-        }
-        Ok(None) => {}
-        Err(err) => {
-            warn!(path = %dir.display(), "Invalid extension manifest: {err}");
-            return None;
-        }
-    }
-
-    let package_json_path = dir.join("package.json");
-    if package_json_path.exists() {
-        match read_pi_manifest(dir) {
-            Ok(Some(manifest)) => {
-                if let Some(exts) = manifest.extensions {
-                    let all_files = collect_extension_manifest_entries(&exts, dir);
-                    let patterns = exts
-                        .iter()
-                        .filter(|entry| is_pattern(entry))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let mut entries = if patterns.is_empty() {
-                        all_files
-                    } else {
-                        let enabled = apply_patterns(&all_files, &patterns, dir);
-                        enabled.into_iter().collect::<Vec<_>>()
-                    };
-                    entries.sort();
-                    entries.dedup();
-                    return Some(entries);
-                }
-            }
-            Ok(None) => {}
-            Err(err) => {
-                warn!(path = %package_json_path.display(), "Invalid package manifest: {err}");
-                return None;
-            }
-        }
-    }
-
-    let index_native = dir.join("index.native.json");
-    if index_native.exists() {
-        return Some(vec![index_native]);
-    }
-
-    for index_name in [
-        "index.ts",
-        "index.tsx",
-        "index.js",
-        "index.mjs",
-        "index.cjs",
-        "index.mts",
-        "index.cts",
-    ] {
-        let candidate = dir.join(index_name);
-        if candidate.exists() {
-            return Some(vec![candidate]);
-        }
-    }
-
-    None
-}
-
-fn suppress_root_extension_walk(dir: &Path) -> bool {
-    match load_extension_manifest(dir) {
-        Ok(Some(_)) | Err(_) => return true,
-        Ok(None) => {}
-    }
-
-    let package_json_path = dir.join("package.json");
-    if !package_json_path.exists() {
-        return false;
-    }
-
-    match read_pi_manifest(dir) {
-        Ok(Some(manifest)) => manifest.extensions.is_some(),
-        Ok(None) => false,
-        Err(_) => true,
-    }
-}
-
-fn collect_auto_extension_entries(dir: &Path) -> Vec<PathBuf> {
-    if !dir.exists() {
-        return Vec::new();
-    }
-
-    let mut out = Vec::new();
-    let suppress_root_walk = suppress_root_extension_walk(dir);
-    if let Some(entries) = resolve_extension_entries(dir) {
-        out.extend(entries);
-    }
-
-    if suppress_root_walk {
-        out.sort();
-        out.dedup();
-        return out;
-    }
-
-    let mut builder = ignore::WalkBuilder::new(dir);
-    builder
-        .hidden(true)
-        .follow_links(true)
-        .max_depth(Some(1))
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .add_custom_ignore_filename(".fdignore")
-        .filter_entry(|e| e.file_name() != std::ffi::OsStr::new("node_modules"));
-
-    for entry in builder.build().skip(1).filter_map(std::result::Result::ok) {
-        let path = entry.path().to_path_buf();
-        let Ok(stats) = fs::metadata(&path) else {
-            continue;
-        };
-        if stats.is_file() {
-            if is_supported_extension_file(&path) {
-                out.push(path);
-            }
-            continue;
-        }
-        if stats.is_dir() {
-            if let Some(entries) = resolve_extension_entries(&path) {
-                out.extend(entries);
-            }
-        }
-    }
-    out.sort();
-    out.dedup();
-    out
-}
-
 fn read_installed_npm_version(installed_path: &Path) -> Option<String> {
     let package_json = installed_path.join("package.json");
     let raw = fs::read_to_string(package_json).ok()?;
@@ -3216,10 +2851,6 @@ fn parse_source(source: &str, cwd: &Path) -> ParsedSource {
         return parse_git_source(source, cwd);
     }
 
-    if let Some(resolved) = resolve_install_source_alias(source, cwd) {
-        return parse_source(&resolved, cwd);
-    }
-
     ParsedSource::Local {
         path: resolve_local_path(source, cwd),
     }
@@ -3231,28 +2862,6 @@ fn validate_non_empty_source<'a>(source: &'a str, label: &str) -> Result<&'a str
         return Err(Error::config(format!("{label} must be non-empty")));
     }
     Ok(trimmed)
-}
-
-fn resolve_install_source_alias(source: &str, cwd: &Path) -> Option<String> {
-    if source.is_empty() || looks_like_local_path(source) {
-        return None;
-    }
-
-    // Preserve local-path behavior for existing relative paths like `foo/bar`.
-    if resolve_local_path(source, cwd).exists() {
-        return None;
-    }
-
-    match ExtensionIndexStore::default_store().resolve_install_source(source) {
-        Ok(Some(resolved)) if resolved != source => Some(resolved),
-        Ok(_) => None,
-        Err(err) => {
-            tracing::debug!(
-                "failed to resolve install source alias via extension index (using source as-is): {err}"
-            );
-            None
-        }
-    }
 }
 
 fn git_clone_source(source: &str, cwd: &Path) -> String {
@@ -4180,59 +3789,6 @@ fn write_settings_json_atomic(path: &Path, value: &Value) -> Result<()> {
         .persist(path)
         .map_err(|e| Error::Io(Box::new(e.error)))?;
     Ok(())
-}
-
-fn compat_scan_enabled() -> bool {
-    let value = std::env::var("PI_EXT_COMPAT_SCAN").unwrap_or_default();
-    matches!(
-        value.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "yes" | "on"
-    )
-}
-
-fn maybe_emit_compat_ledgers(extensions: &[ResolvedResource]) {
-    if !compat_scan_enabled() {
-        return;
-    }
-
-    let mut enabled = extensions.iter().filter(|r| r.enabled).collect::<Vec<_>>();
-    enabled.sort_by(|left, right| left.path.cmp(&right.path));
-
-    for resource in enabled {
-        let root = if resource.path.is_dir() {
-            resource.path.clone()
-        } else {
-            resource
-                .path
-                .parent()
-                .map_or_else(|| resource.path.clone(), Path::to_path_buf)
-        };
-        let scanner = CompatibilityScanner::new(root);
-        let ledger = match scanner.scan_path(&resource.path) {
-            Ok(ledger) => ledger,
-            Err(err) => {
-                warn!(event = "ext.compat_ledger_error", error = %err);
-                continue;
-            }
-        };
-
-        if ledger.is_empty() {
-            continue;
-        }
-
-        match serde_json::to_string(&ledger) {
-            Ok(ledger_json) => {
-                info!(
-                    event = "ext.compat_ledger",
-                    schema = %ledger.schema,
-                    ledger = %ledger_json
-                );
-            }
-            Err(err) => {
-                warn!(event = "ext.compat_ledger_serialize_error", error = %err);
-            }
-        }
-    }
 }
 
 #[cfg(test)]

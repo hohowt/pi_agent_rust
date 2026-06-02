@@ -311,7 +311,7 @@ fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
     let examples_path = package_dir.join("examples").display().to_string();
 
     format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nIn addition to the tools above, you may have access to other custom tools depending on the project.\n\nGuidelines:\n{guidelines}\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: {readme_path}\n- Additional docs: {docs_path}\n- Examples: {examples_path} (extensions, custom tools, SDK)\n- When asked about: extensions (docs/extensions.md, examples/extensions/), themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), custom providers (docs/custom-provider.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
+        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nGuidelines:\n{guidelines}\n\nPi documentation (read only when the user asks about pi itself, its SDK, themes, skills, or TUI):\n- Main documentation: {readme_path}\n- Additional docs: {docs_path}\n- Examples: {examples_path} (custom tools, SDK)\n- When asked about: themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
     )
 }
 
@@ -819,7 +819,6 @@ const PROVIDER_DEFAULT_MODELS: &[(&str, &str)] = &[
     ("openai", "gpt-5.3-codex"),
     ("openai", "gpt-5.2-codex"),
     ("openai", "gpt-5.1-codex"),
-    ("amazon-bedrock", "us.anthropic.claude-opus-4-20250514-v1:0"),
     ("anthropic", "claude-opus-4-5"),
     ("azure-openai-responses", "gpt-5.2"),
     ("google", "gemini-2.5-pro"),
@@ -1231,7 +1230,6 @@ mod tests {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         }
     }
 

@@ -1,10 +1,9 @@
 use std::collections::VecDeque;
 use std::sync::Arc;
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use super::{AgentState, Cmd, EXTENSION_EVENT_TIMEOUT_MS, PiApp, PiMsg, conversation_from_session};
-use crate::extension_events::{SessionBeforeCompactOutcome, apply_session_before_compact_response};
+use super::{AgentState, Cmd, PiApp, PiMsg, conversation_from_session};
 
 /// Safely convert `Duration::as_micros()` (u128) to u64 with saturation.
 #[inline]
@@ -597,7 +596,6 @@ impl PiApp {
         let event_tx = self.event_tx.clone();
         let session = Arc::clone(&self.session);
         let agent = Arc::clone(&self.agent);
-        let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
         let reserve_tokens = self.config.compaction_reserve_tokens();
         let keep_recent_tokens = self.config.compaction_keep_recent_tokens();
@@ -607,12 +605,8 @@ impl PiApp {
         } else {
             Some(custom_instructions)
         };
-        let is_compacting = Arc::clone(&self.extension_compacting);
-
         self.agent_state = AgentState::Processing;
         self.status_message = Some("Compacting session...".to_string());
-        self.extension_compacting
-            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         runtime_handle.spawn(async move {
             let cx = asupersync::Cx::for_request();
@@ -621,7 +615,6 @@ impl PiApp {
                 let mut guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
@@ -646,7 +639,6 @@ impl PiApp {
                 ..Default::default()
             };
             let Some(prep) = crate::compaction::prepare_compaction(&path_entries, settings) else {
-                is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
                     &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
@@ -658,91 +650,35 @@ impl PiApp {
                 return;
             };
 
-            let before_outcome = if let Some(manager) = extensions.clone() {
-                let prep_value = crate::compaction::compaction_preparation_to_value(&prep);
-                let branch_entries_value =
-                    serde_json::to_value(&path_entries).unwrap_or(Value::Array(Vec::new()));
-                let mut payload = serde_json::Map::new();
-                payload.insert("preparation".to_string(), prep_value);
-                payload.insert("branchEntries".to_string(), branch_entries_value);
-                if let Some(custom_instructions) = custom_instructions.as_deref() {
-                    payload.insert(
-                        "customInstructions".to_string(),
-                        Value::String(custom_instructions.to_string()),
-                    );
-                }
-
-                let response = manager
-                    .dispatch_event_with_response(
-                        crate::extensions::ExtensionEventName::SessionBeforeCompact,
-                        Some(Value::Object(payload)),
-                        EXTENSION_EVENT_TIMEOUT_MS,
+            let result = match crate::compaction::compact(
+                prep,
+                Arc::clone(&provider),
+                &api_key,
+                custom_instructions.as_deref(),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(err) => {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &cx,
+                        PiMsg::AgentError(format!("Compaction failed: {err}")),
                     )
-                    .await
-                    .unwrap_or(None);
-                apply_session_before_compact_response(response, prep.tokens_before)
-            } else {
-                SessionBeforeCompactOutcome::default()
+                    .await;
+                    return;
+                }
             };
 
-            if before_outcome.cancel {
-                is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                let _ = crate::interactive::enqueue_pi_event(
-                    &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
-                    PiMsg::System("Compaction cancelled by extension".to_string()),
-                )
-                .await;
-                return;
-            }
-
-            let (summary, first_kept_entry_id, tokens_before, details, from_extension) =
-                if let Some(compaction) = before_outcome.compaction {
-                    (
-                        compaction.summary,
-                        compaction.first_kept_entry_id,
-                        compaction.tokens_before,
-                        compaction.details,
-                        true,
-                    )
-                } else {
-                    let result = match crate::compaction::compact(
-                        prep,
-                        Arc::clone(&provider),
-                        &api_key,
-                        custom_instructions.as_deref(),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(err) => {
-                            is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &cx,
-                                PiMsg::AgentError(format!("Compaction failed: {err}")),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-
-                    let details =
-                        crate::compaction::compaction_details_to_value(&result.details).ok();
-                    (
-                        result.summary,
-                        result.first_kept_entry_id,
-                        result.tokens_before,
-                        details,
-                        false,
-                    )
-                };
+            let summary = result.summary;
+            let first_kept_entry_id = result.first_kept_entry_id;
+            let tokens_before = result.tokens_before;
+            let details = crate::compaction::compaction_details_to_value(&result.details).ok();
 
             let (messages_for_agent, compaction_entry) = {
                 let mut guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
@@ -752,13 +688,12 @@ impl PiApp {
                         return;
                     }
                 };
-                let from_hook = if from_extension { Some(true) } else { None };
                 let entry_id = guard.append_compaction(
                     summary,
                     first_kept_entry_id,
                     tokens_before,
                     details,
-                    from_hook,
+                    None,
                 );
                 let _ = guard.save().await;
                 let compaction_entry = guard.get_entry(&entry_id).and_then(|entry| {
@@ -775,7 +710,6 @@ impl PiApp {
                 let mut agent_guard = match agent.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
@@ -792,7 +726,6 @@ impl PiApp {
                 let guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
-                        is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
                             &cx,
@@ -805,7 +738,6 @@ impl PiApp {
                 conversation_from_session(&guard)
             };
 
-            is_compacting.store(false, std::sync::atomic::Ordering::SeqCst);
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
                 &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
@@ -816,20 +748,7 @@ impl PiApp {
                 },
             )
             .await;
-
-            if let Some(manager) = extensions {
-                if let Some(compaction_entry) = compaction_entry {
-                    let _ = manager
-                        .dispatch_event(
-                            crate::extensions::ExtensionEventName::SessionCompact,
-                            Some(json!({
-                                "compactionEntry": compaction_entry,
-                                "fromExtension": from_extension,
-                            })),
-                        )
-                        .await;
-                }
-            }
+            let _ = compaction_entry;
         });
         None
     }

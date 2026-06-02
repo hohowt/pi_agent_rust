@@ -13,15 +13,15 @@ readme = "README.md"
 keywords = ["ai", "cli", "coding-agent", "llm", "anthropic"]
 categories = ["command-line-utilities", "development-tools"]
 autobins = false
+autoexamples = false
+autobenches = false
+autotests = false
 # Binary organization per bd-uuwgi.1/bd-uuwgi.2 classification:
 # - SHIPPING: src/main.rs (pi) - main CLI binary
 # - RETIRABLE: src/bin/pi_legacy_capture.rs (pending RULE 1 approval)
 # - DEV-ONLY: moved to examples/ (21 files: ext_*, test_*, debug utilities)
 include = [
-    "docs/extension-artifact-provenance.json",
-    "docs/wit/extension.wit",
     "docs/provider-upstream-model-ids-snapshot.json",
-    "docs/schema/extension_protocol.json",
     "legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts",
     "Cargo.toml",
     "LICENSE",
@@ -30,124 +30,23 @@ include = [
     # src/interactive/commands.rs and src/interactive.rs — without it the
     # `cargo publish --dry-run` verify step fails to build the packaged tarball.
     "CHANGELOG.md",
-    "build.rs",
     "src/**",
 ]
 
 [lib]
 name = "pi"
 path = "src/lib.rs"
+test = false
+doctest = false
 
 [[bin]]
 name = "pi"
 path = "src/main.rs"
-
-# RETIRABLE binary (pending RULE 1 approval)
-# Legacy capture functionality - 91KB, last modified 2026-03-12
-# Candidate for removal per binary classification bd-uuwgi.1
-[[bin]]
-name = "pi_legacy_capture"
-path = "src/bin/pi_legacy_capture.rs"
-
-# Examples (moved from src/bin/ to examples/)
-# These binaries are accessible via: cargo run --example <name>
-
-[[example]]
-name = "basic_sdk"
-path = "examples/basic_sdk.rs"
-
-[[example]]
-name = "ext_artifact_manifest"
-path = "examples/ext_artifact_manifest.rs"
-
-[[example]]
-name = "ext_conformance_matrix"
-path = "examples/ext_conformance_matrix.rs"
-
-[[example]]
-name = "ext_conformance_report"
-path = "examples/ext_conformance_report.rs"
-
-[[example]]
-name = "ext_full_validation"
-path = "examples/ext_full_validation.rs"
-
-[[example]]
-name = "ext_inclusion_list"
-path = "examples/ext_inclusion_list.rs"
-
-[[example]]
-name = "ext_license_screen"
-path = "examples/ext_license_screen.rs"
-
-[[example]]
-name = "ext_onboarding_queue"
-path = "examples/ext_onboarding_queue.rs"
-
-[[example]]
-name = "ext_popularity_snapshot"
-path = "examples/ext_popularity_snapshot.rs"
-
-[[example]]
-name = "ext_release_binary_e2e"
-path = "examples/ext_release_binary_e2e.rs"
-
-[[example]]
-name = "ext_runtime_risk_ledger"
-path = "examples/ext_runtime_risk_ledger.rs"
-
-[[example]]
-name = "ext_score_candidates"
-path = "examples/ext_score_candidates.rs"
-
-[[example]]
-name = "ext_stress"
-path = "examples/ext_stress.rs"
-
-[[example]]
-name = "ext_tiered_corpus"
-path = "examples/ext_tiered_corpus.rs"
-
-[[example]]
-name = "ext_unvendored_fetch_run"
-path = "examples/ext_unvendored_fetch_run.rs"
-
-[[example]]
-name = "ext_validate_dedup"
-path = "examples/ext_validate_dedup.rs"
-
-[[example]]
-name = "ext_workloads"
-path = "examples/ext_workloads.rs"
-
-[[example]]
-name = "pi_debug"
-path = "examples/pi_debug.rs"
-
-[[example]]
-name = "pijs_workload"
-path = "examples/pijs_workload.rs"
-
-[[example]]
-name = "session_workload_bench"
-path = "examples/session_workload_bench.rs"
-
-[[example]]
-name = "test_duration"
-path = "examples/test_duration.rs"
-
-[[example]]
-name = "test_infinite_loop"
-path = "examples/test_infinite_loop.rs"
-
-[[example]]
-name = "test_time"
-path = "examples/test_time.rs"
+test = false
 
 [dependencies]
 # CLI
 clap = { version = "4.5.60", features = ["derive", "env", "string"] }
-clap_complete = "4.5.66"
 
 # Async runtime
 asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots", "test-internals"] }
@@ -190,8 +89,7 @@ fs4 = "0.13"
 glob = "0.3"
 ignore = "0.4"
 crossbeam-queue = "0.3"
-sqlmodel-sqlite = { version = "0.2.2" }
-sqlmodel-core = { version = "0.2.2" }
+rusqlite = "0.37"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -206,159 +104,40 @@ memchr = "2.8.0"
 base64 = "0.22"
 flate2 = "1.1.9"
 sha2 = "0.10"
-sha1 = "0.10"
-md-5 = "0.10"
-hmac = "0.12"
-pbkdf2 = { version = "0.12.2", features = ["hmac"] }
-scrypt = { version = "0.11.0", default-features = false }
-getrandom = "0.4.1"
 regex = "1.12.3"
-ring = "0.17.14"
-semver = "1.0.27"
 crc32c = "0.6"
-ast-grep-core = "0.40"
-ast-grep-language = { version = "0.40", default-features = false, features = [
-    "tree-sitter-bash",
-    "tree-sitter-python",
-    "tree-sitter-javascript",
-    "tree-sitter-typescript",
-    "tree-sitter-ruby",
-] }
 unicode-normalization = "0.1"
 xxhash-rust = { version = "0.8", features = ["xxh32"] }
 similar = "2"
 sysinfo = "0.38.2"
-rquickjs = { version = "0.11", features = ["futures", "loader"] }
-swc_common = "18.0.1"
-swc_ecma_codegen = "23.0.0"
-swc_ecma_ast = "20.0.1"
-swc_ecma_parser = "34.0.0"
-swc_ecma_transforms_base = "37.0.0"
-swc_ecma_transforms_typescript = "41.0.0"
-swc_ecma_visit = "20.0.0"
-wasmtime = { version = "41.0.3", features = ["component-model"], optional = true }
 
 # Image processing (optional)
 image = { version = "0.25", optional = true }
-
-[build-dependencies]
-vergen-gix = { version = "9.1.0", features = ["build", "cargo", "rustc"] }
-
-[dev-dependencies]
-arbitrary = { version = "1", features = ["derive"] }
-pretty_assertions = "1"
-insta = { version = "1", features = ["filters"] }
-tempfile = "3.25.0"
-asupersync = { version = "=0.3.2", default-features = false, features = ["test-internals"] }
-filetime = "0.2.27"
-criterion = { version = "0.8.2", features = ["html_reports"] }
-jsonschema = { version = "0.42.0", default-features = false }
-proptest = "1.10.0"
-wat = "1.245.1"
-toml = "1.0.3"
-loom = "0.7.2"
-
-[[bench]]
-name = "tools"
-harness = false
-
-[[bench]]
-name = "extensions"
-harness = false
-
-[[bench]]
-name = "extension_budget_inputs"
-harness = false
-
-[[bench]]
-name = "semantic_context"
-harness = false
-
-[[bench]]
-name = "system"
-harness = false
-
-[[bench]]
-name = "tui_perf"
-harness = false
-
-# Gap H: jemalloc for 10-20% allocation-heavy path improvement.
-# Keep the global jemalloc override to targets where tikv-jemallocator is a
-# supported allocator choice. BSD-family targets stay on the platform allocator.
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-tikv-jemallocator = { version = "0.6", optional = true }
-
-# FreeBSD: third-party libs live under /usr/local and rquickjs-sys doesn't
-# ship pre-generated bindings for this target, so regenerate at build time
-# via the `bindgen` feature (uses /usr/bin/clang from the base system).
-[target.'cfg(target_os = "freebsd")'.dependencies]
-rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
-
-# Android (including Termux on-device): rquickjs-sys 0.11 ships pre-generated
-# bindings for aarch64-linux-android only for some Cargo versions and not
-# others; the canonical fix is to regenerate via the `bindgen` feature so we
-# stop depending on a missing bindings/aarch64-linux-android.rs in the
-# upstream crate. Termux ships clang under $PREFIX/bin which bindgen picks
-# up automatically.
-[target.'cfg(target_os = "android")'.dependencies]
-rquickjs = { version = "0.11", features = ["futures", "loader", "bindgen"] }
 
 [features]
 default = ["sqlite-sessions"]
 full = [
     "image-resize",
-    "jemalloc",
     "clipboard",
-    "wasm-host",
     "sqlite-sessions",
     "syntax-highlighting",
     "rich_rust/full",
 ]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
-wasm-host = ["dep:wasmtime"]
 sqlite-sessions = []
 syntax-highlighting = ["rich_rust/syntax"]
-ext-conformance = []
-fuzzing = []
-# Opt-in loom model-checking lane. These tests are excluded from default
-# all-target gates because loom explores scheduler interleavings aggressively.
-loom-tests = []
-# Opt-in wall-clock/process timing regressions. These are intentionally
-# excluded from default test gates because scheduler-sensitive coverage should
-# use deterministic clocks.
-manual-timing-tests = []
-jemalloc = ["dep:tikv-jemallocator"]
-
-[[test]]
-name = "hostcall_queue_loom"
-path = "tests/hostcall_queue_loom.rs"
-required-features = ["loom-tests"]
 
 [profile.release]
 opt-level = "z"
 lto = true
-codegen-units = 1
+codegen-units = 12
 panic = "abort"
 strip = true
 
 [profile.dev]
 opt-level = 0
 debug = true
-
-[profile.test]
-# Full-suite RCH workers have limited artifact storage; keep test binaries
-# debuggable enough for line traces without emitting full debug sections.
-debug = "line-tables-only"
-incremental = false
-
-# Performance benchmarking profile: opt-level=3, with debug info.
-[profile.perf]
-inherits = "release"
-opt-level = 3
-lto = "thin"
-debug = 1
-strip = false
 
 [lints.rust]
 unsafe_code = "forbid"
@@ -375,7 +154,7 @@ module_name_repetitions = "allow"
 # Local development with sibling crates
 # ---------------------------------------------------------------------------
 # This project depends on published crates.io versions of asupersync,
-# rich_rust, charmed-*, and sqlmodel-*. CI builds verify this (no sibling
+# rich_rust, and charmed-*. CI builds verify this (no sibling
 # repos are checked out).
 #
 # To develop against LOCAL checkouts of these crates, uncomment the
@@ -396,5 +175,3 @@ module_name_repetitions = "allow"
 # charmed-bubbles = { path = "../charmed_rust/crates/bubbles" }
 # charmed-glamour = { path = "../charmed_rust/crates/glamour" }
 # charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
-# sqlmodel-core = { path = "../sqlmodel_rust/crates/sqlmodel-core" }
-# sqlmodel-sqlite = { path = "../sqlmodel_rust/crates/sqlmodel-sqlite" }

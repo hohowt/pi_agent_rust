@@ -299,7 +299,6 @@ fn oai_compatible_defaults_use_known_api_family() {
         "google-generative-ai",
         // Native provider API families:
         "google-vertex",
-        "bedrock-converse-stream",
         "gitlab-chat",
         "copilot-openai",
     ];
@@ -499,37 +498,6 @@ fn factory_dispatches_native_established_providers() {
     let p = create_provider(&cohere_entry, None).expect("cohere factory");
     assert_eq!(p.api(), "cohere-chat");
 
-    // Amazon Bedrock
-    let bedrock_entry = {
-        use pi::provider::{InputType, Model, ModelCost};
-        pi::models::ModelEntry {
-            model: Model {
-                id: "anthropic.claude-3-5-sonnet-20240620-v1:0".to_string(),
-                name: "Claude Sonnet via Bedrock".to_string(),
-                api: "bedrock-converse-stream".to_string(),
-                provider: "amazon-bedrock".to_string(),
-                base_url: "https://bedrock-runtime.us-east-1.amazonaws.com".to_string(),
-                reasoning: true,
-                input: vec![InputType::Text],
-                cost: ModelCost {
-                    input: 0.0,
-                    output: 0.0,
-                    cache_read: 0.0,
-                    cache_write: 0.0,
-                },
-                context_window: 200_000,
-                max_tokens: 8_192,
-                headers: std::collections::HashMap::new(),
-            },
-            api_key: Some("test-bedrock-token".to_string()),
-            headers: std::collections::HashMap::new(),
-            auth_header: false,
-            compat: None,
-            oauth_config: None,
-        }
-    };
-    let p = create_provider(&bedrock_entry, None).expect("bedrock factory");
-    assert_eq!(p.api(), "bedrock-converse-stream");
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -642,7 +610,6 @@ fn canonical_id_snapshot_detects_additions_and_removals() {
         "alibaba",
         "alibaba-cn",
         "alibaba-us",
-        "amazon-bedrock",
         "anthropic",
         "azure-openai",
         "bailing",
@@ -758,7 +725,6 @@ fn alias_mapping_snapshot_is_current() {
         ("azure-cognitive-services", "azure-openai"),
         ("azure-openai-responses", "azure-openai"),
         ("azure_openai", "azure-openai"),
-        ("bedrock", "amazon-bedrock"),
         ("chatgpt-codex", "openai-codex"),
         ("codex", "openai-codex"),
         ("copilot", "github-copilot"),

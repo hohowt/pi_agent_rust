@@ -158,7 +158,7 @@ impl PiApp {
             return;
         }
 
-        let provider_impl = match providers::create_provider(&next, self.extensions.as_ref()) {
+        let provider_impl = match providers::create_provider(&next) {
             Ok(p) => p,
             Err(err) => {
                 self.status_message = Some(err.to_string());
@@ -411,7 +411,6 @@ mod tests {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         }
     }
 
@@ -427,11 +426,9 @@ mod tests {
         let resource_cli = ResourceCliOptions {
             no_skills: false,
             no_prompt_templates: false,
-            no_extensions: false,
             no_themes: false,
             skill_paths: Vec::new(),
             prompt_paths: Vec::new(),
-            extension_paths: Vec::new(),
             theme_paths: Vec::new(),
         };
         let (event_tx, _event_rx) = mpsc::channel(64);

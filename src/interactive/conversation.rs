@@ -212,7 +212,7 @@ pub fn conversation_from_session(session: &Session) -> (Vec<ConversationMessage>
     (messages, usage)
 }
 
-pub(super) fn extension_model_from_entry(entry: &ModelEntry) -> Value {
+pub(super) fn model_entry_to_json(entry: &ModelEntry) -> Value {
     let api_key_present = entry
         .api_key
         .as_ref()
@@ -465,10 +465,10 @@ mod tests {
         assert_eq!(total.input, u64::MAX);
     }
 
-    // ── extension_model_from_entry ──────────────────────────────────────
+    // ── model_entry_to_json ─────────────────────────────────────────────
 
     #[test]
-    fn extension_model_json_structure() {
+    fn model_entry_json_structure() {
         use crate::models::ModelEntry;
         use crate::provider::{InputType, Model, ModelCost};
 
@@ -495,9 +495,8 @@ mod tests {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         };
-        let json = extension_model_from_entry(&entry);
+        let json = model_entry_to_json(&entry);
         assert_eq!(json["provider"], "openai");
         assert_eq!(json["id"], "gpt-4");
         assert_eq!(json["reasoning"], true);
@@ -506,7 +505,7 @@ mod tests {
     }
 
     #[test]
-    fn extension_model_json_treats_blank_key_as_missing() {
+    fn model_entry_json_treats_blank_key_as_missing() {
         use crate::models::ModelEntry;
         use crate::provider::{InputType, Model, ModelCost};
 
@@ -533,10 +532,9 @@ mod tests {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         };
 
-        let json = extension_model_from_entry(&entry);
+        let json = model_entry_to_json(&entry);
         assert_eq!(json["apiKeyPresent"], false);
     }
 

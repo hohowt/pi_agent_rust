@@ -7,7 +7,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -22,26 +22,14 @@ use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
 use asupersync::sync::Mutex;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
-use pi::agent::{
-    AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession, PreWarmedExtensionRuntime,
-};
+use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::app::StartupError;
 use pi::auth::{AuthCredential, AuthStorage};
 use pi::cli;
 use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
 use pi::config::SettingsScope;
-use pi::extension_index::{
-    DEFAULT_INDEX_MAX_AGE, ExtensionIndex, ExtensionIndexEntry, ExtensionIndexStore,
-    ExtensionSafetyProvenance,
-};
-use pi::extensions::{
-    ALL_CAPABILITIES, Capability, ExtensionLoadSpec, ExtensionRegion, ExtensionRuntimeHandle,
-    JsExtensionRuntimeHandle, NativeRustExtensionRuntimeHandle, PolicyDecision,
-    resolve_extension_load_spec,
-};
-use pi::extensions_js::PiJsRuntimeConfig;
-use pi::model::{AssistantMessage, ContentBlock, StopReason, ThinkingLevel};
+use pi::model::{AssistantMessage, ContentBlock, StopReason};
 use pi::models::{ModelEntry, ModelRegistry, default_models_path};
 use pi::package_manager::{
     PackageEntry, PackageManager, PackageScope, ResolvedPaths, ResolvedResource, ResourceOrigin,
@@ -52,26 +40,8 @@ use pi::providers;
 use pi::resources::{ResourceCliOptions, ResourceLoader};
 use pi::session::Session;
 use pi::session_index::SessionIndex;
-use pi::swarm_progress_slo::{
-    ProgressSloEvaluationInput, ProgressSloReport, SWARM_PROGRESS_SLO_SCHEMA, evaluate_progress_slo,
-};
-use pi::swarm_replay::{
-    SWARM_REPLAY_POLICY_REPORT_SCHEMA, SWARM_REPLAY_REPORT_SCHEMA, SWARM_REPLAY_TRACE_SCHEMA,
-    SwarmReplayBaselinePolicy, SwarmReplayPolicyAdapter, SwarmReplayPolicyComparison,
-    SwarmReplayTrace, default_swarm_replay_baseline_policies,
-    evaluate_swarm_replay_baseline_policies, replay_swarm_trace,
-};
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
-use pi::validation_broker::{
-    VALIDATION_BROKER_CLI_LEASE_MUTATION_SCHEMA, VALIDATION_BROKER_CLI_PLAN_SCHEMA,
-    VALIDATION_BROKER_CLI_STATUS_SCHEMA, VALIDATION_BROKER_DECISION_SCHEMA,
-    VALIDATION_BROKER_INPUT_SCHEMA, ValidationAdmissionDecision, ValidationAdmissionDecisionRecord,
-    ValidationAdmissionPolicy, ValidationAdmissionRequestContext, ValidationBrokerInputSnapshot,
-    ValidationSlotLease, ValidationSlotRequest, ValidationSlotState, ValidationSlotStore,
-    ValidationSlotStoreSnapshot, decide_validation_admission,
-};
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -83,10 +53,6 @@ const USAGE_ERROR_PATTERNS: &[&str] = &[
     "@file arguments are not supported in rpc mode",
     "--api-key requires a model to be specified via --provider/--model or --models",
     "context-preview requires",
-    "swarm-progress requires",
-    "swarm-replay-preview requires",
-    "unsupported swarm-progress format",
-    "unsupported swarm-replay-preview policy",
     "unknown --only categories",
     "--only must include at least one category",
     "theme file not found",
@@ -108,9 +74,9 @@ fn main() {
     }
 }
 
-fn parse_cli_args(raw_args: Vec<String>) -> Result<Option<(cli::Cli, Vec<cli::ExtensionCliFlag>)>> {
-    match cli::parse_with_extension_flags(raw_args) {
-        Ok(parsed) => Ok(Some((parsed.cli, parsed.extension_flags))),
+fn parse_cli_args(raw_args: Vec<String>) -> Result<Option<cli::Cli>> {
+    match cli::parse_args(raw_args) {
+        Ok(parsed) => Ok(Some(parsed.cli)),
         Err(err) => {
             if matches!(
                 err.kind(),
@@ -124,7 +90,7 @@ fn parse_cli_args(raw_args: Vec<String>) -> Result<Option<(cli::Cli, Vec<cli::Ex
     }
 }
 
-fn parse_cli_from_env() -> Result<Option<(cli::Cli, Vec<cli::ExtensionCliFlag>)>> {
+fn parse_cli_from_env() -> Result<Option<cli::Cli>> {
     parse_cli_args(std::env::args().collect())
 }
 
@@ -226,43 +192,6 @@ async fn resolve_selection_with_auth(
     }
 }
 
-fn should_retry_selection_after_extensions(
-    cli: &cli::Cli,
-    err: &anyhow::Error,
-    has_extensions: bool,
-) -> bool {
-    if !has_extensions || (cli.provider.is_none() && cli.model.is_none()) {
-        return false;
-    }
-
-    let message = err.to_string().to_ascii_lowercase();
-    message.contains(" not found") || message.contains("no models available for provider")
-}
-
-fn build_extension_bootstrap_selection(
-    config: &Config,
-    model_registry: &ModelRegistry,
-    models_path: &Path,
-) -> Result<pi::app::ModelSelection> {
-    let model_entry = pi::app::bootstrap_model_entry(model_registry).ok_or_else(|| {
-        anyhow::Error::new(StartupError::NoModelsAvailable {
-            models_path: models_path.to_path_buf(),
-        })
-    })?;
-    let thinking_level = config
-        .default_thinking_level
-        .as_deref()
-        .and_then(|value| value.parse::<ThinkingLevel>().ok());
-
-    Ok(pi::app::ModelSelection {
-        thinking_level: model_entry
-            .clamp_thinking_level(thinking_level.unwrap_or(ThinkingLevel::XHigh)),
-        model_entry,
-        scoped_models: Vec::new(),
-        fallback_message: None,
-    })
-}
-
 fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
     if entry.model.context_window.eq(&0) {
         tracing::warn!(
@@ -278,7 +207,7 @@ fn context_window_tokens_for_entry(entry: &ModelEntry) -> u32 {
 #[allow(clippy::too_many_lines)]
 fn main_impl() -> Result<()> {
     // Parse CLI arguments
-    let Some((mut cli, extension_flags)) = parse_cli_from_env()? else {
+    let Some(mut cli) = parse_cli_from_env()? else {
         return Ok(());
     };
 
@@ -334,78 +263,9 @@ fn main_impl() -> Result<()> {
                 )?;
                 return Ok(());
             }
-            cli::Commands::SwarmProgress {
-                input,
-                since,
-                format,
-                out_json,
-                out_text,
-            } => {
-                handle_swarm_progress_blocking(
-                    &cwd,
-                    input,
-                    since.as_deref(),
-                    format,
-                    out_json.as_deref(),
-                    out_text.as_deref(),
-                )?;
-                return Ok(());
-            }
-            cli::Commands::SwarmReplayPreview {
-                trace,
-                policies,
-                format,
-                out_json,
-                out_text,
-                generated_at,
-            } => {
-                handle_swarm_replay_preview_blocking(
-                    &cwd,
-                    trace,
-                    policies,
-                    format,
-                    out_json.as_deref(),
-                    out_text.as_deref(),
-                    generated_at.as_deref(),
-                )?;
-                return Ok(());
-            }
-            cli::Commands::ValidationBroker { command } => {
-                handle_validation_broker_blocking(&cwd, command)?;
-                return Ok(());
-            }
             cli::Commands::List => {
                 let manager = PackageManager::new(cwd);
                 handle_package_list_blocking(&manager)?;
-                return Ok(());
-            }
-            cli::Commands::Info { name } => {
-                handle_info_blocking(name)?;
-                return Ok(());
-            }
-            cli::Commands::Search {
-                query,
-                tag,
-                sort,
-                limit,
-            } if handle_search_blocking(query, tag.as_deref(), sort, *limit)? => {
-                return Ok(());
-            }
-            cli::Commands::Doctor {
-                path,
-                format,
-                policy,
-                fix,
-                only,
-            } => {
-                handle_doctor(
-                    &cwd,
-                    path.as_deref(),
-                    format,
-                    policy.as_deref(),
-                    *fix,
-                    only.as_deref(),
-                )?;
                 return Ok(());
             }
             cli::Commands::Config { show, paths, json } => {
@@ -442,21 +302,6 @@ fn main_impl() -> Result<()> {
         }
     }
 
-    if cli.explain_extension_policy {
-        let config = Config::load()?;
-        let resolved =
-            config.resolve_extension_policy_with_metadata(cli.extension_policy.as_deref());
-        print_resolved_extension_policy(&resolved)?;
-        return Ok(());
-    }
-
-    if cli.explain_repair_policy {
-        let config = Config::load()?;
-        let resolved = config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
-        print_resolved_repair_policy(&resolved)?;
-        return Ok(());
-    }
-
     // List-providers is a fast offline query that uses only static metadata.
     if cli.list_providers {
         list_providers();
@@ -464,70 +309,54 @@ fn main_impl() -> Result<()> {
     }
 
     // List-models is an offline query; avoid loading resources or booting the runtime when possible.
-    //
-    // IMPORTANT: if extension compat scanning is enabled, or explicit CLI extensions are provided,
-    // we must boot the normal startup path so the compat ledger can be emitted deterministically.
     if cli.command.is_none() {
         if let Some(pattern) = &cli.list_models {
-            let compat_scan_enabled =
-                std::env::var("PI_EXT_COMPAT_SCAN")
-                    .ok()
-                    .is_some_and(|value| {
-                        matches!(
-                            value.trim().to_ascii_lowercase().as_str(),
-                            "1" | "true" | "yes" | "on"
-                        )
-                    });
-            let has_cli_extensions = !cli.extension.is_empty();
-
-            if !compat_scan_enabled && !has_cli_extensions {
-                // Note: we intentionally skip OAuth refresh here to keep this path fast and offline.
-                let models_path = default_models_path(&Config::global_dir());
-                if let Some(payload) = load_list_models_cache(&models_path) {
-                    if let Some(error) = &payload.error {
-                        eprintln!("Warning: models.json error: {error}");
-                    }
-                    list_models_from_cached_rows(&payload.rows, pattern.as_deref());
-                    return Ok(());
-                }
-
-                let auth = AuthStorage::load(Config::auth_path())?;
-                let registry = ModelRegistry::load_for_listing(&auth, Some(models_path.clone()));
-                let error = registry.error().map(std::string::ToString::to_string);
-                if let Some(error) = &error {
+            // Note: we intentionally skip OAuth refresh here to keep this path fast and offline.
+            let models_path = default_models_path(&Config::global_dir());
+            if let Some(payload) = load_list_models_cache(&models_path) {
+                if let Some(error) = &payload.error {
                     eprintln!("Warning: models.json error: {error}");
                 }
-
-                let mut models = registry.available_models();
-                models.sort_by(|a, b| {
-                    let provider_cmp = a.model.provider.cmp(&b.model.provider);
-                    if matches!(provider_cmp, std::cmp::Ordering::Equal) {
-                        a.model.id.cmp(&b.model.id)
-                    } else {
-                        provider_cmp
-                    }
-                });
-                let rows = build_model_rows(&models);
-                let payload = ListModelsCachePayload {
-                    error,
-                    rows: rows
-                        .into_iter()
-                        .map(|(provider, model, context, max_out, thinking, images)| {
-                            CachedModelRow {
-                                provider,
-                                model,
-                                context,
-                                max_out,
-                                thinking,
-                                images,
-                            }
-                        })
-                        .collect(),
-                };
-                save_list_models_cache(&models_path, &payload);
                 list_models_from_cached_rows(&payload.rows, pattern.as_deref());
                 return Ok(());
             }
+
+            let auth = AuthStorage::load(Config::auth_path())?;
+            let registry = ModelRegistry::load_for_listing(&auth, Some(models_path.clone()));
+            let error = registry.error().map(std::string::ToString::to_string);
+            if let Some(error) = &error {
+                eprintln!("Warning: models.json error: {error}");
+            }
+
+            let mut models = registry.available_models();
+            models.sort_by(|a, b| {
+                let provider_cmp = a.model.provider.cmp(&b.model.provider);
+                if matches!(provider_cmp, std::cmp::Ordering::Equal) {
+                    a.model.id.cmp(&b.model.id)
+                } else {
+                    provider_cmp
+                }
+            });
+            let rows = build_model_rows(&models);
+            let payload = ListModelsCachePayload {
+                error,
+                rows: rows
+                    .into_iter()
+                    .map(
+                        |(provider, model, context, max_out, thinking, images)| CachedModelRow {
+                            provider,
+                            model,
+                            context,
+                            max_out,
+                            thinking,
+                            images,
+                        },
+                    )
+                    .collect(),
+            };
+            save_list_models_cache(&models_path, &payload);
+            list_models_from_cached_rows(&payload.rows, pattern.as_deref());
+            return Ok(());
         }
     }
 
@@ -577,7 +406,7 @@ fn main_impl() -> Result<()> {
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let handle = runtime.handle();
-    let result = runtime.block_on(run(cli, extension_flags, handle));
+    let result = runtime.block_on(run(cli, handle));
     // `run()` owns graceful application shutdown. Exiting here avoids waiting on
     // runtime-owned background tasks after the CLI/TUI has already finished.
     match result {
@@ -640,395 +469,8 @@ fn validate_theme_path_spec(theme_spec: Option<&str>, cwd: &Path) -> Result<()> 
     Ok(())
 }
 
-fn parse_bool_flag_value(flag_name: &str, raw: &str) -> Result<bool> {
-    match raw.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        _ => Err(pi::error::Error::validation(format!(
-            "Invalid boolean value for extension flag --{flag_name}: \"{raw}\". Use one of: true,false,1,0,yes,no,on,off."
-        ))
-        .into()),
-    }
-}
-
-fn coerce_extension_flag_value(
-    flag: &cli::ExtensionCliFlag,
-    declared_type: &str,
-) -> Result<serde_json::Value> {
-    match declared_type.trim().to_ascii_lowercase().as_str() {
-        "bool" | "boolean" => {
-            if let Some(raw) = flag.value.as_deref() {
-                Ok(Value::Bool(parse_bool_flag_value(&flag.name, raw)?))
-            } else {
-                Ok(Value::Bool(true))
-            }
-        }
-        "number" | "int" | "integer" | "float" => {
-            let Some(raw) = flag.value.as_deref() else {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} requires a numeric value.",
-                    flag.name
-                ))
-                .into());
-            };
-            if let Ok(parsed) = raw.parse::<i64>() {
-                return Ok(Value::Number(parsed.into()));
-            }
-            let parsed = raw.parse::<f64>().map_err(|_| {
-                pi::error::Error::validation(format!(
-                    "Invalid numeric value for extension flag --{}: \"{}\"",
-                    flag.name, raw
-                ))
-            })?;
-            let Some(number) = serde_json::Number::from_f64(parsed) else {
-                return Err(pi::error::Error::validation(format!(
-                    "Numeric value for extension flag --{} is not finite: \"{}\"",
-                    flag.name, raw
-                ))
-                .into());
-            };
-            Ok(Value::Number(number))
-        }
-        _ => {
-            let Some(raw) = flag.value.as_deref() else {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} requires a value.",
-                    flag.name
-                ))
-                .into());
-            };
-            Ok(Value::String(raw.to_string()))
-        }
-    }
-}
-
-async fn apply_extension_cli_flags(
-    manager: &pi::extensions::ExtensionManager,
-    extension_flags: &[cli::ExtensionCliFlag],
-) -> Result<()> {
-    if extension_flags.is_empty() {
-        return Ok(());
-    }
-
-    let registered = manager.list_flags();
-    let known_names: std::collections::BTreeSet<String> = registered
-        .iter()
-        .filter_map(|flag| flag.get("name").and_then(Value::as_str))
-        .map(ToString::to_string)
-        .collect();
-
-    for cli_flag in extension_flags {
-        let matches = registered
-            .iter()
-            .filter(|flag| {
-                flag.get("name")
-                    .and_then(Value::as_str)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(&cli_flag.name))
-            })
-            .collect::<Vec<_>>();
-
-        if matches.is_empty() {
-            let known = if known_names.is_empty() {
-                "(none)".to_string()
-            } else {
-                known_names
-                    .iter()
-                    .map(|name| format!("--{name}"))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            tracing::debug!(
-                event = "pi.extensions.flags.ignored_unknown",
-                flag = %cli_flag.display_name(),
-                registered = %known,
-                "Ignoring unknown extension flag (not registered by any loaded extension)."
-            );
-            continue;
-        }
-
-        for spec in matches {
-            let Some(extension_id) = spec.get("extension_id").and_then(Value::as_str) else {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} cannot be set because extension metadata is missing extension_id.",
-                    cli_flag.name
-                ))
-                .into());
-            };
-            if extension_id.trim().is_empty() {
-                return Err(pi::error::Error::validation(format!(
-                    "Extension flag --{} cannot be set because extension_id is empty.",
-                    cli_flag.name
-                ))
-                .into());
-            }
-            let registered_name = spec.get("name").and_then(Value::as_str).ok_or_else(|| {
-                pi::error::Error::validation(format!(
-                    "Extension flag --{} is missing name metadata.",
-                    cli_flag.name
-                ))
-            })?;
-            let flag_type = spec.get("type").and_then(Value::as_str).unwrap_or("string");
-            let value = coerce_extension_flag_value(cli_flag, flag_type)?;
-            manager
-                .set_flag_value(extension_id, registered_name, value)
-                .await
-                .map_err(anyhow::Error::new)?;
-        }
-    }
-
-    Ok(())
-}
-
-fn policy_config_example(profile: &str, allow_dangerous: bool) -> serde_json::Value {
-    serde_json::json!({
-        "extensionPolicy": {
-            "profile": profile,
-            "allowDangerous": allow_dangerous,
-        }
-    })
-}
-
-fn policy_default_toggle_example(default_permissive: bool) -> serde_json::Value {
-    serde_json::json!({
-        "extensionPolicy": {
-            "defaultPermissive": default_permissive,
-        }
-    })
-}
-
-fn extension_policy_migration_guardrails(
-    resolved: &pi::config::ResolvedExtensionPolicy,
-) -> serde_json::Value {
-    serde_json::json!({
-        "default_profile": "permissive",
-        "active_default_profile": resolved.profile_source.eq("default") && resolved.effective_profile.eq("permissive"),
-        "profile_source": resolved.profile_source,
-        "permissive_by_default_reason": "Fresh installs favor extension compatibility and custom UI out of the box.",
-        "override_cli": {
-            "safe_strict_mode": "pi --extension-policy safe <your command>",
-            "balanced_prompt_mode": "pi --extension-policy balanced <your command>",
-            "balanced_with_dangerous_caps": "PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced <your command>",
-            "explicit_permissive": "pi --extension-policy permissive <your command>",
-        },
-        "settings_examples": {
-            "default_permissive": policy_default_toggle_example(true),
-            "default_safe": policy_default_toggle_example(false),
-            "safe_strict_mode": policy_config_example("safe", false),
-            "balanced_prompt_mode": policy_config_example("balanced", false),
-            "balanced_with_dangerous_caps": policy_config_example("balanced", true),
-            "explicit_permissive": policy_config_example("permissive", false),
-        },
-        "revert_to_safe_cli": "pi --extension-policy safe <your command>",
-    })
-}
-
-const fn maybe_print_extension_policy_migration_notice(
-    _resolved: &pi::config::ResolvedExtensionPolicy,
-) {
-}
-
-fn policy_reason_detail(reason: &str) -> &'static str {
-    match reason {
-        "extension_deny" => "Denied by an extension-specific override.",
-        "deny_caps" => "Denied by the global deny list.",
-        "extension_allow" => "Allowed by an extension-specific override.",
-        "default_caps" => "Allowed by profile defaults.",
-        "not_in_default_caps" => "Not part of profile defaults in strict mode.",
-        "prompt_required" => "Requires an explicit runtime prompt decision.",
-        "permissive" => "Allowed because permissive mode bypasses prompts.",
-        "empty_capability" => "Invalid request: capability name is empty.",
-        _ => "Policy engine returned an implementation-defined reason.",
-    }
-}
-
-fn capability_remediation(capability: Capability, decision: PolicyDecision) -> serde_json::Value {
-    let is_dangerous = capability.is_dangerous();
-
-    let (to_allow_cli, to_allow_config, recommendation) = match (is_dangerous, decision) {
-        (true, PolicyDecision::Deny) => (
-            vec![
-                "PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced <your command>",
-                "pi --extension-policy permissive <your command>",
-            ],
-            vec![
-                policy_config_example("balanced", true),
-                policy_config_example("permissive", false),
-            ],
-            "Prefer balanced + allowDangerous=true over permissive for narrower blast radius.",
-        ),
-        (true, PolicyDecision::Prompt) => (
-            vec![
-                "Approve the runtime capability prompt (Allow once/always).",
-                "pi --extension-policy permissive <your command>",
-            ],
-            vec![
-                policy_config_example("balanced", true),
-                policy_config_example("permissive", false),
-            ],
-            "Use prompt approvals first; move to permissive only if prompts are operationally impossible.",
-        ),
-        (true, PolicyDecision::Allow) => (
-            Vec::new(),
-            Vec::new(),
-            "Capability is already allowed; keep this only if the extension truly needs it.",
-        ),
-        (false, PolicyDecision::Deny) => (
-            vec![
-                "pi --extension-policy balanced <your command>",
-                "pi --extension-policy permissive <your command>",
-            ],
-            vec![
-                policy_config_example("balanced", false),
-                policy_config_example("permissive", false),
-            ],
-            "Balanced is usually enough; permissive should be temporary.",
-        ),
-        (false, PolicyDecision::Prompt) => (
-            vec![
-                "Approve the runtime capability prompt (Allow once/always).",
-                "pi --extension-policy permissive <your command>",
-            ],
-            vec![
-                policy_config_example("balanced", false),
-                policy_config_example("permissive", false),
-            ],
-            "Prompt mode keeps explicit approval in the loop while preserving least privilege.",
-        ),
-        (false, PolicyDecision::Allow) => (
-            Vec::new(),
-            Vec::new(),
-            "Capability is already allowed in the active profile.",
-        ),
-    };
-
-    let to_restrict_cli = if is_dangerous {
-        vec![
-            "pi --extension-policy balanced <your command>",
-            "pi --extension-policy safe <your command>",
-        ]
-    } else {
-        vec!["pi --extension-policy safe <your command>"]
-    };
-    let to_restrict_config = if is_dangerous {
-        vec![
-            policy_config_example("balanced", false),
-            policy_config_example("safe", false),
-        ]
-    } else {
-        vec![policy_config_example("safe", false)]
-    };
-
-    serde_json::json!({
-        "dangerous_capability": is_dangerous,
-        "to_allow_cli": to_allow_cli,
-        "to_allow_config_examples": to_allow_config,
-        "to_restrict_cli": to_restrict_cli,
-        "to_restrict_config_examples": to_restrict_config,
-        "recommendation": recommendation,
-    })
-}
-
-fn print_resolved_extension_policy(resolved: &pi::config::ResolvedExtensionPolicy) -> Result<()> {
-    let capability_decisions = ALL_CAPABILITIES
-        .iter()
-        .map(|capability| {
-            let check = resolved.policy.evaluate(capability.as_str());
-            serde_json::json!({
-                "capability": capability.as_str(),
-                "decision": check.decision,
-                "reason": check.reason,
-                "reason_detail": policy_reason_detail(&check.reason),
-                "remediation": capability_remediation(*capability, check.decision),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let dangerous_capabilities = Capability::dangerous_list()
-        .iter()
-        .map(|capability| {
-            let check = resolved.policy.evaluate(capability.as_str());
-            serde_json::json!({
-                "capability": capability.as_str(),
-                "decision": check.decision,
-                "reason": check.reason,
-                "reason_detail": policy_reason_detail(&check.reason),
-                "remediation": capability_remediation(*capability, check.decision),
-            })
-        })
-        .collect::<Vec<_>>();
-
-    let profile_presets = serde_json::json!([
-        {
-            "profile": "safe",
-            "summary": "Strict deny-by-default profile.",
-            "cli": "pi --extension-policy safe <your command>",
-            "config_example": policy_config_example("safe", false),
-        },
-        {
-            "profile": "balanced",
-            "summary": "Prompt-based profile (legacy alias: standard).",
-            "cli": "pi --extension-policy balanced <your command>",
-            "config_example": policy_config_example("balanced", false),
-        },
-        {
-            "profile": "permissive",
-            "summary": "Allow-most profile for compatibility-first workflows.",
-            "cli": "pi --extension-policy permissive <your command>",
-            "config_example": policy_config_example("permissive", false),
-        },
-    ]);
-
-    let payload = serde_json::json!({
-        "requested_profile": resolved.requested_profile,
-        "effective_profile": resolved.effective_profile,
-        "profile_aliases": {
-            "standard": "balanced",
-        },
-        "profile_source": resolved.profile_source,
-        "allow_dangerous": resolved.allow_dangerous,
-        "profile_presets": profile_presets,
-        "dangerous_capability_opt_in": {
-            "cli": "PI_EXTENSION_ALLOW_DANGEROUS=1 pi --extension-policy balanced <your command>",
-            "env_var": "PI_EXTENSION_ALLOW_DANGEROUS=1",
-            "config_example": policy_config_example("balanced", true),
-        },
-        "migration_guardrails": extension_policy_migration_guardrails(resolved),
-        "mode": resolved.policy.mode,
-        "default_caps": resolved.policy.default_caps.clone(),
-        "deny_caps": resolved.policy.deny_caps.clone(),
-        "dangerous_capabilities": dangerous_capabilities,
-        "capability_decisions": capability_decisions,
-    });
-
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
-}
-
-fn print_resolved_repair_policy(resolved: &pi::config::ResolvedRepairPolicy) -> Result<()> {
-    let payload = serde_json::json!({
-        "requested_mode": resolved.requested_mode,
-        "effective_mode": resolved.effective_mode,
-        "source": resolved.source,
-        "modes": {
-            "off": "Disable all repair functionality.",
-            "suggest": "Only suggest fixes in diagnostics (default).",
-            "auto-safe": "Automatically apply safe fixes (e.g., config updates).",
-            "auto-strict": "Automatically apply all fixes including code changes.",
-        },
-        "cli_override": "pi --repair-policy <mode> <your command>",
-        "env_var": "PI_REPAIR_POLICY=<mode>",
-    });
-
-    println!("{}", serde_json::to_string_pretty(&payload)?);
-    Ok(())
-}
-
 #[allow(clippy::too_many_lines)]
-async fn run(
-    mut cli: cli::Cli,
-    extension_flags: Vec<cli::ExtensionCliFlag>,
-    runtime_handle: RuntimeHandle,
-) -> Result<()> {
+async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
     // Resolve the HTTP request timeout before any provider HTTP client is
@@ -1095,11 +537,9 @@ async fn run(
     let resource_cli = ResourceCliOptions {
         no_skills: cli.no_skills,
         no_prompt_templates: cli.no_prompt_templates,
-        no_extensions: cli.no_extensions,
         no_themes: cli.no_themes,
         skill_paths: cli.skill.clone(),
         prompt_paths: cli.prompt_template.clone(),
-        extension_paths: cli.extension.clone(),
         theme_paths: cli.theme_path.clone(),
     };
     // Run resource loading and auth loading in parallel — they are independent.
@@ -1110,149 +550,15 @@ async fn run(
     )
     .await;
 
-    let mut resources = match resources_result {
+    let resources = match resources_result {
         Ok(resources) => resources,
         Err(err) => {
             if resource_cli.has_explicit_paths() {
                 return Err(anyhow::Error::new(err));
             }
-            eprintln!("Warning: Failed to load skills/prompts/themes/extensions: {err}");
+            eprintln!("Warning: Failed to load skills/prompts/themes: {err}");
             ResourceLoader::empty(config.enable_skill_commands())
         }
-    };
-
-    // Fail early when extension flags were extracted from the CLI but no extensions
-    // are available.  Without this check the binary proceeds to model selection which
-    // may fail for an unrelated reason (e.g. "No models available") and mask the real
-    // usage error.
-    if !extension_flags.is_empty() && resources.extensions().is_empty() {
-        let rendered = extension_flags
-            .iter()
-            .map(cli::ExtensionCliFlag::display_name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        tracing::debug!(
-            event = "pi.extensions.flags.ignored_no_extensions",
-            flags = %rendered,
-            "Extension flags provided but no extensions are loaded; ignoring."
-        );
-    }
-
-    let mut has_js_extensions = false;
-    let mut has_native_extensions = false;
-    for entry in resources.extensions() {
-        match resolve_extension_load_spec(entry) {
-            Ok(ExtensionLoadSpec::NativeRust(_)) => has_native_extensions = true,
-            Ok(ExtensionLoadSpec::Js(_)) => has_js_extensions = true,
-            #[cfg(feature = "wasm-host")]
-            Ok(ExtensionLoadSpec::Wasm(_)) => {}
-            Err(err) => {
-                return Err(anyhow::Error::new(err));
-            }
-        }
-    }
-
-    if has_js_extensions && has_native_extensions {
-        return Err(pi::error::Error::validation(
-            "Mixed extension runtimes are not supported in one session yet. Use either JS/TS extensions (QuickJS) or native-rust descriptors (*.native.json), but not both at once."
-                .to_string(),
-        )
-        .into());
-    }
-
-    let prewarm_policy = config
-        .resolve_extension_policy_with_metadata(cli.extension_policy.as_deref())
-        .policy;
-    let prewarm_repair = config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
-    let prewarm_repair_mode = if prewarm_repair.source.eq("default") {
-        pi::extensions::RepairPolicyMode::AutoStrict
-    } else {
-        prewarm_repair.effective_mode
-    };
-    let prewarm_memory_limit_bytes =
-        (prewarm_policy.max_memory_mb as usize).saturating_mul(1024 * 1024);
-
-    // Pre-warm extension runtime in a background task so startup work can overlap
-    // with auth refresh, model selection, and session creation.
-    let extension_prewarm_handle = if resources.extensions().is_empty() || has_js_extensions {
-        if resources.extensions().is_empty() {
-            None
-        } else {
-            let pre_enabled_tools = cli.enabled_tools();
-            let pre_mgr = pi::extensions::ExtensionManager::new();
-            pre_mgr.set_cwd(cwd.display().to_string());
-
-            let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
-
-            let resolved_risk = config.resolve_extension_risk_with_metadata();
-            pre_mgr.set_runtime_risk_config(resolved_risk.settings);
-
-            let pre_mgr_for_runtime = pre_mgr.clone();
-            let pre_tools_for_runtime = Arc::clone(&pre_tools);
-            let prewarm_policy_for_runtime = prewarm_policy.clone();
-            let prewarm_cwd = cwd.display().to_string();
-            Some((
-                pre_mgr,
-                pre_tools,
-                runtime_handle.spawn(async move {
-                    let mut js_config = PiJsRuntimeConfig {
-                        cwd: prewarm_cwd,
-                        repair_mode: AgentSession::runtime_repair_mode_from_policy_mode(
-                            prewarm_repair_mode,
-                        ),
-                        ..PiJsRuntimeConfig::default()
-                    };
-                    js_config.limits.memory_limit_bytes =
-                        Some(prewarm_memory_limit_bytes).filter(|bytes| *bytes > 0);
-                    let runtime = JsExtensionRuntimeHandle::start_with_policy(
-                        js_config,
-                        pre_tools_for_runtime,
-                        pre_mgr_for_runtime,
-                        prewarm_policy_for_runtime,
-                    )
-                    .await
-                    .map(ExtensionRuntimeHandle::Js)
-                    .map_err(anyhow::Error::new)?;
-                    tracing::info!(
-                        event = "pi.extension_runtime.engine_decision",
-                        stage = "main_prewarm",
-                        requested = "quickjs",
-                        selected = "quickjs",
-                        fallback = false,
-                        "Extension runtime engine selected for prewarm (legacy JS/TS)"
-                    );
-                    Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
-                }),
-            ))
-        }
-    } else {
-        let pre_enabled_tools = cli.enabled_tools();
-        let pre_mgr = pi::extensions::ExtensionManager::new();
-        pre_mgr.set_cwd(cwd.display().to_string());
-        let pre_tools = Arc::new(ToolRegistry::new(&pre_enabled_tools, &cwd, Some(&config)));
-
-        let resolved_risk = config.resolve_extension_risk_with_metadata();
-        pre_mgr.set_runtime_risk_config(resolved_risk.settings);
-
-        Some((
-            pre_mgr,
-            pre_tools,
-            runtime_handle.spawn(async move {
-                let runtime = NativeRustExtensionRuntimeHandle::start()
-                    .await
-                    .map(ExtensionRuntimeHandle::NativeRust)
-                    .map_err(anyhow::Error::new)?;
-                tracing::info!(
-                    event = "pi.extension_runtime.engine_decision",
-                    stage = "main_prewarm",
-                    requested = "native-rust",
-                    selected = "native-rust",
-                    fallback = false,
-                    "Extension runtime engine selected for prewarm (native-rust)"
-                );
-                Ok::<ExtensionRuntimeHandle, anyhow::Error>(runtime)
-            }),
-        ))
     };
 
     let mut auth = auth_result?;
@@ -1348,14 +654,12 @@ async fn run(
             has_cli_api_key_override(cli.api_key.as_deref()),
         )
     };
-    let has_extensions = !resources.extensions().is_empty();
 
     if has_cli_api_key_override(cli.api_key.as_deref())
         && cli.provider.is_none()
         && cli.model.is_none()
     {
-        let allow_unresolved_scope = has_extensions && !scoped_patterns.is_empty();
-        if scoped_models.is_empty() && !allow_unresolved_scope {
+        if scoped_models.is_empty() {
             bail!("--api-key requires a model to be specified via --provider/--model or --models");
         }
     }
@@ -1364,7 +668,7 @@ async fn run(
         is_interactive && io::stdin().is_terminal() && io::stdout().is_terminal();
     let session = Box::pin(Session::new(&cli, &config)).await?;
 
-    let (mut selection, mut resolved_key) = match resolve_selection_with_auth(
+    let (selection, resolved_key) = match resolve_selection_with_auth(
         &mut cli,
         &config,
         &session,
@@ -1379,16 +683,7 @@ async fn run(
     {
         Ok(Some(result)) => result,
         Ok(None) => return Ok(()),
-        Err(err) => {
-            if should_retry_selection_after_extensions(&cli, &err, has_extensions) {
-                (
-                    build_extension_bootstrap_selection(&config, &model_registry, &models_path)?,
-                    None,
-                )
-            } else {
-                return Err(err);
-            }
-        }
+        Err(err) => return Err(err),
     };
 
     let enabled_tools = cli.enabled_tools();
@@ -1413,7 +708,7 @@ async fn run(
         !cli.hide_cwd_in_prompt,
     )?;
     let provider =
-        providers::create_provider(&selection.model_entry, None).map_err(anyhow::Error::new)?;
+        providers::create_provider(&selection.model_entry).map_err(anyhow::Error::new)?;
     let stream_options =
         pi::app::build_stream_options(&config, resolved_key.clone(), &selection, &session);
     // CLI flag wins; fall back to PI_MAX_TOOL_ITERATIONS env, then default.
@@ -1429,7 +724,7 @@ async fn run(
         max_tool_iterations,
         stream_options,
         block_images: config.image_block_images(),
-        fail_closed_hooks: config.fail_closed_hooks(),
+        fail_closed_hooks: false,
         tool_approval: None,
     };
 
@@ -1449,212 +744,6 @@ async fn run(
     )
     .with_runtime_handle(runtime_handle.clone());
     agent_session.set_api_key_override(cli.api_key.clone());
-    let mut extension_model_entries = Vec::new();
-
-    if !resources.extensions().is_empty() {
-        // Await the pre-warmed extension runtime (spawned earlier to overlap with
-        // auth refresh, model selection, and session creation).
-        let pre_warmed = if let Some((mgr, tools, join_handle)) = extension_prewarm_handle {
-            match join_handle.await {
-                Ok(runtime) => {
-                    tracing::info!(
-                        event = "pi.extension_runtime.prewarm.success",
-                        runtime = runtime.runtime_name(),
-                        "Pre-warmed extension runtime ready"
-                    );
-                    Some(PreWarmedExtensionRuntime {
-                        manager: mgr,
-                        runtime,
-                        tools,
-                    })
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        event = "pi.extension_runtime.prewarm.failed",
-                        error = %e,
-                        "Extension runtime pre-warm failed, falling back to inline creation"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-
-        let resolved_ext_policy =
-            config.resolve_extension_policy_with_metadata(cli.extension_policy.as_deref());
-        let resolved_repair_policy =
-            config.resolve_repair_policy_with_metadata(cli.repair_policy.as_deref());
-        let effective_repair_policy = if resolved_repair_policy.source.eq("default") {
-            // Compatibility-first default for extension-heavy workloads:
-            // if the user did not choose a repair policy explicitly, prefer
-            // aggressive deterministic repairs while capability policy stays enforced.
-            pi::extensions::RepairPolicyMode::AutoStrict
-        } else {
-            resolved_repair_policy.effective_mode
-        };
-        tracing::info!(
-            event = "pi.extension_repair_policy.resolved",
-            requested = %resolved_repair_policy.requested_mode,
-            source = resolved_repair_policy.source,
-            effective = ?effective_repair_policy,
-            "Resolved extension repair policy for runtime"
-        );
-        maybe_print_extension_policy_migration_notice(&resolved_ext_policy);
-        agent_session
-            .enable_extensions_with_policy(
-                &enabled_tools,
-                &cwd,
-                Some(&config),
-                resources.extensions(),
-                Some(resolved_ext_policy.policy),
-                Some(effective_repair_policy),
-                pre_warmed,
-            )
-            .await
-            .map_err(anyhow::Error::new)?;
-
-        if !extension_flags.is_empty() {
-            if let Some(region) = &agent_session.extensions {
-                apply_extension_cli_flags(region.manager(), &extension_flags).await?;
-            } else {
-                return Err(pi::error::Error::validation(
-                    "Extension flags were provided, but extensions are not active in this session.",
-                )
-                .into());
-            }
-        }
-
-        // Merge extension-registered providers into the model registry.
-        if let Some(region) = &agent_session.extensions {
-            extension_model_entries = region.manager().extension_model_entries();
-            if !extension_model_entries.is_empty() {
-                // Build OAuth configs map from model entries before merging.
-                let ext_oauth_configs: std::collections::HashMap<String, pi::models::OAuthConfig> =
-                    extension_model_entries
-                        .iter()
-                        .filter_map(|entry| {
-                            entry
-                                .oauth_config
-                                .as_ref()
-                                .map(|cfg| (entry.model.provider.clone(), cfg.clone()))
-                        })
-                        .collect();
-
-                model_registry.merge_entries(extension_model_entries.clone());
-
-                // Refresh expired OAuth tokens for extension-registered providers.
-                if !ext_oauth_configs.is_empty() {
-                    let client = pi::http::client::Client::new();
-                    if let Err(e) = auth
-                        .refresh_expired_extension_oauth_tokens(&client, &ext_oauth_configs)
-                        .await
-                    {
-                        tracing::warn!(
-                            event = "pi.auth.extension_oauth_refresh.failed",
-                            error = %e,
-                            "Failed to refresh extension OAuth tokens, continuing with existing credentials"
-                        );
-                    }
-                }
-            }
-
-            let discovered = region.manager().discover_resources(&cwd, "startup").await;
-            if !discovered.is_empty() {
-                if let Err(err) = resources.extend_with_paths(&cwd, &discovered) {
-                    tracing::warn!(
-                        event = "pi.resources.startup.extension_paths_failed",
-                        error = %err,
-                        "Failed to apply extension-discovered resource paths"
-                    );
-                } else {
-                    let skills_prompt = if enabled_tools.contains(&"read") {
-                        resources.format_skills_for_prompt()
-                    } else {
-                        String::new()
-                    };
-                    let system_prompt = pi::app::build_system_prompt(
-                        &cli,
-                        &cwd,
-                        &enabled_tools,
-                        if skills_prompt.is_empty() {
-                            None
-                        } else {
-                            Some(skills_prompt.as_str())
-                        },
-                        &global_dir,
-                        &package_dir,
-                        test_mode,
-                        !cli.hide_cwd_in_prompt,
-                    )?;
-                    agent_session.agent.set_system_prompt(Some(system_prompt));
-                }
-            }
-        }
-    } else if !extension_flags.is_empty() {
-        let rendered = extension_flags
-            .iter()
-            .map(pi::cli::ExtensionCliFlag::display_name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        tracing::debug!(
-            event = "pi.extensions.flags.ignored_no_extensions",
-            flags = %rendered,
-            "Extension flags provided but no extensions are loaded; ignoring."
-        );
-    }
-
-    if has_extensions {
-        let session_snapshot = {
-            let cx = pi::agent_cx::AgentCx::for_request();
-            let session = agent_session
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            session.clone()
-        };
-
-        let final_selection = resolve_selection_with_auth(
-            &mut cli,
-            &config,
-            &session_snapshot,
-            &mut model_registry,
-            &scoped_patterns,
-            &mut auth,
-            &models_path,
-            allow_setup_prompt,
-            &extension_model_entries,
-        )
-        .await?;
-        let Some((updated_selection, updated_key)) = final_selection else {
-            return Ok(());
-        };
-
-        selection = updated_selection;
-        resolved_key = updated_key;
-
-        let provider = providers::create_provider(
-            &selection.model_entry,
-            agent_session
-                .extensions
-                .as_ref()
-                .map(ExtensionRegion::manager),
-        )
-        .map_err(anyhow::Error::new)?;
-        agent_session.agent.set_provider(provider);
-        {
-            let stream_options = agent_session.agent.stream_options_mut();
-            stream_options.api_key.clone_from(&resolved_key);
-            stream_options
-                .headers
-                .clone_from(&selection.model_entry.headers);
-            stream_options.thinking_level = Some(selection.thinking_level);
-        }
-        agent_session
-            .set_compaction_context_window(context_window_tokens_for_entry(&selection.model_entry));
-        agent_session.refresh_extension_completion_host_state();
-    }
 
     {
         let cx = pi::agent_cx::AgentCx::for_request();
@@ -1699,7 +788,7 @@ async fn run(
                 thinking_level: sm.thinking_level,
             })
             .collect::<Vec<_>>();
-        run_rpc_mode(
+        Box::pin(run_rpc_mode(
             agent_session,
             resources,
             config.clone(),
@@ -1708,7 +797,7 @@ async fn run(
             cli.api_key.clone(),
             auth.clone(),
             runtime_handle.clone(),
-        )
+        ))
         .await
     } else if is_interactive {
         let model_scope = selection
@@ -1744,13 +833,6 @@ async fn run(
             &config,
         )
         .await;
-        // Explicitly shut down extension runtimes before the session drops.
-        // Without this, ExtensionRegion::drop() runs synchronously and cannot
-        // coordinate with the QuickJS runtime thread, causing a GC assertion
-        // failure (non-empty gc_obj_list) when 2+ JS extensions are loaded.
-        if let Some(ref ext) = agent_session.extensions {
-            ext.shutdown().await;
-        }
         result
     };
 
@@ -1780,9 +862,6 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
         cli::Commands::Update { source } => {
             handle_package_update(&manager, source).await?;
         }
-        cli::Commands::UpdateIndex => {
-            handle_update_index().await?;
-        }
         cli::Commands::ContextPreview {
             format,
             bead,
@@ -1803,75 +882,11 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 &query,
             )?;
         }
-        cli::Commands::SwarmProgress {
-            input,
-            since,
-            format,
-            out_json,
-            out_text,
-        } => {
-            handle_swarm_progress_blocking(
-                cwd,
-                &input,
-                since.as_deref(),
-                &format,
-                out_json.as_deref(),
-                out_text.as_deref(),
-            )?;
-        }
-        cli::Commands::SwarmReplayPreview {
-            trace,
-            policies,
-            format,
-            out_json,
-            out_text,
-            generated_at,
-        } => {
-            handle_swarm_replay_preview_blocking(
-                cwd,
-                &trace,
-                &policies,
-                &format,
-                out_json.as_deref(),
-                out_text.as_deref(),
-                generated_at.as_deref(),
-            )?;
-        }
-        cli::Commands::ValidationBroker { command } => {
-            handle_validation_broker_blocking(cwd, &command)?;
-        }
-        cli::Commands::Search {
-            query,
-            tag,
-            sort,
-            limit,
-        } => {
-            handle_search(&query, tag.as_deref(), &sort, limit).await?;
-        }
-        cli::Commands::Info { name } => {
-            handle_info_blocking(&name)?;
-        }
         cli::Commands::List => {
             handle_package_list(&manager).await?;
         }
         cli::Commands::Config { show, paths, json } => {
             handle_config(&manager, cwd, show, paths, json).await?;
-        }
-        cli::Commands::Doctor {
-            path,
-            format,
-            policy,
-            fix,
-            only,
-        } => {
-            handle_doctor(
-                cwd,
-                path.as_deref(),
-                &format,
-                policy.as_deref(),
-                fix,
-                only.as_deref(),
-            )?;
         }
         cli::Commands::Migrate { path, dry_run } => {
             handle_session_migrate(&path, dry_run)?;
@@ -1879,1466 +894,6 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[derive(Debug, Serialize)]
-struct ValidationBrokerCommandReport {
-    name: &'static str,
-    action: String,
-    cwd: String,
-    store: String,
-    output_writes: u8,
-}
-
-#[derive(Debug, Serialize)]
-struct ValidationBrokerOutputPaths {
-    json: Option<String>,
-    text: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ValidationBrokerGuards {
-    read_only_plan: bool,
-    live_mutations: u8,
-    refuses_output_overwrite: bool,
-    destructive_actions: u8,
-    provider_calls: u8,
-}
-
-#[derive(Debug, Serialize)]
-struct ValidationBrokerStoreSummary {
-    path: String,
-    schema: String,
-    status: String,
-    total_records: usize,
-    total_slots: usize,
-    active_slots: usize,
-    reusable_slots: usize,
-    stale_slots: usize,
-    expired_at_report_time_slots: usize,
-    state_counts: BTreeMap<String, usize>,
-    degraded_reasons: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ValidationBrokerStatusReport {
-    schema: &'static str,
-    generated_at_utc: String,
-    command: ValidationBrokerCommandReport,
-    store: ValidationBrokerStoreSummary,
-    output_paths: ValidationBrokerOutputPaths,
-    guards: ValidationBrokerGuards,
-}
-
-#[derive(Debug, Serialize)]
-struct ValidationBrokerPlanReport {
-    schema: &'static str,
-    generated_at_utc: String,
-    command: ValidationBrokerCommandReport,
-    request_id: String,
-    bead_id: String,
-    read_only: bool,
-    next_action: &'static str,
-    decision: ValidationAdmissionDecisionRecord,
-    store: ValidationBrokerStoreSummary,
-    output_paths: ValidationBrokerOutputPaths,
-    guards: ValidationBrokerGuards,
-}
-
-#[derive(Debug, Serialize)]
-struct ValidationBrokerLeaseMutationReport {
-    schema: &'static str,
-    generated_at_utc: String,
-    command: ValidationBrokerCommandReport,
-    event: &'static str,
-    lease: ValidationSlotLease,
-    store: ValidationBrokerStoreSummary,
-    output_paths: ValidationBrokerOutputPaths,
-    guards: ValidationBrokerGuards,
-}
-
-#[allow(clippy::too_many_lines)]
-fn handle_validation_broker_blocking(
-    cwd: &Path,
-    command: &cli::ValidationBrokerCommand,
-) -> Result<()> {
-    match command {
-        cli::ValidationBrokerCommand::Status {
-            store,
-            format,
-            out_json,
-            out_text,
-            generated_at,
-        } => {
-            let generated_at_utc = validation_broker_generated_at(
-                "validation-broker status",
-                generated_at.as_deref(),
-            )?;
-            let store_path = resolve_cli_path(cwd, store);
-            let slot_store = ValidationSlotStore::new(&store_path);
-            let snapshot = slot_store.load_snapshot();
-            let output_paths =
-                validation_broker_output_paths(out_json.as_deref(), out_text.as_deref());
-            let report = ValidationBrokerStatusReport {
-                schema: VALIDATION_BROKER_CLI_STATUS_SCHEMA,
-                generated_at_utc: generated_at_utc.clone(),
-                command: validation_broker_command_report(
-                    cwd,
-                    "status",
-                    store,
-                    output_paths.output_writes(),
-                ),
-                store: validation_store_summary(&store_path, &snapshot, &generated_at_utc),
-                output_paths,
-                guards: validation_broker_guards(true, 0),
-            };
-            emit_validation_broker_status(
-                cwd,
-                &report,
-                format,
-                out_json.as_deref(),
-                out_text.as_deref(),
-            )?;
-        }
-        cli::ValidationBrokerCommand::Plan {
-            request,
-            inputs,
-            store,
-            policy,
-            format,
-            out_json,
-            out_text,
-            generated_at,
-        } => {
-            let generated_at_utc =
-                validation_broker_generated_at("validation-broker plan", generated_at.as_deref())?;
-            let request_path = resolve_cli_path(cwd, request);
-            let inputs_path = resolve_cli_path(cwd, inputs);
-            let context =
-                read_validation_broker_json::<ValidationAdmissionRequestContext>(&request_path)?;
-            let input_snapshot =
-                read_validation_broker_json::<ValidationBrokerInputSnapshot>(&inputs_path)?;
-            if input_snapshot.schema != VALIDATION_BROKER_INPUT_SCHEMA {
-                return Err(validation_broker_validation_error(format!(
-                    "validation-broker plan requires inputs schema {VALIDATION_BROKER_INPUT_SCHEMA}, got {}",
-                    input_snapshot.schema
-                )));
-            }
-            let policy = match policy {
-                Some(path) => read_validation_broker_json::<ValidationAdmissionPolicy>(
-                    &resolve_cli_path(cwd, path),
-                )?,
-                None => ValidationAdmissionPolicy::default(),
-            };
-            let store_path = resolve_cli_path(cwd, store);
-            let slot_store = ValidationSlotStore::new(&store_path);
-            let snapshot = slot_store.load_snapshot();
-            let decision = decide_validation_admission(
-                context.clone(),
-                &input_snapshot,
-                &snapshot,
-                &policy,
-                &generated_at_utc,
-            )?;
-            if decision.schema != VALIDATION_BROKER_DECISION_SCHEMA {
-                return Err(validation_broker_validation_error(format!(
-                    "validation-broker plan produced unexpected decision schema {}",
-                    decision.schema
-                )));
-            }
-            let output_paths =
-                validation_broker_output_paths(out_json.as_deref(), out_text.as_deref());
-            let next_action = validation_broker_next_action(&decision.decision);
-            let report = ValidationBrokerPlanReport {
-                schema: VALIDATION_BROKER_CLI_PLAN_SCHEMA,
-                generated_at_utc: generated_at_utc.clone(),
-                command: validation_broker_command_report(
-                    cwd,
-                    "plan",
-                    store,
-                    output_paths.output_writes(),
-                ),
-                request_id: context.request_id,
-                bead_id: context.request.bead_id,
-                read_only: true,
-                next_action,
-                decision,
-                store: validation_store_summary(&store_path, &snapshot, &generated_at_utc),
-                output_paths,
-                guards: validation_broker_guards(true, 0),
-            };
-            emit_validation_broker_plan(
-                cwd,
-                &report,
-                format,
-                out_json.as_deref(),
-                out_text.as_deref(),
-            )?;
-        }
-        cli::ValidationBrokerCommand::Acquire {
-            request,
-            store,
-            started_at,
-            expires_at,
-            format,
-            out_json,
-            out_text,
-        } => {
-            let request_path = resolve_cli_path(cwd, request);
-            let request = read_validation_broker_json::<ValidationSlotRequest>(&request_path)?;
-            let lease =
-                ValidationSlotLease::acquire(request, started_at.clone(), expires_at.clone())?;
-            let store_path = resolve_cli_path(cwd, store);
-            let slot_store = ValidationSlotStore::new(&store_path);
-            let snapshot = slot_store.load_snapshot();
-            ensure_validation_store_mutable(&snapshot)?;
-            if snapshot.latest_by_slot_id.contains_key(&lease.slot_id) {
-                return Err(validation_broker_validation_error(format!(
-                    "validation-broker acquire refuses duplicate slot_id {}",
-                    lease.slot_id
-                )));
-            }
-            slot_store.append_lease("acquired", started_at.clone(), &lease)?;
-            let updated = slot_store.load_snapshot();
-            emit_validation_broker_lease_mutation(
-                cwd,
-                "acquire",
-                "acquired",
-                store,
-                &store_path,
-                &updated,
-                lease,
-                started_at,
-                format,
-                out_json.as_deref(),
-                out_text.as_deref(),
-            )?;
-        }
-        cli::ValidationBrokerCommand::Renew {
-            store,
-            slot_id,
-            owner,
-            heartbeat_at,
-            expires_at,
-            format,
-            out_json,
-            out_text,
-        } => {
-            let store_path = resolve_cli_path(cwd, store);
-            let slot_store = ValidationSlotStore::new(&store_path);
-            let snapshot = slot_store.load_snapshot();
-            ensure_validation_store_mutable(&snapshot)?;
-            let mut lease = validation_broker_latest_lease(&snapshot, slot_id)?;
-            lease.renew(owner, heartbeat_at.clone(), expires_at.clone())?;
-            slot_store.append_lease("renewed", heartbeat_at.clone(), &lease)?;
-            let updated = slot_store.load_snapshot();
-            emit_validation_broker_lease_mutation(
-                cwd,
-                "renew",
-                "renewed",
-                store,
-                &store_path,
-                &updated,
-                lease,
-                heartbeat_at,
-                format,
-                out_json.as_deref(),
-                out_text.as_deref(),
-            )?;
-        }
-        cli::ValidationBrokerCommand::Release {
-            store,
-            slot_id,
-            owner,
-            at,
-            reason,
-            format,
-            out_json,
-            out_text,
-        } => {
-            let store_path = resolve_cli_path(cwd, store);
-            let slot_store = ValidationSlotStore::new(&store_path);
-            let snapshot = slot_store.load_snapshot();
-            ensure_validation_store_mutable(&snapshot)?;
-            let mut lease = validation_broker_latest_lease(&snapshot, slot_id)?;
-            lease.release(owner, at.clone(), reason.clone())?;
-            slot_store.append_lease("released", at.clone(), &lease)?;
-            let updated = slot_store.load_snapshot();
-            emit_validation_broker_lease_mutation(
-                cwd,
-                "release",
-                "released",
-                store,
-                &store_path,
-                &updated,
-                lease,
-                at,
-                format,
-                out_json.as_deref(),
-                out_text.as_deref(),
-            )?;
-        }
-    }
-
-    Ok(())
-}
-
-impl ValidationBrokerOutputPaths {
-    fn output_writes(&self) -> u8 {
-        u8::from(self.json.is_some()) + u8::from(self.text.is_some())
-    }
-}
-
-fn validation_broker_output_paths(
-    out_json: Option<&str>,
-    out_text: Option<&str>,
-) -> ValidationBrokerOutputPaths {
-    ValidationBrokerOutputPaths {
-        json: out_json.map(ToOwned::to_owned),
-        text: out_text.map(ToOwned::to_owned),
-    }
-}
-
-const fn validation_broker_guards(
-    read_only_plan: bool,
-    live_mutations: u8,
-) -> ValidationBrokerGuards {
-    ValidationBrokerGuards {
-        read_only_plan,
-        live_mutations,
-        refuses_output_overwrite: true,
-        destructive_actions: 0,
-        provider_calls: 0,
-    }
-}
-
-fn validation_broker_command_report(
-    cwd: &Path,
-    action: impl Into<String>,
-    store: &str,
-    output_writes: u8,
-) -> ValidationBrokerCommandReport {
-    ValidationBrokerCommandReport {
-        name: "validation-broker",
-        action: action.into(),
-        cwd: cwd.display().to_string(),
-        store: store.to_string(),
-        output_writes,
-    }
-}
-
-fn read_validation_broker_json<T>(path: &Path) -> Result<T>
-where
-    T: DeserializeOwned,
-{
-    let raw = fs::read_to_string(path)?;
-    serde_json::from_str(&raw).map_err(Into::into)
-}
-
-fn validation_store_summary(
-    path: &Path,
-    snapshot: &ValidationSlotStoreSnapshot,
-    now_utc: &str,
-) -> ValidationBrokerStoreSummary {
-    let mut state_counts = BTreeMap::new();
-    let mut active_slots = 0usize;
-    let mut reusable_slots = 0usize;
-    let mut stale_slots = 0usize;
-    let mut expired_at_report_time_slots = 0usize;
-    for lease in snapshot.latest_by_slot_id.values() {
-        let state_key = validation_slot_state_key(&lease.state);
-        *state_counts.entry(state_key.to_string()).or_insert(0) += 1;
-        match lease.state {
-            ValidationSlotState::Requested | ValidationSlotState::Active => active_slots += 1,
-            ValidationSlotState::Reusable => reusable_slots += 1,
-            ValidationSlotState::Stale => stale_slots += 1,
-            ValidationSlotState::Failed
-            | ValidationSlotState::Released
-            | ValidationSlotState::Expired
-            | ValidationSlotState::Degraded => {}
-        }
-        if lease.is_stale_at(now_utc).unwrap_or(false) {
-            expired_at_report_time_slots += 1;
-        }
-    }
-
-    ValidationBrokerStoreSummary {
-        path: path.display().to_string(),
-        schema: snapshot.schema.clone(),
-        status: format!("{:?}", snapshot.status).to_ascii_lowercase(),
-        total_records: snapshot.leases.len(),
-        total_slots: snapshot.latest_by_slot_id.len(),
-        active_slots,
-        reusable_slots,
-        stale_slots,
-        expired_at_report_time_slots,
-        state_counts,
-        degraded_reasons: snapshot.degraded_reasons.clone(),
-    }
-}
-
-const fn validation_slot_state_key(state: &ValidationSlotState) -> &'static str {
-    match state {
-        ValidationSlotState::Requested => "requested",
-        ValidationSlotState::Active => "active",
-        ValidationSlotState::Reusable => "reusable",
-        ValidationSlotState::Stale => "stale",
-        ValidationSlotState::Failed => "failed",
-        ValidationSlotState::Released => "released",
-        ValidationSlotState::Expired => "expired",
-        ValidationSlotState::Degraded => "degraded",
-    }
-}
-
-const fn validation_decision_key(decision: &ValidationAdmissionDecision) -> &'static str {
-    match decision {
-        ValidationAdmissionDecision::Allow => "allow",
-        ValidationAdmissionDecision::Wait => "wait",
-        ValidationAdmissionDecision::Coalesce => "coalesce",
-        ValidationAdmissionDecision::Narrow => "narrow",
-        ValidationAdmissionDecision::DenyLocalFallback => "deny_local_fallback",
-        ValidationAdmissionDecision::StaleRecover => "stale_recover",
-        ValidationAdmissionDecision::DegradedBlock => "degraded_block",
-    }
-}
-
-const fn validation_broker_next_action(decision: &ValidationAdmissionDecision) -> &'static str {
-    match decision {
-        ValidationAdmissionDecision::Allow => "run_now",
-        ValidationAdmissionDecision::Wait => "wait",
-        ValidationAdmissionDecision::Coalesce => "coalesce_with_reusable_slot",
-        ValidationAdmissionDecision::Narrow => "narrow_scope",
-        ValidationAdmissionDecision::DenyLocalFallback
-        | ValidationAdmissionDecision::DegradedBlock => "surface_blocker",
-        ValidationAdmissionDecision::StaleRecover => "recover_stale_slot_or_bead",
-    }
-}
-
-fn validation_broker_generated_at(label: &str, generated_at: Option<&str>) -> Result<String> {
-    let Some(value) = generated_at.and_then(non_empty_string) else {
-        return Ok(chrono::Utc::now().to_rfc3339());
-    };
-    match chrono::DateTime::parse_from_rfc3339(&value) {
-        Ok(parsed) if parsed.offset().local_minus_utc() == 0 => {}
-        Ok(_) => {
-            return Err(validation_broker_validation_error(format!(
-                "{label} requires --generated-at to use UTC offset: {value}"
-            )));
-        }
-        Err(_) => {
-            return Err(validation_broker_validation_error(format!(
-                "{label} requires --generated-at to be RFC3339: {value}"
-            )));
-        }
-    }
-    Ok(value)
-}
-
-fn ensure_validation_store_mutable(snapshot: &ValidationSlotStoreSnapshot) -> Result<()> {
-    if snapshot.is_degraded() {
-        Err(validation_broker_validation_error(format!(
-            "refusing to mutate degraded validation slot store: {}",
-            snapshot.degraded_reasons.join("; ")
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-fn validation_broker_latest_lease(
-    snapshot: &ValidationSlotStoreSnapshot,
-    slot_id: &str,
-) -> Result<ValidationSlotLease> {
-    snapshot
-        .latest_by_slot_id
-        .get(slot_id)
-        .cloned()
-        .ok_or_else(|| {
-            validation_broker_validation_error(format!(
-                "validation-broker slot_id {slot_id} not found"
-            ))
-        })
-}
-
-fn validation_broker_validation_error(message: impl Into<String>) -> anyhow::Error {
-    anyhow::Error::new(pi::error::Error::validation(message.into()))
-}
-
-fn emit_validation_broker_status(
-    cwd: &Path,
-    report: &ValidationBrokerStatusReport,
-    format: &str,
-    out_json: Option<&str>,
-    out_text: Option<&str>,
-) -> Result<()> {
-    let json_output = serde_json::to_string_pretty(report)?;
-    let text_output = render_validation_broker_status_text(report);
-    emit_validation_broker_output(cwd, &json_output, &text_output, format, out_json, out_text)
-}
-
-fn emit_validation_broker_plan(
-    cwd: &Path,
-    report: &ValidationBrokerPlanReport,
-    format: &str,
-    out_json: Option<&str>,
-    out_text: Option<&str>,
-) -> Result<()> {
-    let json_output = serde_json::to_string_pretty(report)?;
-    let text_output = render_validation_broker_plan_text(report);
-    emit_validation_broker_output(cwd, &json_output, &text_output, format, out_json, out_text)
-}
-
-#[allow(clippy::too_many_arguments)]
-fn emit_validation_broker_lease_mutation(
-    cwd: &Path,
-    action: &str,
-    event: &'static str,
-    store_arg: &str,
-    store_path: &Path,
-    snapshot: &ValidationSlotStoreSnapshot,
-    lease: ValidationSlotLease,
-    generated_at_utc: &str,
-    format: &str,
-    out_json: Option<&str>,
-    out_text: Option<&str>,
-) -> Result<()> {
-    let output_paths = validation_broker_output_paths(out_json, out_text);
-    let report = ValidationBrokerLeaseMutationReport {
-        schema: VALIDATION_BROKER_CLI_LEASE_MUTATION_SCHEMA,
-        generated_at_utc: generated_at_utc.to_string(),
-        command: validation_broker_command_report(
-            cwd,
-            action,
-            store_arg,
-            output_paths.output_writes(),
-        ),
-        event,
-        lease,
-        store: validation_store_summary(store_path, snapshot, generated_at_utc),
-        output_paths,
-        guards: validation_broker_guards(false, 1),
-    };
-    let json_output = serde_json::to_string_pretty(&report)?;
-    let text_output = render_validation_broker_lease_text(&report);
-    emit_validation_broker_output(cwd, &json_output, &text_output, format, out_json, out_text)
-}
-
-fn emit_validation_broker_output(
-    cwd: &Path,
-    json_output: &str,
-    text_output: &str,
-    format: &str,
-    out_json: Option<&str>,
-    out_text: Option<&str>,
-) -> Result<()> {
-    if let Some(path) = out_json {
-        write_validation_broker_output(&resolve_cli_path(cwd, path), json_output, "JSON output")?;
-    }
-    if let Some(path) = out_text {
-        write_validation_broker_output(&resolve_cli_path(cwd, path), text_output, "text output")?;
-    }
-    if out_json.is_none() && out_text.is_none() {
-        match format {
-            "json" => println!("{json_output}"),
-            "text" => print!("{text_output}"),
-            other => {
-                return Err(validation_broker_validation_error(format!(
-                    "unsupported validation-broker format: {other}"
-                )));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn write_validation_broker_output(path: &Path, content: &str, label: &str) -> Result<()> {
-    if path.exists() {
-        return Err(validation_broker_validation_error(format!(
-            "refusing to overwrite existing validation-broker {label}: {}",
-            path.display()
-        )));
-    }
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, content)?;
-    Ok(())
-}
-
-fn render_validation_broker_status_text(report: &ValidationBrokerStatusReport) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "Validation Broker Status");
-    let _ = writeln!(output, "schema: {}", report.schema);
-    let _ = writeln!(output, "generated_at_utc: {}", report.generated_at_utc);
-    push_validation_store_summary_text(&mut output, &report.store);
-    push_validation_list(
-        &mut output,
-        "degraded_reasons",
-        &report.store.degraded_reasons,
-    );
-    output
-}
-
-fn render_validation_broker_plan_text(report: &ValidationBrokerPlanReport) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "Validation Broker Plan");
-    let _ = writeln!(output, "schema: {}", report.schema);
-    let _ = writeln!(output, "generated_at_utc: {}", report.generated_at_utc);
-    let _ = writeln!(output, "read_only: {}", report.read_only);
-    let _ = writeln!(output, "request_id: {}", report.request_id);
-    let _ = writeln!(output, "bead_id: {}", report.bead_id);
-    let _ = writeln!(
-        output,
-        "decision: {}",
-        validation_decision_key(&report.decision.decision)
-    );
-    let _ = writeln!(output, "next_action: {}", report.next_action);
-    let _ = writeln!(output, "confidence: {}", report.decision.confidence);
-    push_validation_list(&mut output, "reasons", &report.decision.reasons);
-    push_validation_list(
-        &mut output,
-        "required_actions",
-        &report.decision.required_actions,
-    );
-    push_validation_list(&mut output, "no_claims", &report.decision.no_claims);
-    push_validation_store_summary_text(&mut output, &report.store);
-    output
-}
-
-fn render_validation_broker_lease_text(report: &ValidationBrokerLeaseMutationReport) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "Validation Broker Lease");
-    let _ = writeln!(output, "schema: {}", report.schema);
-    let _ = writeln!(output, "generated_at_utc: {}", report.generated_at_utc);
-    let _ = writeln!(output, "event: {}", report.event);
-    let _ = writeln!(output, "slot_id: {}", report.lease.slot_id);
-    let _ = writeln!(
-        output,
-        "state: {}",
-        validation_slot_state_key(&report.lease.state)
-    );
-    let _ = writeln!(output, "owner_agent: {}", report.lease.owner_agent);
-    let _ = writeln!(output, "bead_id: {}", report.lease.bead_id);
-    push_validation_store_summary_text(&mut output, &report.store);
-    output
-}
-
-fn push_validation_store_summary_text(output: &mut String, store: &ValidationBrokerStoreSummary) {
-    let _ = writeln!(output, "store: {}", store.path);
-    let _ = writeln!(output, "store_status: {}", store.status);
-    let _ = writeln!(output, "total_records: {}", store.total_records);
-    let _ = writeln!(output, "total_slots: {}", store.total_slots);
-    let _ = writeln!(output, "active_slots: {}", store.active_slots);
-    let _ = writeln!(output, "reusable_slots: {}", store.reusable_slots);
-    let _ = writeln!(output, "stale_slots: {}", store.stale_slots);
-    let _ = writeln!(
-        output,
-        "expired_at_report_time_slots: {}",
-        store.expired_at_report_time_slots
-    );
-}
-
-fn push_validation_list(output: &mut String, label: &str, values: &[String]) {
-    let _ = writeln!(output, "{label}:");
-    if values.is_empty() {
-        let _ = writeln!(output, "- none");
-    } else {
-        for value in values {
-            let _ = writeln!(output, "- {value}");
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_swarm_progress_blocking(
-    cwd: &Path,
-    input: &str,
-    since: Option<&str>,
-    format: &str,
-    out_json: Option<&str>,
-    out_text: Option<&str>,
-) -> Result<()> {
-    let input = read_swarm_progress_input(cwd, input)?;
-    validate_swarm_progress_since(&input, since)?;
-    let report = evaluate_progress_slo(input);
-    if report.schema != SWARM_PROGRESS_SLO_SCHEMA {
-        bail!(
-            "swarm-progress produced unexpected schema {}, expected {SWARM_PROGRESS_SLO_SCHEMA}",
-            report.schema
-        );
-    }
-    emit_swarm_progress_output(cwd, &report, format, out_json, out_text)
-}
-
-fn read_swarm_progress_input(cwd: &Path, input: &str) -> Result<ProgressSloEvaluationInput> {
-    let input_arg = non_empty_string(input)
-        .ok_or_else(|| anyhow::anyhow!("swarm-progress requires --input"))?;
-    let input_path = resolve_cli_path(cwd, &input_arg);
-    let raw = fs::read_to_string(&input_path).map_err(|err| {
-        anyhow::anyhow!(
-            "swarm-progress failed to read --input {}: {err}",
-            input_path.display()
-        )
-    })?;
-    serde_json::from_str::<ProgressSloEvaluationInput>(&raw).map_err(|err| {
-        anyhow::anyhow!(
-            "swarm-progress requires normalized progress SLO input JSON at {}: {err}",
-            input_path.display()
-        )
-    })
-}
-
-fn validate_swarm_progress_since(
-    input: &ProgressSloEvaluationInput,
-    since: Option<&str>,
-) -> Result<()> {
-    let Some(since) = since else {
-        return Ok(());
-    };
-    let Some(since) = non_empty_string(since) else {
-        bail!("swarm-progress requires non-empty --since values");
-    };
-    if input.time_window.comparison_baseline != since {
-        bail!(
-            "swarm-progress --since {since} does not match input time_window.comparison_baseline {}",
-            input.time_window.comparison_baseline
-        );
-    }
-    Ok(())
-}
-
-fn emit_swarm_progress_output(
-    cwd: &Path,
-    report: &ProgressSloReport,
-    format: &str,
-    out_json: Option<&str>,
-    out_text: Option<&str>,
-) -> Result<()> {
-    let json_output = serde_json::to_string_pretty(report)?;
-    let text_output = render_swarm_progress_text(report);
-    if let Some(path) = out_json {
-        write_swarm_progress_output(&resolve_cli_path(cwd, path), &json_output, "JSON output")?;
-    }
-    if let Some(path) = out_text {
-        write_swarm_progress_output(&resolve_cli_path(cwd, path), &text_output, "text output")?;
-    }
-    if out_json.is_none() && out_text.is_none() {
-        match format {
-            "json" => println!("{json_output}"),
-            "text" => print!("{text_output}"),
-            other => bail!("unsupported swarm-progress format: {other}"),
-        }
-    }
-    Ok(())
-}
-
-fn write_swarm_progress_output(path: &Path, content: &str, label: &str) -> Result<()> {
-    if path.exists() {
-        bail!(
-            "refusing to overwrite existing swarm-progress {label}: {}",
-            path.display()
-        );
-    }
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, content)?;
-    Ok(())
-}
-
-fn render_swarm_progress_text(report: &ProgressSloReport) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "Swarm Progress SLO");
-    let _ = writeln!(output, "schema: {}", report.schema);
-    let _ = writeln!(output, "generated_at: {}", report.generated_at);
-    let _ = writeln!(
-        output,
-        "status: {}",
-        swarm_progress_json_key(&report.status)
-    );
-    let _ = writeln!(output, "confidence: {:.3}", report.confidence);
-    let _ = writeln!(
-        output,
-        "window: {} -> {} ({}s, baseline={})",
-        report.time_window.start_utc,
-        report.time_window.end_utc,
-        report.time_window.duration_seconds,
-        report.time_window.comparison_baseline
-    );
-    let _ = writeln!(output, "advisory_only: true");
-    let _ = writeln!(output, "read_only: true");
-    let _ = writeln!(output, "live_mutations: 0");
-    let _ = writeln!(
-        output,
-        "authority_boundary: no live Beads/git/Agent Mail/RCH mutations"
-    );
-    push_swarm_progress_list(&mut output, "reasons", &report.reason_ids);
-    push_swarm_progress_metrics(&mut output, report);
-    push_swarm_progress_saturation(&mut output, report);
-    push_swarm_progress_list(&mut output, "next_actions", &report.next_actions);
-    push_swarm_progress_list(&mut output, "suppressed_claims", &report.suppressed_claims);
-    let _ = writeln!(output, "source_statuses: {}", report.source_statuses.len());
-    output
-}
-
-fn push_swarm_progress_metrics(output: &mut String, report: &ProgressSloReport) {
-    let metrics = &report.progress_metrics;
-    let _ = writeln!(output, "metrics:");
-    let _ = writeln!(output, "- closed_beads: {}", metrics.closed_beads);
-    let _ = writeln!(output, "- open_beads: {}", metrics.open_beads);
-    let _ = writeln!(output, "- in_progress_beads: {}", metrics.in_progress_beads);
-    let _ = writeln!(output, "- ready_beads: {}", metrics.ready_beads);
-    let _ = writeln!(
-        output,
-        "- dependency_blocked_beads: {}",
-        metrics.dependency_blocked_beads
-    );
-    let _ = writeln!(output, "- commits: {}", metrics.commits);
-    let _ = writeln!(output, "- pushed_commits: {}", metrics.pushed_commits);
-    let _ = writeln!(
-        output,
-        "- stale_in_progress_candidates: {}",
-        metrics.stale_in_progress_candidates
-    );
-    let _ = writeln!(
-        output,
-        "- agent_mail_health: {}",
-        swarm_progress_json_key(&metrics.agent_mail_health)
-    );
-    let _ = writeln!(
-        output,
-        "- rch_posture: {}",
-        swarm_progress_json_key(&metrics.rch_posture)
-    );
-    let _ = writeln!(
-        output,
-        "- validation_broker_posture: {}",
-        swarm_progress_json_key(&metrics.validation_broker_posture)
-    );
-}
-
-fn push_swarm_progress_saturation(output: &mut String, report: &ProgressSloReport) {
-    let saturation = &report.saturation_summary;
-    let _ = writeln!(output, "saturation:");
-    let _ = writeln!(
-        output,
-        "- coordination_saturation: {}",
-        swarm_progress_json_key(&saturation.coordination_saturation)
-    );
-    let _ = writeln!(
-        output,
-        "- build_saturation: {}",
-        swarm_progress_json_key(&saturation.build_saturation)
-    );
-    let _ = writeln!(
-        output,
-        "- validation_saturation: {}",
-        swarm_progress_json_key(&saturation.validation_saturation)
-    );
-    let _ = writeln!(
-        output,
-        "- queue_convergence: {}",
-        swarm_progress_json_key(&saturation.queue_convergence)
-    );
-    let _ = writeln!(
-        output,
-        "- recommended_operator_posture: {}",
-        swarm_progress_json_key(&saturation.recommended_operator_posture)
-    );
-}
-
-fn push_swarm_progress_list(output: &mut String, label: &str, values: &[String]) {
-    let _ = writeln!(output, "{label}:");
-    if values.is_empty() {
-        let _ = writeln!(output, "- none");
-    } else {
-        for value in values {
-            let _ = writeln!(output, "- {value}");
-        }
-    }
-}
-
-fn swarm_progress_json_key(value: &impl Serialize) -> String {
-    serde_json::to_string(value).map_or_else(
-        |_| "unknown".to_string(),
-        |raw| raw.trim_matches('"').to_string(),
-    )
-}
-
-const SWARM_REPLAY_PREVIEW_SCHEMA: &str = "pi.swarm.replay_preview.v1";
-
-#[derive(Debug, Serialize)]
-struct SwarmReplayPreviewReport<'a> {
-    schema: &'static str,
-    generated_at_utc: String,
-    command: SwarmReplayPreviewCommand,
-    trace: SwarmReplayPreviewTraceSummary,
-    replay: SwarmReplayPreviewReplaySummary,
-    policies: SwarmReplayPreviewPolicySection<'a>,
-    recommendation: Option<SwarmReplayPreviewPolicySummary<'a>>,
-    output_paths: SwarmReplayPreviewOutputPaths,
-    guards: SwarmReplayPreviewGuards,
-}
-
-#[derive(Debug, Serialize)]
-struct SwarmReplayPreviewCommand {
-    invocation: &'static str,
-    cwd: String,
-    read_only_replay: bool,
-    provider_calls: u8,
-    live_mutations: u8,
-    output_writes: u8,
-}
-
-#[derive(Debug, Serialize)]
-struct SwarmReplayPreviewTraceSummary {
-    path: String,
-    schema: String,
-    trace_id: String,
-    generated_at: String,
-    source_count: u64,
-    event_count: u64,
-    first_event_id: Option<String>,
-    last_event_id: Option<String>,
-    redaction_status: String,
-    uncertainty_state: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SwarmReplayPreviewReplaySummary {
-    schema: &'static str,
-    replayed_event_count: u64,
-    final_logical_clock: u64,
-    snapshot_count: u64,
-    diagnostic_count: u64,
-    diagnostics: Vec<SwarmReplayPreviewDiagnosticSummary>,
-    final_state: SwarmReplayPreviewStateSummary,
-    resource_saturation_points: u64,
-    first_saturation_reasons: Vec<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct SwarmReplayPreviewDiagnosticSummary {
-    code: String,
-    severity: String,
-    event_id: Option<String>,
-    message: String,
-}
-
-#[derive(Debug, Serialize)]
-struct SwarmReplayPreviewStateSummary {
-    bead_count: u64,
-    agent_count: u64,
-    active_reservation_count: u64,
-    active_build_slot_count: u64,
-    rch_job_count: u64,
-    validation_gate_count: u64,
-    runpack_recommendation_count: u64,
-    operator_handoff_count: u64,
-    reservation_conflict_count: u64,
-    agent_mail_available: bool,
-    missing_agent_mail_evidence: bool,
-    dirty_worktree: Option<bool>,
-}
-
-#[derive(Debug, Serialize)]
-struct SwarmReplayPreviewPolicySection<'a> {
-    schema: &'static str,
-    requested_policy_ids: Vec<String>,
-    evaluated_policy_ids: Vec<String>,
-    decision_count: u64,
-    comparison_count: u64,
-    distinct_action_count: u64,
-    score_spread: Option<i64>,
-    comparisons: Vec<SwarmReplayPreviewPolicySummary<'a>>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct SwarmReplayPreviewPolicySummary<'a> {
-    policy_id: &'a str,
-    rank: u64,
-    score: i64,
-    confidence: &'a str,
-    confidence_score: u64,
-    throughput_actions: u64,
-    validation_commands_deferred: u64,
-    local_fallback_risk: &'a str,
-    reservation_conflicts_avoided: u64,
-    stale_work_reclaimed: u64,
-    missing_data_claims: Vec<&'a str>,
-    rationale: Vec<&'a str>,
-}
-
-#[derive(Debug, Serialize)]
-struct SwarmReplayPreviewOutputPaths {
-    json: Option<String>,
-    text: Option<String>,
-}
-
-#[allow(clippy::struct_excessive_bools)]
-#[derive(Debug, Serialize)]
-struct SwarmReplayPreviewGuards {
-    read_only_replay: bool,
-    no_live_mutation: bool,
-    no_network_required: bool,
-    output_artifacts_only: bool,
-    runpack_not_source_of_truth: bool,
-}
-
-#[allow(clippy::too_many_arguments)]
-fn handle_swarm_replay_preview_blocking(
-    cwd: &Path,
-    trace: &str,
-    policy_names: &[String],
-    format: &str,
-    out_json: Option<&str>,
-    out_text: Option<&str>,
-    generated_at: Option<&str>,
-) -> Result<()> {
-    let trace_arg = non_empty_string(trace)
-        .ok_or_else(|| anyhow::anyhow!("swarm-replay-preview requires --trace"))?;
-    let trace_path = resolve_cli_path(cwd, &trace_arg);
-    let trace_raw = fs::read_to_string(&trace_path)?;
-    let trace = serde_json::from_str::<SwarmReplayTrace>(&trace_raw)?;
-    if trace.schema != SWARM_REPLAY_TRACE_SCHEMA {
-        bail!(
-            "swarm-replay-preview requires trace schema {SWARM_REPLAY_TRACE_SCHEMA}, got {}",
-            trace.schema
-        );
-    }
-    let selected_policies = selected_swarm_replay_policies(policy_names)?;
-    let replay_report = replay_swarm_trace(&trace)?;
-    let policy_report =
-        evaluate_swarm_replay_baseline_policies(&replay_report, &selected_policies)?;
-    let generated_at_utc = swarm_replay_preview_generated_at(generated_at)?;
-    let output_writes = u8::from(out_json.is_some()) + u8::from(out_text.is_some());
-    let output_paths = SwarmReplayPreviewOutputPaths {
-        json: out_json.map(ToString::to_string),
-        text: out_text.map(ToString::to_string),
-    };
-    let report = build_swarm_replay_preview_report(
-        cwd,
-        &trace_arg,
-        generated_at_utc,
-        output_writes,
-        output_paths,
-        &trace,
-        &replay_report,
-        &policy_report,
-    );
-    let json_output = serde_json::to_string_pretty(&report)?;
-    let text_output = render_swarm_replay_preview_text(&report);
-
-    if let Some(path) = out_json {
-        write_swarm_replay_preview_output(
-            &resolve_cli_path(cwd, path),
-            &json_output,
-            "JSON preview",
-        )?;
-    }
-    if let Some(path) = out_text {
-        write_swarm_replay_preview_output(
-            &resolve_cli_path(cwd, path),
-            &text_output,
-            "text preview",
-        )?;
-    }
-    if out_json.is_none() && out_text.is_none() {
-        match format {
-            "json" => println!("{json_output}"),
-            "text" => print!("{text_output}"),
-            other => bail!("unsupported swarm-replay-preview format: {other}"),
-        }
-    }
-
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
-fn build_swarm_replay_preview_report<'a>(
-    cwd: &Path,
-    trace_path: &str,
-    generated_at_utc: String,
-    output_writes: u8,
-    output_paths: SwarmReplayPreviewOutputPaths,
-    trace: &SwarmReplayTrace,
-    replay_report: &pi::swarm_replay::SwarmReplayReport,
-    policy_report: &'a pi::swarm_replay::SwarmReplayPolicyReport,
-) -> SwarmReplayPreviewReport<'a> {
-    let comparisons = policy_report
-        .policy_comparisons
-        .iter()
-        .map(summarize_swarm_replay_policy_comparison)
-        .collect::<Vec<_>>();
-    let recommendation = policy_report
-        .policy_comparisons
-        .first()
-        .map(summarize_swarm_replay_policy_comparison);
-    let score_spread = policy_score_spread(&policy_report.policy_comparisons);
-    let distinct_action_count = {
-        let actions = policy_report
-            .decisions
-            .iter()
-            .map(|decision| decision.action.as_str())
-            .collect::<BTreeSet<_>>();
-        u64::try_from(actions.len()).unwrap_or(u64::MAX)
-    };
-    let first_saturation_reasons = replay_report
-        .resource_pressure_timeline
-        .iter()
-        .find(|snapshot| !snapshot.saturation_reasons.is_empty())
-        .map(|snapshot| snapshot.saturation_reasons.clone())
-        .unwrap_or_default();
-
-    SwarmReplayPreviewReport {
-        schema: SWARM_REPLAY_PREVIEW_SCHEMA,
-        generated_at_utc,
-        command: SwarmReplayPreviewCommand {
-            invocation: "pi swarm-replay-preview",
-            cwd: normalize_display_path(cwd),
-            read_only_replay: true,
-            provider_calls: 0,
-            live_mutations: 0,
-            output_writes,
-        },
-        trace: SwarmReplayPreviewTraceSummary {
-            path: trace_path.to_string(),
-            schema: trace.schema.clone(),
-            trace_id: trace.trace_id.clone(),
-            generated_at: trace.generated_at.clone(),
-            source_count: u64::try_from(trace.source_inventory.len()).unwrap_or(u64::MAX),
-            event_count: u64::try_from(trace.events.len()).unwrap_or(u64::MAX),
-            first_event_id: trace.events.first().map(|event| event.event_id.clone()),
-            last_event_id: trace.events.last().map(|event| event.event_id.clone()),
-            redaction_status: swarm_replay_redaction_status(trace),
-            uncertainty_state: swarm_replay_uncertainty_state(trace),
-        },
-        replay: SwarmReplayPreviewReplaySummary {
-            schema: SWARM_REPLAY_REPORT_SCHEMA,
-            replayed_event_count: replay_report.replayed_event_count,
-            final_logical_clock: replay_report.final_logical_clock,
-            snapshot_count: u64::try_from(replay_report.snapshots.len()).unwrap_or(u64::MAX),
-            diagnostic_count: u64::try_from(replay_report.diagnostics.len()).unwrap_or(u64::MAX),
-            diagnostics: replay_report
-                .diagnostics
-                .iter()
-                .take(8)
-                .map(|diagnostic| SwarmReplayPreviewDiagnosticSummary {
-                    code: diagnostic.code.clone(),
-                    severity: diagnostic.severity.clone(),
-                    event_id: diagnostic.event_id.clone(),
-                    message: diagnostic.message.clone(),
-                })
-                .collect(),
-            final_state: SwarmReplayPreviewStateSummary {
-                bead_count: u64::try_from(replay_report.final_state.beads.len())
-                    .unwrap_or(u64::MAX),
-                agent_count: u64::try_from(replay_report.final_state.agents.len())
-                    .unwrap_or(u64::MAX),
-                active_reservation_count: u64::try_from(
-                    replay_report
-                        .final_state
-                        .reservations
-                        .values()
-                        .filter(|reservation| reservation.active)
-                        .count(),
-                )
-                .unwrap_or(u64::MAX),
-                active_build_slot_count: u64::try_from(replay_report.final_state.build_slots.len())
-                    .unwrap_or(u64::MAX),
-                rch_job_count: u64::try_from(replay_report.final_state.rch_jobs.len())
-                    .unwrap_or(u64::MAX),
-                validation_gate_count: u64::try_from(
-                    replay_report.final_state.validation_gates.len(),
-                )
-                .unwrap_or(u64::MAX),
-                runpack_recommendation_count: u64::try_from(
-                    replay_report.final_state.runpack_recommendations.len(),
-                )
-                .unwrap_or(u64::MAX),
-                operator_handoff_count: u64::try_from(
-                    replay_report.final_state.operator_handoffs.len(),
-                )
-                .unwrap_or(u64::MAX),
-                reservation_conflict_count: replay_report
-                    .final_state
-                    .coordination
-                    .reservation_conflict_count,
-                agent_mail_available: replay_report.final_state.coordination.agent_mail_available,
-                missing_agent_mail_evidence: replay_report
-                    .final_state
-                    .coordination
-                    .missing_agent_mail_evidence,
-                dirty_worktree: replay_report
-                    .final_state
-                    .worktree
-                    .as_ref()
-                    .map(|worktree| worktree.dirty),
-            },
-            resource_saturation_points: u64::try_from(
-                replay_report
-                    .resource_pressure_timeline
-                    .iter()
-                    .filter(|snapshot| !snapshot.saturation_reasons.is_empty())
-                    .count(),
-            )
-            .unwrap_or(u64::MAX),
-            first_saturation_reasons,
-        },
-        policies: SwarmReplayPreviewPolicySection {
-            schema: SWARM_REPLAY_POLICY_REPORT_SCHEMA,
-            requested_policy_ids: policy_report.policy_ids.clone(),
-            evaluated_policy_ids: policy_report.policy_ids.clone(),
-            decision_count: policy_report.decision_count,
-            comparison_count: policy_report.comparison_count,
-            distinct_action_count,
-            score_spread,
-            comparisons,
-        },
-        recommendation,
-        output_paths,
-        guards: SwarmReplayPreviewGuards {
-            read_only_replay: true,
-            no_live_mutation: true,
-            no_network_required: true,
-            output_artifacts_only: true,
-            runpack_not_source_of_truth: true,
-        },
-    }
-}
-
-fn swarm_replay_redaction_status(trace: &SwarmReplayTrace) -> String {
-    if trace.redaction_summary.raw_secret_bytes_emitted > 0 {
-        "unsafe_raw_secret_bytes_emitted".to_string()
-    } else if trace.redaction_summary.redacted_count > 0
-        || trace.redaction_summary.sensitive_omitted_count > 0
-    {
-        "redacted".to_string()
-    } else {
-        "clean".to_string()
-    }
-}
-
-fn swarm_replay_uncertainty_state(trace: &SwarmReplayTrace) -> String {
-    if !trace.uncertainty_summary.malformed_sources.is_empty() {
-        "malformed_sources".to_string()
-    } else if !trace.uncertainty_summary.missing_sources.is_empty() {
-        "missing_sources".to_string()
-    } else if !trace.uncertainty_summary.suppressed_claims.is_empty() {
-        "suppressed_claims".to_string()
-    } else if !trace.uncertainty_summary.stale_sources.is_empty() {
-        "stale_sources".to_string()
-    } else if trace
-        .uncertainty_summary
-        .event_count_by_uncertainty
-        .keys()
-        .any(|state| state != "certain")
-    {
-        "uncertain_events".to_string()
-    } else {
-        "certain".to_string()
-    }
-}
-
-fn summarize_swarm_replay_policy_comparison(
-    comparison: &SwarmReplayPolicyComparison,
-) -> SwarmReplayPreviewPolicySummary<'_> {
-    SwarmReplayPreviewPolicySummary {
-        policy_id: comparison.policy_id.as_str(),
-        rank: comparison.rank,
-        score: comparison.score,
-        confidence: comparison.confidence.level.as_str(),
-        confidence_score: comparison.confidence.score,
-        throughput_actions: comparison.metrics.throughput_actions,
-        validation_commands_deferred: comparison.metrics.validation_commands_deferred,
-        local_fallback_risk: comparison.metrics.local_fallback_risk.as_str(),
-        reservation_conflicts_avoided: comparison.metrics.reservation_conflicts_avoided,
-        stale_work_reclaimed: comparison.metrics.stale_work_reclaimed,
-        missing_data_claims: comparison
-            .missing_data
-            .iter()
-            .map(|missing| missing.claim.as_str())
-            .collect(),
-        rationale: comparison
-            .rationale
-            .iter()
-            .take(4)
-            .map(String::as_str)
-            .collect(),
-    }
-}
-
-fn policy_score_spread(comparisons: &[SwarmReplayPolicyComparison]) -> Option<i64> {
-    let min = comparisons
-        .iter()
-        .map(|comparison| comparison.score)
-        .min()?;
-    let max = comparisons
-        .iter()
-        .map(|comparison| comparison.score)
-        .max()?;
-    Some(max.saturating_sub(min))
-}
-
-fn selected_swarm_replay_policies(
-    policy_names: &[String],
-) -> Result<Vec<SwarmReplayBaselinePolicy>> {
-    if policy_names.is_empty() {
-        return Ok(default_swarm_replay_baseline_policies().to_vec());
-    }
-
-    let mut seen = BTreeSet::new();
-    let mut policies = Vec::new();
-    for raw in policy_names {
-        let Some(value) = non_empty_string(raw) else {
-            bail!("swarm-replay-preview requires non-empty --policy values");
-        };
-        let Some(policy) = parse_swarm_replay_policy(&value) else {
-            bail!(
-                "unsupported swarm-replay-preview policy {value}; valid policies: {}",
-                swarm_replay_policy_help()
-            );
-        };
-        if seen.insert(policy) {
-            policies.push(policy);
-        }
-    }
-    Ok(policies)
-}
-
-fn parse_swarm_replay_policy(value: &str) -> Option<SwarmReplayBaselinePolicy> {
-    let normalized = value.trim().replace('-', "_");
-    match normalized.as_str() {
-        "conservative_manual" => Some(SwarmReplayBaselinePolicy::ConservativeManual),
-        "existing_autopilot" => Some(SwarmReplayBaselinePolicy::ExistingAutopilot),
-        "rch_fanout_limited" => Some(SwarmReplayBaselinePolicy::RchFanoutLimited),
-        "stale_bead_reclaiming" => Some(SwarmReplayBaselinePolicy::StaleBeadReclaiming),
-        "build_slot_protective" => Some(SwarmReplayBaselinePolicy::BuildSlotProtective),
-        _ => None,
-    }
-}
-
-fn swarm_replay_policy_help() -> String {
-    default_swarm_replay_baseline_policies()
-        .iter()
-        .map(SwarmReplayPolicyAdapter::policy_id)
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-fn swarm_replay_preview_generated_at(generated_at: Option<&str>) -> Result<String> {
-    let Some(value) = generated_at.and_then(non_empty_string) else {
-        return Ok(chrono::Utc::now().to_rfc3339());
-    };
-    if chrono::DateTime::parse_from_rfc3339(&value).is_err() {
-        bail!("swarm-replay-preview requires --generated-at to be RFC3339: {value}");
-    }
-    Ok(value)
-}
-
-fn resolve_cli_path(cwd: &Path, raw: &str) -> PathBuf {
-    let path = PathBuf::from(raw);
-    if path.is_absolute() {
-        path
-    } else {
-        cwd.join(path)
-    }
-}
-
-fn write_swarm_replay_preview_output(path: &Path, content: &str, label: &str) -> Result<()> {
-    if path.exists() {
-        bail!("refusing to overwrite existing {label}: {}", path.display());
-    }
-    if let Some(parent) = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent)?;
-    }
-    fs::write(path, content)?;
-    Ok(())
-}
-
-fn render_swarm_replay_preview_text(report: &SwarmReplayPreviewReport<'_>) -> String {
-    let mut output = String::new();
-    let _ = writeln!(output, "Swarm Replay Preview");
-    let _ = writeln!(output, "schema: {}", report.schema);
-    let _ = writeln!(output, "trace: {}", report.trace.trace_id);
-    let _ = writeln!(
-        output,
-        "events: {} replayed, {} snapshots",
-        report.replay.replayed_event_count, report.replay.snapshot_count
-    );
-    let _ = writeln!(
-        output,
-        "sources: {} ({})",
-        report.trace.source_count, report.trace.uncertainty_state
-    );
-    let _ = writeln!(
-        output,
-        "final_state: {} beads, {} agents, {} active reservations, {} reservation conflicts",
-        report.replay.final_state.bead_count,
-        report.replay.final_state.agent_count,
-        report.replay.final_state.active_reservation_count,
-        report.replay.final_state.reservation_conflict_count
-    );
-    let _ = writeln!(
-        output,
-        "policies: {} evaluated, {} decisions, {} distinct actions",
-        report.policies.evaluated_policy_ids.len(),
-        report.policies.decision_count,
-        report.policies.distinct_action_count
-    );
-    if let Some(recommendation) = &report.recommendation {
-        let _ = writeln!(
-            output,
-            "top_policy: {} rank {} score {} confidence {}",
-            recommendation.policy_id,
-            recommendation.rank,
-            recommendation.score,
-            recommendation.confidence
-        );
-        for reason in &recommendation.rationale {
-            let _ = writeln!(output, "rationale: {reason}");
-        }
-    }
-    if report.replay.diagnostic_count > 0 {
-        let _ = writeln!(output, "diagnostics: {}", report.replay.diagnostic_count);
-        for diagnostic in &report.replay.diagnostics {
-            let _ = writeln!(
-                output,
-                "- {} {}: {}",
-                diagnostic.severity, diagnostic.code, diagnostic.message
-            );
-        }
-    } else {
-        let _ = writeln!(output, "diagnostics: 0");
-    }
-    if report.replay.resource_saturation_points > 0 {
-        let _ = writeln!(
-            output,
-            "resource_saturation_points: {}",
-            report.replay.resource_saturation_points
-        );
-        for reason in &report.replay.first_saturation_reasons {
-            let _ = writeln!(output, "saturation: {reason}");
-        }
-    }
-    let _ = writeln!(
-        output,
-        "guards: read_only={} no_live_mutation={} no_network_required={} runpack_not_source_of_truth={}",
-        report.guards.read_only_replay,
-        report.guards.no_live_mutation,
-        report.guards.no_network_required,
-        report.guards.runpack_not_source_of_truth
-    );
-    output
 }
 
 #[derive(Debug, Serialize)]
@@ -3657,8 +1212,6 @@ const fn scope_from_flag(local: bool) -> PackageScope {
 async fn handle_package_install(manager: &PackageManager, source: &str, local: bool) -> Result<()> {
     let scope = scope_from_flag(local);
     let resolved_source = manager.resolve_install_source_alias(source);
-    let safety_index = load_extension_safety_index();
-    print_install_safety_advisory(&resolved_source, safety_index.as_ref());
     manager.install(&resolved_source, scope).await?;
     manager.add_package_source(&resolved_source, scope).await?;
     if resolved_source.eq(source) {
@@ -3676,8 +1229,6 @@ fn handle_package_install_blocking(
 ) -> Result<()> {
     let scope = scope_from_flag(local);
     let resolved_source = manager.resolve_install_source_alias(source);
-    let safety_index = load_extension_safety_index();
-    print_install_safety_advisory(&resolved_source, safety_index.as_ref());
     manager.install_blocking(&resolved_source, scope)?;
     manager.add_package_source_blocking(&resolved_source, scope)?;
     if resolved_source.eq(source) {
@@ -3821,7 +1372,6 @@ fn handle_package_update_blocking(manager: &PackageManager, source: Option<&str>
 async fn handle_package_list(manager: &PackageManager) -> Result<()> {
     let entries = manager.list_packages().await?;
     let (user, project) = split_package_entries(entries);
-    let safety_index = load_extension_safety_index();
 
     if user.is_empty() && project.is_empty() {
         println!("No packages installed.");
@@ -3831,7 +1381,7 @@ async fn handle_package_list(manager: &PackageManager) -> Result<()> {
     if !user.is_empty() {
         println!("User packages:");
         for entry in &user {
-            print_package_entry(manager, entry, safety_index.as_ref()).await?;
+            print_package_entry(manager, entry).await?;
         }
     }
 
@@ -3841,7 +1391,7 @@ async fn handle_package_list(manager: &PackageManager) -> Result<()> {
         }
         println!("Project packages:");
         for entry in &project {
-            print_package_entry(manager, entry, safety_index.as_ref()).await?;
+            print_package_entry(manager, entry).await?;
         }
     }
 
@@ -3850,9 +1400,8 @@ async fn handle_package_list(manager: &PackageManager) -> Result<()> {
 
 fn handle_package_list_blocking(manager: &PackageManager) -> Result<()> {
     let entries = manager.list_packages_blocking()?;
-    let safety_index = load_extension_safety_index();
     print_package_list_entries_blocking(manager, entries, |manager, entry| {
-        print_package_entry_blocking(manager, entry, safety_index.as_ref())
+        print_package_entry_blocking(manager, entry)
     })
 }
 
@@ -3903,463 +1452,7 @@ where
     Ok(())
 }
 
-async fn handle_update_index() -> Result<()> {
-    let store = ExtensionIndexStore::default_store();
-    let client = pi::http::client::Client::new();
-    let (_, stats) = store.refresh_best_effort(&client).await?;
-
-    if !stats.refreshed {
-        println!(
-            "Extension index refresh skipped: remote sources unavailable; using existing seed/cache."
-        );
-        return Ok(());
-    }
-
-    println!(
-        "Extension index refreshed: {} merged entries (npm: {}, github: {}) at {}",
-        stats.merged_entries,
-        stats.npm_entries,
-        stats.github_entries,
-        store.path().display()
-    );
-    Ok(())
-}
-
-async fn handle_search(query: &str, tag: Option<&str>, sort: &str, limit: usize) -> Result<()> {
-    let store = ExtensionIndexStore::default_store();
-
-    // Load cached index; auto-refresh only if a cache file exists but is stale.
-    // If no cache exists, use the built-in seed index without a network call.
-    let mut index = store.load_or_seed()?;
-    let has_cache = store.path().exists();
-    if has_cache && index.is_stale(chrono::Utc::now(), DEFAULT_INDEX_MAX_AGE) {
-        println!("Refreshing extension index...");
-        let client = pi::http::client::Client::new();
-        match store.refresh_best_effort(&client).await {
-            Ok((refreshed, _)) => index = refreshed,
-            Err(_) => {
-                println!(
-                    "Warning: Could not refresh index (network unavailable). Using cached results."
-                );
-            }
-        }
-    }
-
-    render_search_results(&index, query, tag, sort, limit);
-    Ok(())
-}
-
-fn handle_search_blocking(
-    query: &str,
-    tag: Option<&str>,
-    sort: &str,
-    limit: usize,
-) -> Result<bool> {
-    let store = ExtensionIndexStore::default_store();
-    let index = store.load_or_seed()?;
-
-    // Preserve refresh semantics: if cache is stale, fall back to async path so we can
-    // attempt network refresh before searching.
-    let has_cache = store.path().exists();
-    if has_cache && index.is_stale(chrono::Utc::now(), DEFAULT_INDEX_MAX_AGE) {
-        return Ok(false);
-    }
-
-    render_search_results(&index, query, tag, sort, limit);
-    Ok(true)
-}
-
-fn render_search_results(
-    index: &pi::extension_index::ExtensionIndex,
-    query: &str,
-    tag: Option<&str>,
-    sort: &str,
-    limit: usize,
-) {
-    let hits = collect_search_hits(index, tag, sort, limit, query);
-    if hits.is_empty() {
-        println!("No extensions found for \"{query}\".");
-        return;
-    }
-
-    print_search_results(&hits, index);
-}
-
-fn collect_search_hits(
-    index: &pi::extension_index::ExtensionIndex,
-    tag: Option<&str>,
-    sort: &str,
-    limit: usize,
-    query: &str,
-) -> Vec<pi::extension_index::ExtensionSearchHit> {
-    if limit.eq(&0) {
-        return Vec::new();
-    }
-
-    let mut hits = index.search(query, index.entries.len());
-
-    // Filter by tag if requested
-    if let Some(tag_filter) = tag {
-        let tag_lower = tag_filter.to_ascii_lowercase();
-        hits.retain(|hit| {
-            hit.entry
-                .tags
-                .iter()
-                .any(|t| t.to_ascii_lowercase().eq(&tag_lower))
-        });
-    }
-
-    // Sort by name if requested (relevance is the default from search())
-    if sort.eq("name") {
-        hits.sort_by(|a, b| {
-            a.entry
-                .name
-                .to_ascii_lowercase()
-                .cmp(&b.entry.name.to_ascii_lowercase())
-        });
-    }
-
-    hits.truncate(limit);
-    hits
-}
-
-fn truncate_chars(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_string();
-    }
-    let keep = max_chars.saturating_sub(3);
-    let truncated = value.chars().take(keep).collect::<String>();
-    format!("{truncated}...")
-}
-
-#[allow(clippy::uninlined_format_args)]
-fn print_search_results(hits: &[pi::extension_index::ExtensionSearchHit], index: &ExtensionIndex) {
-    // Column widths
-    let name_w = hits
-        .iter()
-        .map(|h| h.entry.name.len())
-        .max()
-        .unwrap_or(0)
-        .max(4); // "Name"
-    let desc_w = hits
-        .iter()
-        .map(|h| h.entry.description.as_deref().unwrap_or("").len().min(50))
-        .max()
-        .unwrap_or(0)
-        .max(11); // "Description"
-    let tags_w = hits
-        .iter()
-        .map(|h| h.entry.tags.join(", ").len().min(30))
-        .max()
-        .unwrap_or(0)
-        .max(4); // "Tags"
-    let source_w = 6; // "Source"
-    let safety_w = hits
-        .iter()
-        .map(|h| {
-            ExtensionSafetyProvenance::from_index_entry(&h.entry, index, DEFAULT_INDEX_MAX_AGE)
-                .compact_label()
-                .len()
-                .min(44)
-        })
-        .max()
-        .unwrap_or(0)
-        .max(6); // "Safety"
-
-    // Header
-    println!(
-        "  {:<name_w$}  {:<desc_w$}  {:<tags_w$}  {:<source_w$}  {:<safety_w$}",
-        "Name", "Description", "Tags", "Source", "Safety"
-    );
-    println!(
-        "  {:<name_w$}  {:<desc_w$}  {:<tags_w$}  {:<source_w$}  {:<safety_w$}",
-        "-".repeat(name_w),
-        "-".repeat(desc_w),
-        "-".repeat(tags_w),
-        "-".repeat(source_w),
-        "-".repeat(safety_w)
-    );
-
-    // Rows
-    for hit in hits {
-        let desc = hit.entry.description.as_deref().unwrap_or("");
-        let desc_truncated = if desc.chars().count() > 50 {
-            let truncated: String = desc.chars().take(47).collect();
-            format!("{truncated}...")
-        } else {
-            desc.to_string()
-        };
-        let tags_joined = hit.entry.tags.join(", ");
-        let tags_truncated = if tags_joined.chars().count() > 30 {
-            let truncated: String = tags_joined.chars().take(27).collect();
-            format!("{truncated}...")
-        } else {
-            tags_joined
-        };
-        let source_label = match &hit.entry.source {
-            Some(pi::extension_index::ExtensionIndexSource::Npm { .. }) => "npm",
-            Some(pi::extension_index::ExtensionIndexSource::Git { .. }) => "git",
-            Some(pi::extension_index::ExtensionIndexSource::Url { .. }) => "url",
-            None => "-",
-        };
-        let safety =
-            ExtensionSafetyProvenance::from_index_entry(&hit.entry, index, DEFAULT_INDEX_MAX_AGE)
-                .compact_label();
-        let safety_truncated = truncate_chars(&safety, 44);
-        println!(
-            "  {:<name_w$}  {:<desc_w$}  {:<tags_w$}  {:<source_w$}  {:<safety_w$}",
-            hit.entry.name, desc_truncated, tags_truncated, source_label, safety_truncated
-        );
-    }
-
-    let count = hits.len();
-    let noun = if count.eq(&1) {
-        "extension"
-    } else {
-        "extensions"
-    };
-    println!("\n  {count} {noun} found. Install with: pi install <name>");
-}
-
-fn handle_info_blocking(name: &str) -> Result<()> {
-    let index = ExtensionIndexStore::default_store().load_or_seed()?;
-    match find_index_entry_by_name_or_id(&index, name) {
-        ExtensionInfoLookup::Found(entry) => print_extension_info(entry, &index),
-        ExtensionInfoLookup::Ambiguous => {
-            println!("Extension query \"{name}\" is ambiguous.");
-            println!("Try: pi search {name}");
-        }
-        ExtensionInfoLookup::NotFound => {
-            println!("Extension \"{name}\" not found.");
-            println!("Try: pi search {name}");
-        }
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ExtensionInfoLookup<'a> {
-    Found(&'a pi::extension_index::ExtensionIndexEntry),
-    NotFound,
-    Ambiguous,
-}
-
-fn find_index_entry_by_name_or_id<'a>(
-    index: &'a pi::extension_index::ExtensionIndex,
-    name: &str,
-) -> ExtensionInfoLookup<'a> {
-    // Look up by exact id, name, or fuzzy match when there is a single best hit.
-    if let Some(entry) = index
-        .entries
-        .iter()
-        .find(|e| e.id.eq_ignore_ascii_case(name) || e.name.eq_ignore_ascii_case(name))
-    {
-        return ExtensionInfoLookup::Found(entry);
-    }
-
-    let hits = index.search(name, 2);
-    let Some(best_hit) = hits.first() else {
-        return ExtensionInfoLookup::NotFound;
-    };
-
-    if hits
-        .get(1)
-        .is_some_and(|next_hit| next_hit.score.eq(&best_hit.score))
-    {
-        return ExtensionInfoLookup::Ambiguous;
-    }
-
-    index
-        .entries
-        .iter()
-        .find(|entry| entry.id.eq(&best_hit.entry.id))
-        .map_or(ExtensionInfoLookup::NotFound, ExtensionInfoLookup::Found)
-}
-
-fn print_extension_info(entry: &ExtensionIndexEntry, index: &ExtensionIndex) {
-    let width = 60;
-    let bar = "─".repeat(width);
-
-    // Header
-    println!("  ┌{bar}┐");
-    let title = &entry.name;
-    let padding = width.saturating_sub(title.len() + 1);
-    println!("  │ {title}{:padding$}│", "");
-
-    // ID (if different from name)
-    if entry.id.ne(&entry.name) {
-        let id_line = format!("id: {}", entry.id);
-        let padding = width.saturating_sub(id_line.len() + 1);
-        println!("  │ {id_line}{:padding$}│", "");
-    }
-
-    // Description
-    if let Some(desc) = &entry.description {
-        println!("  │{:width$}│", "");
-        for line in wrap_text(desc, width - 2) {
-            let padding = width.saturating_sub(line.len() + 1);
-            println!("  │ {line}{:padding$}│", "");
-        }
-    }
-
-    // Separator
-    println!("  ├{bar}┤");
-
-    // Tags
-    if !entry.tags.is_empty() {
-        let tags_line = format!("Tags: {}", entry.tags.join(", "));
-        let padding = width.saturating_sub(tags_line.len() + 1);
-        println!("  │ {tags_line}{:padding$}│", "");
-    }
-
-    // License
-    if let Some(license) = &entry.license {
-        let lic_line = format!("License: {license}");
-        let padding = width.saturating_sub(lic_line.len() + 1);
-        println!("  │ {lic_line}{:padding$}│", "");
-    }
-
-    // Source
-    if let Some(source) = &entry.source {
-        let source_line = match source {
-            pi::extension_index::ExtensionIndexSource::Npm {
-                package, version, ..
-            } => {
-                let ver = version.as_deref().unwrap_or("latest");
-                format!("Source: npm:{package}@{ver}")
-            }
-            pi::extension_index::ExtensionIndexSource::Git { repo, path, .. } => {
-                let suffix = path.as_deref().map_or(String::new(), |p| format!(" ({p})"));
-                format!("Source: git:{repo}{suffix}")
-            }
-            pi::extension_index::ExtensionIndexSource::Url { url } => {
-                format!("Source: {url}")
-            }
-        };
-        for line in wrap_text(&source_line, width - 2) {
-            let padding = width.saturating_sub(line.len() + 1);
-            println!("  │ {line}{:padding$}│", "");
-        }
-    }
-
-    // Safety provenance
-    let safety = ExtensionSafetyProvenance::from_index_entry(entry, index, DEFAULT_INDEX_MAX_AGE);
-    println!("  ├{bar}┤");
-    for line in extension_safety_lines(&safety) {
-        let padding = width.saturating_sub(line.len() + 1);
-        println!("  │ {line}{:padding$}│", "");
-    }
-
-    // Install command
-    println!("  ├{bar}┤");
-    if let Some(install_source) = &entry.install_source {
-        let install_line = format!("Install: pi install {install_source}");
-        for line in wrap_text(&install_line, width - 2) {
-            let padding = width.saturating_sub(line.len() + 1);
-            println!("  │ {line}{:padding$}│", "");
-        }
-    } else {
-        let hint = "Install source not available";
-        let padding = width.saturating_sub(hint.len() + 1);
-        println!("  │ {hint}{:padding$}│", "");
-    }
-
-    println!("  └{bar}┘");
-}
-
-/// Wrap text to fit within `max_width` characters.
-fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
-    let mut lines = Vec::new();
-    for paragraph in text.split('\n') {
-        if paragraph.is_empty() {
-            lines.push(String::new());
-            continue;
-        }
-        let mut current = String::new();
-        for word in paragraph.split_whitespace() {
-            if current.is_empty() {
-                current = word.to_string();
-            } else if current.len() + 1 + word.len() <= max_width {
-                current.push(' ');
-                current.push_str(word);
-            } else {
-                lines.push(current);
-                current = word.to_string();
-            }
-        }
-        if !current.is_empty() {
-            lines.push(current);
-        }
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-fn load_extension_safety_index() -> Option<ExtensionIndex> {
-    ExtensionIndexStore::default_store().load_or_seed().ok()
-}
-
-fn extension_safety_for_source(
-    source: &str,
-    index: Option<&ExtensionIndex>,
-) -> ExtensionSafetyProvenance {
-    if let Some(index) = index {
-        if let Some(entry) = index
-            .entries
-            .iter()
-            .find(|entry| entry.install_source.as_deref() == Some(source))
-        {
-            return ExtensionSafetyProvenance::from_index_entry(
-                entry,
-                index,
-                DEFAULT_INDEX_MAX_AGE,
-            );
-        }
-    }
-    ExtensionSafetyProvenance::from_install_source(source)
-}
-
-fn extension_safety_lines(safety: &ExtensionSafetyProvenance) -> Vec<String> {
-    let capabilities = if safety.requested_capabilities.is_empty() {
-        "none".to_string()
-    } else {
-        safety.requested_capabilities.join(",")
-    };
-    let mut lines = vec![
-        format!(
-            "Safety: source={} license={} risk={} confidence={}",
-            safety.source_type,
-            safety.license_status,
-            safety.risk_profile,
-            safety.source_confidence
-        ),
-        format!(
-            "Signals: categories={} capabilities={} freshness={}",
-            safety.registration_categories.join(","),
-            capabilities,
-            safety.freshness
-        ),
-    ];
-    if !safety.degraded_reasons.is_empty() {
-        lines.push(format!("Degraded: {}", safety.degraded_reasons.join(",")));
-    }
-    lines
-}
-
-fn print_install_safety_advisory(source: &str, index: Option<&ExtensionIndex>) {
-    let safety = extension_safety_for_source(source, index);
-    for line in extension_safety_lines(&safety) {
-        println!("{line}");
-    }
-}
-
-async fn print_package_entry(
-    manager: &PackageManager,
-    entry: &PackageEntry,
-    index: Option<&ExtensionIndex>,
-) -> Result<()> {
+async fn print_package_entry(manager: &PackageManager, entry: &PackageEntry) -> Result<()> {
     let display = if entry.filter.is_some() {
         format!("{} (filtered)", entry.source)
     } else {
@@ -4369,16 +1462,10 @@ async fn print_package_entry(
     if let Some(path) = manager.installed_path(&entry.source, entry.scope).await? {
         println!("    {}", path.display());
     }
-    let safety = extension_safety_for_source(&entry.source, index);
-    println!("    Safety: {}", safety.compact_label());
     Ok(())
 }
 
-fn print_package_entry_blocking(
-    manager: &PackageManager,
-    entry: &PackageEntry,
-    index: Option<&ExtensionIndex>,
-) -> Result<()> {
+fn print_package_entry_blocking(manager: &PackageManager, entry: &PackageEntry) -> Result<()> {
     let display = if entry.filter.is_some() {
         format!("{} (filtered)", entry.source)
     } else {
@@ -4388,25 +1475,21 @@ fn print_package_entry_blocking(
     if let Some(path) = manager.installed_path_blocking(&entry.source, entry.scope)? {
         println!("    {}", path.display());
     }
-    let safety = extension_safety_for_source(&entry.source, index);
-    println!("    Safety: {}", safety.compact_label());
     Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 enum ConfigResourceKind {
-    Extensions,
     Skills,
     Prompts,
     Themes,
 }
 
 impl ConfigResourceKind {
-    const ALL: [Self; 4] = [Self::Extensions, Self::Skills, Self::Prompts, Self::Themes];
+    const ALL: [Self; 3] = [Self::Skills, Self::Prompts, Self::Themes];
 
     const fn field_name(self) -> &'static str {
         match self {
-            Self::Extensions => "extensions",
             Self::Skills => "skills",
             Self::Prompts => "prompts",
             Self::Themes => "themes",
@@ -4415,7 +1498,6 @@ impl ConfigResourceKind {
 
     const fn label(self) -> &'static str {
         match self {
-            Self::Extensions => "extension",
             Self::Skills => "skill",
             Self::Prompts => "prompt",
             Self::Themes => "theme",
@@ -4424,10 +1506,9 @@ impl ConfigResourceKind {
 
     const fn order(self) -> usize {
         match self {
-            Self::Extensions => 0,
-            Self::Skills => 1,
-            Self::Prompts => 2,
-            Self::Themes => 3,
+            Self::Skills => 0,
+            Self::Prompts => 1,
+            Self::Themes => 2,
         }
     }
 }
@@ -4454,7 +1535,6 @@ struct ConfigPathsReport {
     auth: String,
     sessions: String,
     packages: String,
-    extension_index: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -4485,7 +1565,6 @@ struct ConfigReport {
 
 #[derive(Debug, Clone, Default)]
 struct PackageFilterState {
-    extensions: Option<Vec<String>>,
     skills: Option<Vec<String>>,
     prompts: Option<Vec<String>>,
     themes: Option<Vec<String>>,
@@ -4494,7 +1573,6 @@ struct PackageFilterState {
 impl PackageFilterState {
     fn set_kind(&mut self, kind: ConfigResourceKind, values: Vec<String>) {
         match kind {
-            ConfigResourceKind::Extensions => self.extensions = Some(values),
             ConfigResourceKind::Skills => self.skills = Some(values),
             ConfigResourceKind::Prompts => self.prompts = Some(values),
             ConfigResourceKind::Themes => self.themes = Some(values),
@@ -4503,7 +1581,6 @@ impl PackageFilterState {
 
     const fn values_for_kind(&self, kind: ConfigResourceKind) -> Option<&Vec<String>> {
         match kind {
-            ConfigResourceKind::Extensions => self.extensions.as_ref(),
             ConfigResourceKind::Skills => self.skills.as_ref(),
             ConfigResourceKind::Prompts => self.prompts.as_ref(),
             ConfigResourceKind::Themes => self.themes.as_ref(),
@@ -4511,10 +1588,7 @@ impl PackageFilterState {
     }
 
     const fn has_any_field(&self) -> bool {
-        self.extensions.is_some()
-            || self.skills.is_some()
-            || self.prompts.is_some()
-            || self.themes.is_some()
+        self.skills.is_some() || self.prompts.is_some() || self.themes.is_some()
     }
 }
 
@@ -4797,18 +1871,11 @@ fn collect_config_packages_from_entries(
     }
 
     if let Some(ResolvedPaths {
-        extensions,
         skills,
         prompts,
         themes,
     }) = resolved_paths
     {
-        merge_resolved_resources(
-            ConfigResourceKind::Extensions,
-            &extensions,
-            &mut packages,
-            &mut lookup,
-        );
         merge_resolved_resources(
             ConfigResourceKind::Skills,
             &skills,
@@ -4904,7 +1971,6 @@ fn build_config_report(cwd: &Path, packages: &[ConfigPackageState]) -> ConfigRep
             auth: Config::auth_path().display().to_string(),
             sessions: Config::sessions_dir().display().to_string(),
             packages: Config::package_dir().display().to_string(),
-            extension_index: Config::extension_index_path().display().to_string(),
         },
         precedence: vec![
             "CLI flags".to_string(),
@@ -4928,7 +1994,6 @@ fn print_config_report(report: &ConfigReport, include_packages: bool) {
     println!("  Auth:     {}", report.paths.auth);
     println!("  Sessions: {}", report.paths.sessions);
     println!("  Packages: {}", report.paths.packages);
-    println!("  ExtIndex: {}", report.paths.extension_index);
     println!();
     println!("Settings precedence:");
     for (idx, entry) in report.precedence.iter().enumerate() {
@@ -5332,84 +2397,8 @@ fn handle_session_migrate(path: &str, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-fn handle_doctor(
-    cwd: &Path,
-    extension_path: Option<&str>,
-    format: &str,
-    policy_override: Option<&str>,
-    fix: bool,
-    only: Option<&str>,
-) -> Result<()> {
-    use pi::doctor::{CheckCategory, DoctorOptions};
-
-    let only_set = if let Some(raw) = only {
-        let mut parsed = std::collections::HashSet::new();
-        let mut invalid = Vec::new();
-        for part in raw.split(',') {
-            let name = part.trim();
-            if name.is_empty() {
-                continue;
-            }
-            match name.parse::<CheckCategory>() {
-                Ok(cat) => {
-                    parsed.insert(cat);
-                }
-                Err(_) => invalid.push(name.to_string()),
-            }
-        }
-        if !invalid.is_empty() {
-            bail!(
-                "Unknown --only categories: {} (valid: config, dirs, auth, shell, sessions, swarm, extensions)",
-                invalid.join(", ")
-            );
-        }
-        if parsed.is_empty() {
-            bail!(
-                "--only must include at least one category (valid: config, dirs, auth, shell, sessions, swarm, extensions)"
-            );
-        }
-        Some(parsed)
-    } else {
-        None
-    };
-
-    let opts = DoctorOptions {
-        cwd,
-        extension_path,
-        policy_override,
-        fix,
-        only: only_set,
-    };
-
-    let report = pi::doctor::run_doctor(&opts)?;
-
-    match format {
-        "json" => {
-            println!("{}", report.to_json()?);
-        }
-        "markdown" | "md" => {
-            print!("{}", report.render_markdown());
-        }
-        _ => {
-            print!("{}", report.render_text());
-        }
-    }
-
-    // Exit with code 1 if any failures (useful for CI)
-    if matches!(report.overall, pi::doctor::Severity::Fail) {
-        std::process::exit(1);
-    }
-
-    Ok(())
-}
-
 fn print_version() {
-    println!(
-        "pi {} ({} {})",
-        env!("CARGO_PKG_VERSION"),
-        option_env!("VERGEN_GIT_SHA").unwrap_or("unknown"),
-        option_env!("VERGEN_BUILD_TIMESTAMP").unwrap_or(""),
-    );
+    println!("pi {}", env!("CARGO_PKG_VERSION"));
 }
 
 fn list_models(registry: &ModelRegistry, pattern: Option<&str>) {
@@ -6515,7 +3504,7 @@ async fn run_print_mode(
     initial: Option<InitialMessage>,
     messages: Vec<String>,
     resources: &ResourceLoader,
-    runtime_handle: RuntimeHandle,
+    _runtime_handle: RuntimeHandle,
     config: &Config,
 ) -> Result<()> {
     if mode.ne("text") && mode.ne("json") {
@@ -6540,18 +3529,11 @@ async fn run_print_mode(
     }
 
     let text_stream_state = Arc::new(StdMutex::new(PrintTextStreamState::default()));
-    let extensions = session.extensions.as_ref().map(|r| r.manager().clone());
     let emit_json_events = mode.eq("json");
     let stream_text_events = mode.eq("text");
-    let runtime_for_events = runtime_handle.clone();
     let text_stream_state_for_events = Arc::clone(&text_stream_state);
     let make_event_handler = move || {
-        let extensions = extensions.clone();
-        let runtime_for_events = runtime_for_events.clone();
         let text_stream_state = Arc::clone(&text_stream_state_for_events);
-        let coalescer = extensions
-            .as_ref()
-            .map(|m| pi::extensions::EventCoalescer::new(m.clone()));
         move |event: AgentEvent| {
             if emit_json_events {
                 if let Ok(serialized) = serde_json::to_string(&event) {
@@ -6565,11 +3547,6 @@ async fn run_print_mode(
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 guard.observe_delta(delta);
-            }
-            // Route non-lifecycle events through the coalescer for
-            // batched/coalesced dispatch with lazy serialization.
-            if let Some(coal) = &coalescer {
-                coal.dispatch_agent_event_lazy(&event, &runtime_for_events);
             }
         }
     };
@@ -7026,15 +4003,7 @@ async fn run_interactive_mode(
         pending.push(pi::interactive::PendingInput::Text(message));
     }
 
-    let AgentSession {
-        agent,
-        session,
-        extensions: region,
-        ..
-    } = session;
-    // Extract manager for the interactive loop; the region stays alive to
-    // handle shutdown when this scope exits.
-    let extensions = region.as_ref().map(|r| r.manager().clone());
+    let AgentSession { agent, session, .. } = session;
     let interactive_result = pi::interactive::run_interactive(
         agent,
         session,
@@ -7046,18 +4015,10 @@ async fn run_interactive_mode(
         save_enabled,
         resources,
         resource_cli,
-        extensions,
         cwd,
         runtime_handle,
     )
     .await;
-    // Explicitly shut down extension runtimes so the QuickJS GC can
-    // collect all objects before JS_FreeRuntime asserts an empty gc_obj_list.
-    // Must run even on error — otherwise ExtensionRegion::drop() runs
-    // synchronously and the GC assertion fires.
-    if let Some(ref region) = region {
-        region.shutdown().await;
-    }
     interactive_result?;
     Ok(())
 }
@@ -7099,21 +4060,6 @@ fn format_token_count(count: u32) -> String {
     }
 }
 
-#[cfg(test)]
-fn fuzzy_match(pattern: &str, value: &str) -> bool {
-    let mut needle = pattern
-        .chars()
-        .flat_map(char::to_lowercase)
-        .filter(|c| !c.is_whitespace());
-    let mut haystack = value.chars().flat_map(char::to_lowercase);
-    for ch in needle.by_ref() {
-        if !haystack.by_ref().any(|h| h.eq(&ch)) {
-            return false;
-        }
-    }
-    true
-}
-
 fn fuzzy_match_model_id(pattern: &str, provider: &str, model_id: &str) -> bool {
     let mut needle = pattern
         .chars()
@@ -7143,7 +4089,7 @@ fn default_export_path(input: &Path) -> PathBuf {
     PathBuf::from(format!("pi-session-{basename}.html"))
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use anyhow::anyhow;

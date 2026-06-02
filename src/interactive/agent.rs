@@ -1,27 +1,7 @@
 use super::conversation::{
     add_usage, build_content_blocks_for_input, content_blocks_to_text, last_assistant_message,
-    split_content_blocks_for_input,
 };
-use super::ext_session::{format_extension_ui_prompt, parse_extension_ui_response};
 use super::*;
-use crate::extension_events::{BeforeAgentStartOutcome, apply_before_agent_start_response};
-
-pub(super) fn extension_commands_for_catalog(
-    manager: &ExtensionManager,
-) -> Vec<crate::autocomplete::NamedEntry> {
-    manager
-        .list_commands()
-        .into_iter()
-        .filter_map(|cmd| {
-            let name = cmd.get("name")?.as_str()?.to_string();
-            let description = cmd
-                .get("description")
-                .and_then(|d| d.as_str())
-                .map(std::string::ToString::to_string);
-            Some(crate::autocomplete::NamedEntry { name, description })
-        })
-        .collect()
-}
 
 pub(super) fn build_user_message(text: String) -> ModelMessage {
     ModelMessage::User(UserMessage {
@@ -30,60 +10,13 @@ pub(super) fn build_user_message(text: String) -> ModelMessage {
     })
 }
 
-async fn dispatch_input_event(
-    manager: &ExtensionManager,
-    text: String,
-    images: Vec<ImageContent>,
-) -> crate::error::Result<InputEventOutcome> {
-    let images_value = serde_json::to_value(&images).unwrap_or(Value::Null);
-    let attachments_value = images_value.clone();
-    let text_clone = text.clone();
-    let payload = json!({
-        "text": text,
-        "content": text_clone,
-        "images": images_value,
-        "attachments": attachments_value,
-        "source": "interactive",
-    });
-    let response = manager
-        .dispatch_event_with_response(
-            ExtensionEventName::Input,
-            Some(payload),
-            EXTENSION_EVENT_TIMEOUT_MS,
-        )
-        .await?;
-    Ok(apply_input_event_response(response, text, images))
-}
-
 const UI_STREAM_DELTA_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_millis(45);
 const UI_STREAM_DELTA_MAX_BUFFER_BYTES: usize = 2 * 1024;
-const EXTENSION_CUSTOM_WIDGET_KEY: &str = "__pi_custom_overlay";
-const EXTENSION_CUSTOM_MIN_WIDTH: usize = 20;
-// Interactive slash commands may host long-running custom UIs (e.g. games).
-// Keep the command budget long enough to avoid timing out active sessions.
-const EXTENSION_INTERACTIVE_COMMAND_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum StreamDeltaKind {
     Text,
     Thinking,
-}
-
-fn content_blocks_estimated_output_bytes(content: &[ContentBlock]) -> usize {
-    content
-        .iter()
-        .map(|block| match block {
-            ContentBlock::Text(text) => text.text.len(),
-            ContentBlock::Thinking(thinking) => thinking.thinking.len(),
-            ContentBlock::RedactedThinking(redacted) => redacted.data.len(),
-            ContentBlock::Image(image) => image.data.len().saturating_add(image.mime_type.len()),
-            ContentBlock::ToolCall(tool) => tool
-                .id
-                .len()
-                .saturating_add(tool.name.len())
-                .saturating_add(tool.arguments.to_string().len()),
-        })
-        .sum()
 }
 
 struct UiStreamDeltaBatcher {
@@ -93,7 +26,6 @@ struct UiStreamDeltaBatcher {
     flush_interval: std::time::Duration,
     max_pending_bytes: usize,
     last_flush: std::time::Instant,
-    frame_p99_us: Arc<AtomicU64>,
     pending_tool_update: Option<PiMsg>,
     pending_tool_update_bytes: usize,
     pending_tool_update_events: usize,
@@ -101,12 +33,7 @@ struct UiStreamDeltaBatcher {
 }
 
 impl UiStreamDeltaBatcher {
-    #[cfg(test)]
     fn new(sender: mpsc::Sender<PiMsg>) -> Self {
-        Self::new_with_frame_p99(sender, Arc::new(AtomicU64::new(0)))
-    }
-
-    fn new_with_frame_p99(sender: mpsc::Sender<PiMsg>, frame_p99_us: Arc<AtomicU64>) -> Self {
         let now = std::time::Instant::now();
         let flush_interval = UI_STREAM_DELTA_FLUSH_INTERVAL;
         Self {
@@ -117,7 +44,6 @@ impl UiStreamDeltaBatcher {
             max_pending_bytes: UI_STREAM_DELTA_MAX_BUFFER_BYTES,
             // Prime the first delta flush so the UI shows immediate output.
             last_flush: now.checked_sub(flush_interval).unwrap_or(now),
-            frame_p99_us,
             pending_tool_update: None,
             pending_tool_update_bytes: 0,
             pending_tool_update_events: 0,
@@ -169,35 +95,9 @@ impl UiStreamDeltaBatcher {
     }
 
     fn push_tool_update(&mut self, msg: PiMsg) {
-        let output_bytes = match &msg {
-            PiMsg::ToolUpdate { content, .. } => content_blocks_estimated_output_bytes(content),
-            _ => 0,
-        };
-        let pending_tool_output_bytes = self.pending_tool_update_bytes.saturating_add(output_bytes);
-        let pending_tool_events = self.pending_tool_update_events.saturating_add(1);
-        let decision = TuiPressureController::decide(
-            self.frame_p99_us.load(Ordering::Relaxed),
-            pending_tool_output_bytes,
-            pending_tool_events,
-        );
-
-        if !decision.throttle_tool_updates {
-            self.flush_tool_update(true);
-            self.pending.push_back(msg);
-            self.flush(true);
-            return;
-        }
-
-        self.pending_tool_update = Some(msg);
-        self.pending_tool_update_bytes = pending_tool_output_bytes;
-        self.pending_tool_update_events = pending_tool_events;
-
-        if pending_tool_events >= decision.max_pending_tool_events
-            || self.pending_tool_update_bytes >= decision.max_pending_tool_output_bytes
-            || self.last_tool_update_flush.elapsed() >= decision.flush_interval
-        {
-            self.flush_tool_update(true);
-        }
+        self.flush_tool_update(true);
+        self.pending.push_back(msg);
+        self.flush(true);
     }
 
     fn enqueue_pending_tool_update(&mut self) {
@@ -372,7 +272,6 @@ impl PiApp {
                 self.agent_state = AgentState::Processing;
                 self.current_response.clear();
                 self.current_thinking.clear();
-                self.extension_streaming.store(true, Ordering::SeqCst);
             }
             PiMsg::RunPending => {
                 return self.run_next_pending();
@@ -482,8 +381,6 @@ impl PiApp {
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
                 self.abort_handle = None;
-                self.extension_streaming.store(false, Ordering::SeqCst);
-                self.extension_compacting.store(false, Ordering::SeqCst);
 
                 // Refresh VCS info (may have changed during tool execution)
                 self.vcs_info = super::read_vcs_info(&self.cwd);
@@ -537,8 +434,6 @@ impl PiApp {
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
                 self.abort_handle = None;
-                self.extension_streaming.store(false, Ordering::SeqCst);
-                self.extension_compacting.store(false, Ordering::SeqCst);
                 self.input.focus();
                 self.refresh_conversation_viewport(true);
 
@@ -570,8 +465,6 @@ impl PiApp {
                 self.agent_state = AgentState::Idle;
                 self.current_tool = None;
                 self.abort_handle = None;
-                self.extension_streaming.store(false, Ordering::SeqCst);
-                self.extension_compacting.store(false, Ordering::SeqCst);
                 self.scroll_to_bottom();
                 self.input.focus();
 
@@ -639,7 +532,6 @@ After approving access in the browser, press Enter in Pi to complete login."
                     provider,
                     kind: PendingLoginKind::DeviceFlow,
                     verifier: String::new(),
-                    oauth_config: None,
                     device_code: Some(device_code),
                     redirect_uri: None,
                 });
@@ -661,7 +553,6 @@ After approving access in the browser, press Enter in Pi to complete login."
                 self.current_tool = None;
                 self.abort_handle = None;
                 self.status_message = status;
-                self.message_render_cache.clear();
                 if let Err(message) = self.sync_runtime_selection_from_session_header() {
                     self.status_message = Some(message);
                 }
@@ -698,11 +589,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 status,
                 diagnostics,
             } => {
-                let mut autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
-                if let Some(manager) = &self.extensions {
-                    autocomplete_catalog.extension_commands =
-                        extension_commands_for_catalog(manager);
-                }
+                let autocomplete_catalog = AutocompleteCatalog::from_resources(&resources);
                 self.autocomplete.provider.set_catalog(autocomplete_catalog);
                 self.autocomplete.close();
                 self.resources = resources;
@@ -722,33 +609,6 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
                 self.input.focus();
             }
-            PiMsg::ExtensionUiRequest(request) => {
-                return self.handle_extension_ui_request(request);
-            }
-            PiMsg::ExtensionCommandDone {
-                command: _,
-                display,
-                is_error: _,
-            } => {
-                self.agent_state = AgentState::Idle;
-                self.current_tool = None;
-
-                self.messages.push(ConversationMessage {
-                    role: MessageRole::System,
-                    content: display,
-                    thinking: None,
-                    collapsed: false,
-                });
-                self.extension_custom_active = false;
-                self.extension_custom_key_queue.clear();
-                self.extension_custom_overlay = None;
-                self.scroll_to_bottom();
-                self.input.focus();
-
-                if !self.pending_inputs.is_empty() {
-                    return Some(Cmd::new(|| Message::new(PiMsg::RunPending)));
-                }
-            }
             PiMsg::OAuthCallbackReceived(callback_url) => {
                 // Auto-submit the OAuth code received from the local callback server.
                 if let Some(pending) = self.pending_oauth.take() {
@@ -763,605 +623,6 @@ After approving access in the browser, press Enter in Pi to complete login."
                 }
             }
         }
-        None
-    }
-
-    fn handle_extension_ui_request(&mut self, request: ExtensionUiRequest) -> Option<Cmd> {
-        // Capability-specific prompts get a dedicated modal overlay.
-        if CapabilityPromptOverlay::is_capability_prompt(&request) {
-            self.capability_prompt = Some(CapabilityPromptOverlay::from_request(request));
-            return None;
-        }
-        match request.method.as_str() {
-            "getEditorText" | "get_editor_text" => {
-                let value = Value::String(self.input.value());
-                self.send_extension_ui_response(ExtensionUiResponse {
-                    id: request.id,
-                    value: Some(value),
-                    cancelled: false,
-                });
-                return None;
-            }
-            "getAllThemes" | "get_all_themes" => {
-                let value = Value::Array(self.collect_extension_theme_infos());
-                self.send_extension_ui_response(ExtensionUiResponse {
-                    id: request.id,
-                    value: Some(value),
-                    cancelled: false,
-                });
-                return None;
-            }
-            "getTheme" | "get_theme" => {
-                let name = request
-                    .payload
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                let value = if name.is_empty() {
-                    Value::Null
-                } else {
-                    Theme::resolve_spec(&name, &self.cwd)
-                        .ok()
-                        .and_then(|theme| serde_json::to_value(theme).ok())
-                        .unwrap_or(Value::Null)
-                };
-                self.send_extension_ui_response(ExtensionUiResponse {
-                    id: request.id,
-                    value: Some(value),
-                    cancelled: false,
-                });
-                return None;
-            }
-            "setTheme" | "set_theme" => {
-                let name = request
-                    .payload
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                let mut response = serde_json::Map::new();
-                if name.is_empty() {
-                    response.insert("success".to_string(), Value::Bool(false));
-                    response.insert(
-                        "error".to_string(),
-                        Value::String("Theme name is required".to_string()),
-                    );
-                } else {
-                    match Theme::resolve_spec(&name, &self.cwd) {
-                        Ok(theme) => {
-                            let theme_name = theme.name.clone();
-                            self.apply_theme(theme);
-                            self.config.theme = Some(theme_name);
-                            response.insert("success".to_string(), Value::Bool(true));
-                        }
-                        Err(err) => {
-                            response.insert("success".to_string(), Value::Bool(false));
-                            response.insert("error".to_string(), Value::String(err.to_string()));
-                        }
-                    }
-                }
-                self.send_extension_ui_response(ExtensionUiResponse {
-                    id: request.id,
-                    value: Some(Value::Object(response)),
-                    cancelled: false,
-                });
-                return None;
-            }
-            _ => {}
-        }
-        if request.method == "custom" {
-            self.handle_custom_extension_ui_request(request);
-            return None;
-        }
-        if request.expects_response() {
-            self.extension_ui_queue.push_back(request);
-            self.advance_extension_ui_queue();
-        } else {
-            self.apply_extension_ui_effect(&request);
-        }
-        None
-    }
-
-    fn collect_extension_theme_infos(&self) -> Vec<Value> {
-        let mut entries: Vec<(String, Option<String>)> = Vec::new();
-        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-        let mut push_entry = |name: &str, path: Option<String>| {
-            let key = name.to_ascii_lowercase();
-            if seen.insert(key) {
-                entries.push((name.to_string(), path));
-            }
-        };
-
-        push_entry("dark", None);
-        push_entry("light", None);
-        push_entry("solarized", None);
-
-        for path in Theme::discover_themes(&self.cwd) {
-            if let Ok(theme) = Theme::load(&path) {
-                push_entry(&theme.name, Some(path.display().to_string()));
-            }
-        }
-
-        entries.sort_by_key(|entry| entry.0.to_ascii_lowercase());
-
-        entries
-            .into_iter()
-            .map(|(name, path)| {
-                let mut map = serde_json::Map::new();
-                map.insert("name".to_string(), Value::String(name));
-                map.insert("path".to_string(), path.map_or(Value::Null, Value::String));
-                Value::Object(map)
-            })
-            .collect()
-    }
-
-    fn handle_custom_extension_ui_request(&mut self, request: ExtensionUiRequest) {
-        let mode = request
-            .payload
-            .get("mode")
-            .or_else(|| request.payload.get("phase"))
-            .and_then(Value::as_str)
-            .unwrap_or("poll");
-        let closing = mode.eq_ignore_ascii_case("close")
-            || request
-                .payload
-                .get("close")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-
-        if closing {
-            self.extension_custom_active = false;
-            self.extension_custom_overlay = None;
-            self.extension_custom_key_queue.clear();
-        } else {
-            self.extension_custom_active = true;
-            if self.extension_custom_overlay.is_none() {
-                self.extension_custom_overlay = Some(ExtensionCustomOverlay::default());
-            }
-            if let Some(overlay) = self.extension_custom_overlay.as_mut() {
-                if request.extension_id.is_some() {
-                    overlay.extension_id.clone_from(&request.extension_id);
-                }
-                if let Some(title) = request.payload.get("title") {
-                    overlay.title = title.as_str().map(std::string::ToString::to_string);
-                }
-            }
-        }
-
-        let mut response = serde_json::Map::new();
-        let width = self.custom_overlay_width_from_payload(&request.payload);
-        response.insert(
-            "width".to_string(),
-            Value::from(u64::try_from(width).unwrap_or(80)),
-        );
-        if let Some(key) = self.extension_custom_key_queue.pop_front() {
-            response.insert("key".to_string(), Value::String(key));
-        }
-        if !self.extension_custom_active {
-            response.insert("closed".to_string(), Value::Bool(true));
-        }
-
-        self.send_extension_ui_response(ExtensionUiResponse {
-            id: request.id,
-            value: Some(Value::Object(response)),
-            cancelled: false,
-        });
-    }
-
-    fn custom_overlay_width_from_payload(&self, payload: &Value) -> usize {
-        fn parse_percent_basis_points(raw: &str) -> Option<u32> {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-
-            let mut parts = trimmed.split('.');
-            let whole_part = parts.next()?;
-            let frac_part = parts.next();
-            if parts.next().is_some() || whole_part.is_empty() {
-                return None;
-            }
-            if !whole_part.chars().all(|ch| ch.is_ascii_digit()) {
-                return None;
-            }
-
-            let whole = whole_part.parse::<u32>().ok()?;
-            let mut basis_points = whole.checked_mul(100)?;
-
-            if let Some(frac_part) = frac_part {
-                if !frac_part.chars().all(|ch| ch.is_ascii_digit()) {
-                    return None;
-                }
-                let mut digits = frac_part.chars();
-                let first = digits.next().and_then(|ch| ch.to_digit(10)).unwrap_or(0);
-                let second = digits.next().and_then(|ch| ch.to_digit(10)).unwrap_or(0);
-                let third = digits.next().and_then(|ch| ch.to_digit(10)).unwrap_or(0);
-
-                let mut fractional = first * 10 + second;
-                if third >= 5 {
-                    fractional = fractional.saturating_add(1);
-                }
-                basis_points = basis_points.checked_add(fractional)?;
-            }
-
-            Some(basis_points)
-        }
-
-        fn parse_width_spec(spec: &Value, base: usize) -> Option<usize> {
-            match spec {
-                Value::Number(num) => num
-                    .as_u64()
-                    .and_then(|n| usize::try_from(n).ok())
-                    .filter(|n| *n > 0),
-                Value::String(raw) => {
-                    let trimmed = raw.trim();
-                    if trimmed.is_empty() {
-                        return None;
-                    }
-                    if let Some(percent) = trimmed.strip_suffix('%') {
-                        let basis_points = parse_percent_basis_points(percent)?;
-                        if basis_points == 0 {
-                            return None;
-                        }
-                        let base = u128::try_from(base).ok()?;
-                        let width = base
-                            .checked_mul(u128::from(basis_points))?
-                            .checked_add(5_000)?
-                            / 10_000;
-                        let width = usize::try_from(width).ok()?;
-                        return Some(width.max(1));
-                    }
-                    trimmed.parse::<usize>().ok().filter(|n| *n > 0)
-                }
-                _ => None,
-            }
-        }
-
-        let base = self
-            .term_width
-            .saturating_sub(4)
-            .max(EXTENSION_CUSTOM_MIN_WIDTH);
-        let spec = payload
-            .pointer("/overlayOptions/width")
-            .or_else(|| payload.get("width"));
-        spec.and_then(|value| parse_width_spec(value, base))
-            .unwrap_or(base)
-            .max(EXTENSION_CUSTOM_MIN_WIDTH)
-    }
-
-    fn apply_extension_ui_effect(&mut self, request: &ExtensionUiRequest) {
-        match request.method.as_str() {
-            "notify" => self.apply_extension_notify_effect(request),
-            "setStatus" | "set_status" => self.apply_extension_status_effect(request),
-            "setWidget" | "set_widget" => self.apply_extension_widget_effect(request),
-            "setTitle" | "set_title" => self.apply_extension_title_effect(request),
-            "set_editor_text" => self.apply_extension_editor_text_effect(request),
-            _ => {}
-        }
-    }
-
-    fn apply_extension_notify_effect(&mut self, request: &ExtensionUiRequest) {
-        let title = request
-            .payload
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or("Notification");
-        let message = request
-            .payload
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let level = request
-            .payload
-            .get("level")
-            .and_then(Value::as_str)
-            .or_else(|| request.payload.get("notifyType").and_then(Value::as_str))
-            .or_else(|| request.payload.get("notify_type").and_then(Value::as_str))
-            .unwrap_or("info");
-        self.messages.push(ConversationMessage {
-            role: MessageRole::System,
-            content: format!("Extension notify ({level}): {title} {message}"),
-            thinking: None,
-            collapsed: false,
-        });
-        self.scroll_to_bottom();
-    }
-
-    fn apply_extension_status_effect(&mut self, request: &ExtensionUiRequest) {
-        let status_text = request
-            .payload
-            .get("statusText")
-            .and_then(Value::as_str)
-            .or_else(|| request.payload.get("status_text").and_then(Value::as_str))
-            .or_else(|| request.payload.get("text").and_then(Value::as_str))
-            .unwrap_or("");
-        if status_text.is_empty() {
-            return;
-        }
-
-        let status_key = request
-            .payload
-            .get("statusKey")
-            .and_then(Value::as_str)
-            .or_else(|| request.payload.get("status_key").and_then(Value::as_str))
-            .unwrap_or("");
-
-        self.status_message = Some(if status_key.is_empty() {
-            status_text.to_string()
-        } else {
-            format!("{status_key}: {status_text}")
-        });
-    }
-
-    fn apply_extension_widget_effect(&mut self, request: &ExtensionUiRequest) {
-        let widget_key = request
-            .payload
-            .get("widgetKey")
-            .and_then(Value::as_str)
-            .or_else(|| request.payload.get("widget_key").and_then(Value::as_str))
-            .unwrap_or("widget");
-
-        let lines = request
-            .payload
-            .get("widgetLines")
-            .or_else(|| request.payload.get("widget_lines"))
-            .or_else(|| request.payload.get("lines"))
-            .and_then(Value::as_array)
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(std::string::ToString::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        if widget_key == EXTENSION_CUSTOM_WIDGET_KEY {
-            self.apply_custom_overlay_widget_effect(request, lines);
-            return;
-        }
-
-        let content = request
-            .payload
-            .get("content")
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .or_else(|| (!lines.is_empty()).then(|| lines.join("\n")));
-
-        if let Some(content) = content {
-            self.messages.push(ConversationMessage {
-                role: MessageRole::System,
-                content: format!("Extension widget ({widget_key}):\n{content}"),
-                thinking: None,
-                collapsed: false,
-            });
-            self.scroll_to_bottom();
-        }
-    }
-
-    fn apply_custom_overlay_widget_effect(
-        &mut self,
-        request: &ExtensionUiRequest,
-        lines: Vec<String>,
-    ) {
-        let should_clear = request
-            .payload
-            .get("clear")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        if should_clear {
-            self.extension_custom_overlay = None;
-            self.extension_custom_active = false;
-            self.extension_custom_key_queue.clear();
-            return;
-        }
-
-        self.extension_custom_active = true;
-        if self.extension_custom_overlay.is_none() {
-            self.extension_custom_overlay = Some(ExtensionCustomOverlay::default());
-        }
-        if let Some(overlay) = self.extension_custom_overlay.as_mut() {
-            if request.extension_id.is_some() {
-                overlay.extension_id.clone_from(&request.extension_id);
-            }
-            if let Some(title) = request.payload.get("title") {
-                overlay.title = title.as_str().map(std::string::ToString::to_string);
-            }
-            overlay.lines = lines;
-        }
-    }
-
-    fn apply_extension_title_effect(&mut self, request: &ExtensionUiRequest) {
-        if let Some(title) = request.payload.get("title").and_then(Value::as_str) {
-            self.status_message = Some(format!("Title: {title}"));
-        }
-    }
-
-    fn apply_extension_editor_text_effect(&mut self, request: &ExtensionUiRequest) {
-        if let Some(text) = request.payload.get("text").and_then(Value::as_str) {
-            self.input.set_value(text);
-        }
-    }
-
-    pub(super) fn send_extension_ui_response(&mut self, response: ExtensionUiResponse) {
-        if let Some(manager) = &self.extensions {
-            if !manager.respond_ui(response) {
-                self.status_message = Some("No pending extension UI request".to_string());
-            }
-        } else {
-            self.status_message = Some("Extensions are disabled".to_string());
-        }
-    }
-
-    fn advance_extension_ui_queue(&mut self) {
-        if self.active_extension_ui.is_some() {
-            return;
-        }
-        if let Some(next) = self.extension_ui_queue.pop_front() {
-            if next.method == "custom" {
-                self.handle_custom_extension_ui_request(next);
-                self.advance_extension_ui_queue();
-                return;
-            }
-            let prompt = format_extension_ui_prompt(&next);
-            self.active_extension_ui = Some(next);
-            self.messages.push(ConversationMessage {
-                role: MessageRole::System,
-                content: prompt,
-                thinking: None,
-                collapsed: false,
-            });
-            self.scroll_to_bottom();
-            self.input.focus();
-        }
-    }
-
-    fn dispatch_extension_command(&mut self, command: &str, args: &str) -> Option<Cmd> {
-        let Some(manager) = &self.extensions else {
-            self.status_message = Some("Extensions are disabled".to_string());
-            return None;
-        };
-
-        let Some(runtime) = manager.runtime() else {
-            self.status_message = Some(format!(
-                "Extension command '/{command}' is not available (runtime not enabled)"
-            ));
-            return None;
-        };
-
-        self.agent_state = AgentState::ToolRunning;
-        self.current_tool = Some(format!("/{command}"));
-
-        let command_name = command.to_string();
-        let args_str = args.to_string();
-        let cwd = self.cwd.display().to_string();
-        let event_tx = self.event_tx.clone();
-        let runtime_handle = self.runtime_handle.clone();
-
-        let ctx_payload = serde_json::json!({
-            "cwd": cwd,
-            "hasUI": true,
-        });
-
-        let cmd_for_msg = command_name.clone();
-        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-        runtime_handle.spawn(async move {
-            let result = runtime
-                .execute_command(
-                    command_name,
-                    args_str,
-                    std::sync::Arc::new(ctx_payload),
-                    EXTENSION_INTERACTIVE_COMMAND_TIMEOUT_MS,
-                )
-                .await;
-
-            match result {
-                Ok(value) => {
-                    let display = if value.is_null() || value == serde_json::Value::Null {
-                        format!("/{cmd_for_msg} completed.")
-                    } else if let Some(s) = value.as_str() {
-                        s.to_string()
-                    } else {
-                        format!("/{cmd_for_msg} completed: {value}")
-                    };
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::ExtensionCommandDone {
-                            command: cmd_for_msg,
-                            display,
-                            is_error: false,
-                        },
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::ExtensionCommandDone {
-                            command: cmd_for_msg,
-                            display: format!("Extension command error: {err}"),
-                            is_error: true,
-                        },
-                    )
-                    .await;
-                }
-            }
-        });
-
-        None
-    }
-
-    pub(super) fn dispatch_extension_shortcut(&mut self, key_id: &str) -> Option<Cmd> {
-        let Some(manager) = &self.extensions else {
-            self.status_message = Some("Extensions are disabled".to_string());
-            return None;
-        };
-
-        let Some(runtime) = manager.runtime() else {
-            self.status_message =
-                Some("Extension shortcut not available (runtime not enabled)".to_string());
-            return None;
-        };
-
-        self.agent_state = AgentState::ToolRunning;
-        self.current_tool = Some(format!("shortcut:{key_id}"));
-
-        let key_id_owned = key_id.to_string();
-        let cwd = self.cwd.display().to_string();
-        let event_tx = self.event_tx.clone();
-        let runtime_handle = self.runtime_handle.clone();
-
-        let ctx_payload = serde_json::json!({
-            "cwd": cwd,
-            "hasUI": true,
-        });
-
-        let key_for_msg = key_id_owned.clone();
-        let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
-        runtime_handle.spawn(async move {
-            let result = runtime
-                .execute_shortcut(
-                    key_id_owned,
-                    std::sync::Arc::new(ctx_payload),
-                    crate::extensions::EXTENSION_SHORTCUT_BUDGET_MS,
-                )
-                .await;
-
-            match result {
-                Ok(_) => {
-                    let display = format!("Shortcut [{key_for_msg}] executed.");
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::ExtensionCommandDone {
-                            command: key_for_msg,
-                            display,
-                            is_error: false,
-                        },
-                    )
-                    .await;
-                }
-                Err(err) => {
-                    let _ = crate::interactive::enqueue_pi_event(
-                        &event_tx,
-                        &task_cx,
-                        PiMsg::ExtensionCommandDone {
-                            command: key_for_msg,
-                            display: format!("Shortcut error: {err}"),
-                            is_error: true,
-                        },
-                    )
-                    .await;
-                }
-            }
-        });
-
         None
     }
 
@@ -1390,17 +651,6 @@ After approving access in the browser, press Enter in Pi to complete login."
         if trimmed.is_empty() {
             self.status_message = Some("No input to queue".to_string());
             return;
-        }
-
-        if let Some((command, _args)) = parse_extension_command(trimmed) {
-            if let Some(manager) = &self.extensions {
-                if manager.has_command(&command) {
-                    self.status_message = Some(format!(
-                        "Extension command '/{command}' cannot be queued while busy"
-                    ));
-                    return;
-                }
-            }
         }
 
         let expanded = self.resources.expand_input(trimmed);
@@ -1479,26 +729,17 @@ After approving access in the browser, press Enter in Pi to complete login."
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
-        let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
-        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
 
         self.agent_state = AgentState::Processing;
         self.scroll_to_bottom();
 
-        let runtime_handle_for_task = runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
             #[cfg(test)]
             emit_submit_continue_deadline_probe(task_cx.budget().deadline);
-            if let Some(manager) = extensions.clone() {
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
-                    .await;
-            }
-
             let mut agent_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
                     Ok(guard) => guard,
@@ -1515,30 +756,17 @@ After approving access in the browser, press Enter in Pi to complete login."
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
-            let extensions = extensions.clone();
-            let runtime_handle = runtime_handle_for_task.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let ui_stream_batcher =
-                Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
-                    event_sender.clone(),
-                    Arc::clone(&tui_pressure_frame_p99_us),
-                )));
+            let ui_stream_batcher = Arc::new(StdMutex::new(UiStreamDeltaBatcher::new(
+                event_sender.clone(),
+            )));
             let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
             let result = agent_guard
                 .run_continue_with_abort(Some(abort_signal), move |event| {
-                    {
-                        let mut batcher = match ui_stream_batcher_for_events.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        dispatch_agent_event_to_ui(&event, &mut batcher);
-                    }
-
-                    if let Some(coal) = &coalescer {
-                        coal.dispatch_agent_event_lazy(&event, &runtime_handle);
-                    }
+                    let mut batcher = match ui_stream_batcher_for_events.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    dispatch_agent_event_to_ui(&event, &mut batcher);
                 })
                 .await;
             flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
@@ -1643,16 +871,12 @@ After approving access in the browser, press Enter in Pi to complete login."
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
-        let extensions = self.extensions.clone();
         let runtime_handle = self.runtime_handle.clone();
-        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
 
-        let runtime_handle_for_task = runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            let mut content_for_agent = content_for_agent;
             let base_system_prompt = {
                 let guard =
                     match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx)
@@ -1673,71 +897,6 @@ After approving access in the browser, press Enter in Pi to complete login."
                 drop(guard);
                 prompt
             };
-            let before_start = if let Some(manager) = extensions.clone() {
-                let (text, images) = split_content_blocks_for_input(&content_for_agent);
-                match dispatch_input_event(&manager, text, images).await {
-                    Ok(InputEventOutcome::Continue { text, images }) => {
-                        content_for_agent = build_content_blocks_for_input(&text, &images);
-                        let updated = content_blocks_to_text(&content_for_agent);
-                        if updated != display_owned {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &task_cx,
-                                PiMsg::UpdateLastUserMessage(updated),
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(InputEventOutcome::Block { reason }) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::UpdateLastUserMessage("[input blocked]".to_string()),
-                        )
-                        .await;
-                        let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(message),
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(err.to_string()),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-
-                let (text, images) = split_content_blocks_for_input(&content_for_agent);
-                let images_value = serde_json::to_value(&images).unwrap_or(Value::Null);
-                let payload = json!({
-                    "prompt": text,
-                    "images": images_value,
-                    "systemPrompt": base_system_prompt.as_deref().unwrap_or(""),
-                });
-                let response = manager
-                    .dispatch_event_with_response(
-                        ExtensionEventName::BeforeAgentStart,
-                        Some(payload),
-                        EXTENSION_EVENT_TIMEOUT_MS,
-                    )
-                    .await
-                    .unwrap_or(None);
-                apply_before_agent_start_response(response, Utc::now().timestamp_millis())
-            } else {
-                BeforeAgentStartOutcome {
-                    messages: Vec::new(),
-                    system_prompt: None,
-                }
-            };
-
             let mut agent_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
                     Ok(guard) => guard,
@@ -1751,50 +910,28 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
-            let BeforeAgentStartOutcome {
-                messages: before_messages,
-                system_prompt,
-            } = before_start;
-            if let Some(prompt) = system_prompt {
-                agent_guard.set_system_prompt(Some(prompt));
-            } else {
-                agent_guard.set_system_prompt(base_system_prompt.clone());
-            }
+            agent_guard.set_system_prompt(base_system_prompt.clone());
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
-            let extensions = extensions.clone();
-            let runtime_handle = runtime_handle_for_task.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let ui_stream_batcher =
-                Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
-                    event_sender.clone(),
-                    Arc::clone(&tui_pressure_frame_p99_us),
-                )));
+            let ui_stream_batcher = Arc::new(StdMutex::new(UiStreamDeltaBatcher::new(
+                event_sender.clone(),
+            )));
             let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
             let user_message = ModelMessage::User(UserMessage {
                 content: UserContent::Blocks(content_for_agent),
                 timestamp: Utc::now().timestamp_millis(),
             });
-            let mut prompts = Vec::with_capacity(1 + before_messages.len());
+            let mut prompts = Vec::with_capacity(1);
             prompts.push(user_message);
-            prompts.extend(before_messages.into_iter().map(ModelMessage::Custom));
 
             let result = agent_guard
                 .run_with_messages_with_abort(prompts, Some(abort_signal), move |event| {
-                    {
-                        let mut batcher = match ui_stream_batcher_for_events.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        dispatch_agent_event_to_ui(&event, &mut batcher);
-                    }
-
-                    if let Some(coal) = &coalescer {
-                        coal.dispatch_agent_event_lazy(&event, &runtime_handle);
-                    }
+                    let mut batcher = match ui_stream_batcher_for_events.lock() {
+                        Ok(guard) => guard,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    dispatch_agent_event_to_ui(&event, &mut batcher);
                 })
                 .await;
             flush_ui_stream_batcher_with_backpressure(&ui_stream_batcher).await;
@@ -1862,22 +999,6 @@ After approving access in the browser, press Enter in Pi to complete login."
             return None;
         }
 
-        if let Some(active) = self.active_extension_ui.take() {
-            match parse_extension_ui_response(&active, message) {
-                Ok(response) => {
-                    self.send_extension_ui_response(response);
-                    self.advance_extension_ui_queue();
-                }
-                Err(err) => {
-                    self.status_message = Some(err);
-                    self.active_extension_ui = Some(active);
-                }
-            }
-            self.input.reset();
-            self.input.focus();
-            return None;
-        }
-
         if let Some(pending) = self.pending_oauth.take() {
             return self.submit_oauth_code(message, pending);
         }
@@ -1889,14 +1010,6 @@ After approving access in the browser, press Enter in Pi to complete login."
         // Check for slash commands
         if let Some((cmd, args)) = SlashCommand::parse(message) {
             return self.handle_slash_command(cmd, args);
-        }
-
-        if let Some((command, args)) = parse_extension_command(message) {
-            if let Some(manager) = &self.extensions {
-                if manager.has_command(&command) {
-                    return self.dispatch_extension_command(&command, args);
-                }
-            }
         }
 
         if message.starts_with('/') && !message.starts_with("/skill:") {
@@ -1973,8 +1086,6 @@ After approving access in the browser, press Enter in Pi to complete login."
         let agent = Arc::clone(&self.agent);
         let session = Arc::clone(&self.session);
         let save_enabled = self.save_enabled;
-        let extensions = self.extensions.clone();
-        let tui_pressure_frame_p99_us = Arc::clone(&self.tui_pressure_frame_p99_us);
         let (abort_handle, abort_signal) = AbortHandle::new();
         self.abort_handle = Some(abort_handle);
 
@@ -1988,8 +1099,6 @@ After approving access in the browser, press Enter in Pi to complete login."
             thinking: None,
             collapsed: false,
         });
-        let displayed_message = message_for_agent.clone();
-
         // Clear input and reset to single-line mode
         self.input.reset();
         self.input_mode = InputMode::SingleLine;
@@ -2004,55 +1113,9 @@ After approving access in the browser, press Enter in Pi to complete login."
         let runtime_handle = self.runtime_handle.clone();
 
         // Spawn async task to run the agent
-        let runtime_handle_for_agent = runtime_handle.clone();
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
-            let mut message_for_agent = message_for_agent;
-            let mut input_images = Vec::new();
-            if let Some(manager) = extensions.clone() {
-                match dispatch_input_event(&manager, message_for_agent.clone(), Vec::new()).await {
-                    Ok(InputEventOutcome::Continue { text, images }) => {
-                        message_for_agent = text;
-                        input_images = images;
-                        if message_for_agent != displayed_message {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &task_cx,
-                                PiMsg::UpdateLastUserMessage(message_for_agent.clone()),
-                            )
-                            .await;
-                        }
-                    }
-                    Ok(InputEventOutcome::Block { reason }) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::UpdateLastUserMessage("[input blocked]".to_string()),
-                        )
-                        .await;
-                        let message = reason.unwrap_or_else(|| "Input blocked".to_string());
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(message),
-                        )
-                        .await;
-                        return;
-                    }
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &task_cx,
-                            PiMsg::AgentError(err.to_string()),
-                        )
-                        .await;
-                        return;
-                    }
-                }
-                let _ = manager
-                    .dispatch_event(ExtensionEventName::BeforeAgentStart, None)
-                    .await;
-            }
+            let input_images = Vec::new();
 
             let mut agent_guard =
                 match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
@@ -2070,30 +1133,18 @@ After approving access in the browser, press Enter in Pi to complete login."
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
-            let extensions = extensions.clone();
-            let coalescer = extensions
-                .as_ref()
-                .map(|m| crate::extensions::EventCoalescer::new(m.clone()));
-            let ui_stream_batcher =
-                Arc::new(StdMutex::new(UiStreamDeltaBatcher::new_with_frame_p99(
-                    event_sender.clone(),
-                    Arc::clone(&tui_pressure_frame_p99_us),
-                )));
+            let ui_stream_batcher = Arc::new(StdMutex::new(UiStreamDeltaBatcher::new(
+                event_sender.clone(),
+            )));
             let result = if input_images.is_empty() {
                 let ui_stream_batcher_for_events = Arc::clone(&ui_stream_batcher);
                 agent_guard
                     .run_with_abort(message_for_agent, Some(abort_signal), move |event| {
-                        {
-                            let mut batcher = match ui_stream_batcher_for_events.lock() {
-                                Ok(guard) => guard,
-                                Err(poisoned) => poisoned.into_inner(),
-                            };
-                            dispatch_agent_event_to_ui(&event, &mut batcher);
-                        }
-
-                        if let Some(coal) = &coalescer {
-                            coal.dispatch_agent_event_lazy(&event, &runtime_handle_for_agent);
-                        }
+                        let mut batcher = match ui_stream_batcher_for_events.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        };
+                        dispatch_agent_event_to_ui(&event, &mut batcher);
                     })
                     .await
             } else {
@@ -2105,17 +1156,11 @@ After approving access in the browser, press Enter in Pi to complete login."
                         content_for_agent,
                         Some(abort_signal),
                         move |event| {
-                            {
-                                let mut batcher = match ui_stream_batcher_for_events.lock() {
-                                    Ok(guard) => guard,
-                                    Err(poisoned) => poisoned.into_inner(),
-                                };
-                                dispatch_agent_event_to_ui(&event, &mut batcher);
-                            }
-
-                            if let Some(coal) = &coalescer {
-                                coal.dispatch_agent_event_lazy(&event, &runtime_handle_for_agent);
-                            }
+                            let mut batcher = match ui_stream_batcher_for_events.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            dispatch_agent_event_to_ui(&event, &mut batcher);
                         },
                     )
                     .await
@@ -2212,7 +1257,7 @@ mod stream_delta_batcher_tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU64, AtomicUsize};
+    use std::sync::atomic::AtomicUsize;
 
     struct DummyProvider;
 
@@ -2293,7 +1338,6 @@ mod stream_delta_batcher_tests {
             headers: HashMap::new(),
             auth_header: true,
             compat: None,
-            oauth_config: None,
         }
     }
 
@@ -2309,11 +1353,9 @@ mod stream_delta_batcher_tests {
         let resource_cli = ResourceCliOptions {
             no_skills: false,
             no_prompt_templates: false,
-            no_extensions: false,
             no_themes: false,
             skill_paths: Vec::new(),
             prompt_paths: Vec::new(),
-            extension_paths: Vec::new(),
             theme_paths: Vec::new(),
         };
         let (event_tx, event_rx) = asupersync::channel::mpsc::channel(64);
@@ -2349,50 +1391,6 @@ mod stream_delta_batcher_tests {
     fn build_test_app() -> PiApp {
         let (app, _event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
         app
-    }
-
-    fn build_test_extension_manager_with_command_output(
-        output: &Value,
-    ) -> crate::extensions::ExtensionManager {
-        let manager = crate::extensions::ExtensionManager::new();
-        let temp = tempfile::tempdir().expect("tempdir");
-        let entry = temp.path().join("test-extension.native.json");
-        let descriptor = json!({
-            "id": "test-extension",
-            "name": "test-extension",
-            "version": "1.0.0",
-            "apiVersion": crate::extensions::PROTOCOL_VERSION,
-            "slashCommands": [
-                {
-                    "name": "deploy",
-                    "description": "Deploy"
-                }
-            ],
-            "commandOutputs": {
-                "deploy": output
-            }
-        });
-        std::fs::write(
-            &entry,
-            serde_json::to_vec(&descriptor).expect("serialize native extension descriptor"),
-        )
-        .expect("write native extension descriptor");
-
-        runtime().block_on(async {
-            let native_runtime = crate::extensions::NativeRustExtensionRuntimeHandle::start()
-                .await
-                .expect("start native runtime");
-            manager.set_native_runtime(native_runtime);
-            manager
-                .load_native_extensions(vec![
-                    crate::extensions::NativeRustExtensionLoadSpec::from_entry_path(&entry)
-                        .expect("build native extension load spec"),
-                ])
-                .await
-                .expect("load native extension");
-        });
-
-        manager
     }
 
     #[derive(Default)]
@@ -2528,90 +1526,6 @@ mod stream_delta_batcher_tests {
     }
 
     #[test]
-    fn pressure_coalesces_tool_updates_until_control_flush() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let frame_p99 = Arc::new(AtomicU64::new(TuiPressureController::HIGH_FRAME_P99_US));
-        let mut batcher = UiStreamDeltaBatcher::new_with_frame_p99(tx, frame_p99);
-        batcher.last_tool_update_flush = std::time::Instant::now();
-
-        batcher.send_immediate(text_tool_update("first"));
-        batcher.send_immediate(text_tool_update("second"));
-        assert!(rx.try_recv().is_err());
-
-        batcher.send_immediate(PiMsg::ToolEnd {
-            name: "bash".to_string(),
-            tool_id: "t1".to_string(),
-            is_error: false,
-        });
-
-        let first = rx.try_recv().expect("expected coalesced latest update");
-        let second = rx.try_recv().expect("expected tool end after update");
-        assert!(matches!(
-            first,
-            PiMsg::ToolUpdate { content, .. }
-                if matches!(content.first(), Some(ContentBlock::Text(text)) if text.text == "second")
-        ));
-        assert!(matches!(second, PiMsg::ToolEnd { tool_id, .. } if tool_id == "t1"));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn pressure_flushes_tool_update_when_pending_event_cap_is_hit() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let frame_p99 = Arc::new(AtomicU64::new(TuiPressureController::HIGH_FRAME_P99_US));
-        let mut batcher = UiStreamDeltaBatcher::new_with_frame_p99(tx, frame_p99);
-        batcher.last_tool_update_flush = std::time::Instant::now();
-
-        for idx in 0..TuiPressureController::HIGH_PENDING_TOOL_EVENTS {
-            batcher.send_immediate(text_tool_update(&format!("chunk-{idx}")));
-        }
-
-        let msg = rx
-            .try_recv()
-            .expect("expected latest update after pending cap");
-        assert!(matches!(
-            msg,
-            PiMsg::ToolUpdate { content, .. }
-                if matches!(
-                    content.first(),
-                    Some(ContentBlock::Text(text))
-                        if text.text
-                            == format!(
-                                "chunk-{}",
-                                TuiPressureController::HIGH_PENDING_TOOL_EVENTS - 1
-                            )
-                )
-        ));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
-    fn pressure_flushes_tool_update_when_pending_byte_cap_is_hit() {
-        let (tx, mut rx) = mpsc::channel(8);
-        let frame_p99 = Arc::new(AtomicU64::new(TuiPressureController::HIGH_FRAME_P99_US));
-        let mut batcher = UiStreamDeltaBatcher::new_with_frame_p99(tx, frame_p99);
-        batcher.last_tool_update_flush = std::time::Instant::now();
-
-        let chunks = ["a", "b", "c"]
-            .map(|prefix| prefix.repeat(TuiPressureController::HIGH_TOOL_OUTPUT_BYTES));
-        let expected_latest = "d".repeat(TuiPressureController::HIGH_TOOL_OUTPUT_BYTES);
-        for chunk in &chunks {
-            batcher.send_immediate(text_tool_update(chunk));
-        }
-        batcher.send_immediate(text_tool_update(&expected_latest));
-
-        let msg = rx
-            .try_recv()
-            .expect("expected latest update after pending byte cap");
-        assert!(matches!(
-            msg,
-            PiMsg::ToolUpdate { content, .. }
-                if matches!(content.first(), Some(ContentBlock::Text(text)) if text.text == expected_latest)
-        ));
-        assert!(rx.try_recv().is_err());
-    }
-
-    #[test]
     fn retains_unsent_chunk_when_channel_is_full() {
         let (tx, mut rx) = mpsc::channel(1);
         let mut batcher = UiStreamDeltaBatcher::new(tx);
@@ -2725,50 +1639,6 @@ mod stream_delta_batcher_tests {
         assert!(
             !state.saw_user_message.load(Ordering::SeqCst),
             "continue path should not synthesize a user message"
-        );
-    }
-
-    #[test]
-    fn submit_message_preserves_raw_extension_command_args() {
-        let raw_args = r#"--message "hello world"   --force"#;
-        let (mut app, mut event_rx) = build_test_app_with_provider(Arc::new(DummyProvider));
-        app.extensions = Some(build_test_extension_manager_with_command_output(&json!(
-            raw_args
-        )));
-
-        let _ = app.submit_message(r#"/deploy   --message "hello world"   --force"#);
-
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        let mut completion = None;
-        let mut agent_error = None;
-        while std::time::Instant::now() < deadline {
-            match event_rx.try_recv() {
-                Ok(PiMsg::ExtensionCommandDone {
-                    display, is_error, ..
-                }) => {
-                    assert!(!is_error, "unexpected extension command error: {display}");
-                    completion = Some(display);
-                    break;
-                }
-                Ok(PiMsg::AgentError(err)) => {
-                    agent_error = Some(err);
-                    break;
-                }
-                Ok(_) | Err(_) => {}
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-
-        assert!(
-            agent_error.is_none(),
-            "unexpected agent error while running extension command: {}",
-            agent_error.unwrap_or_default()
-        );
-        assert_eq!(
-            completion.as_deref(),
-            Some(raw_args),
-            "timed out waiting for extension command completion"
         );
     }
 
@@ -3042,177 +1912,6 @@ mod stream_delta_batcher_tests {
         assert_eq!(
             agent_guard.stream_options().thinking_level,
             Some(crate::model::ThinkingLevel::Off)
-        );
-    }
-
-    #[test]
-    fn empty_custom_overlay_frame_keeps_overlay_visible() {
-        let mut app = build_test_app();
-        let poll_request = ExtensionUiRequest::new(
-            "req-poll",
-            "custom",
-            json!({ "title": "Snake", "overlayOptions": { "width": "75%" } }),
-        )
-        .with_extension_id(Some("snake".to_string()));
-        app.handle_custom_extension_ui_request(poll_request);
-
-        let frame_request =
-            ExtensionUiRequest::new("req-frame", "setWidget", json!({ "title": "Snake" }))
-                .with_extension_id(Some("snake".to_string()));
-        app.apply_custom_overlay_widget_effect(&frame_request, Vec::new());
-
-        let overlay = app
-            .extension_custom_overlay
-            .as_ref()
-            .expect("empty frames should keep placeholder overlay active");
-        assert_eq!(overlay.extension_id.as_deref(), Some("snake"));
-        assert_eq!(overlay.title.as_deref(), Some("Snake"));
-        assert!(
-            overlay.lines.is_empty(),
-            "empty frame should preserve the waiting-state overlay"
-        );
-        assert!(
-            app.extension_custom_active,
-            "empty frame must not silently deactivate custom UI input handling"
-        );
-    }
-
-    #[test]
-    fn custom_overlay_poll_without_title_preserves_existing_title() {
-        let mut app = build_test_app();
-        let initial_request = ExtensionUiRequest::new(
-            "req-open",
-            "custom",
-            json!({ "title": "Snake", "overlay": true }),
-        )
-        .with_extension_id(Some("snake".to_string()));
-        app.handle_custom_extension_ui_request(initial_request);
-
-        let poll_request = ExtensionUiRequest::new(
-            "req-poll",
-            "custom",
-            json!({ "mode": "poll", "widgetKey": "__pi_custom_overlay" }),
-        )
-        .with_extension_id(Some("snake".to_string()));
-        app.handle_custom_extension_ui_request(poll_request);
-
-        let overlay = app
-            .extension_custom_overlay
-            .as_ref()
-            .expect("poll should keep custom overlay alive");
-        assert_eq!(overlay.title.as_deref(), Some("Snake"));
-        assert!(app.extension_custom_active);
-    }
-
-    #[test]
-    fn custom_overlay_frame_without_title_preserves_existing_title() {
-        let mut app = build_test_app();
-        let poll_request = ExtensionUiRequest::new(
-            "req-poll",
-            "custom",
-            json!({ "title": "Snake", "overlay": true }),
-        )
-        .with_extension_id(Some("snake".to_string()));
-        app.handle_custom_extension_ui_request(poll_request);
-
-        let frame_request =
-            ExtensionUiRequest::new("req-frame", "setWidget", json!({ "lines": ["score: 1"] }))
-                .with_extension_id(Some("snake".to_string()));
-        app.apply_custom_overlay_widget_effect(&frame_request, vec!["score: 1".to_string()]);
-
-        let overlay = app
-            .extension_custom_overlay
-            .as_ref()
-            .expect("frame update should keep custom overlay alive");
-        assert_eq!(overlay.title.as_deref(), Some("Snake"));
-        assert_eq!(overlay.lines, vec!["score: 1".to_string()]);
-    }
-
-    #[test]
-    fn clear_custom_overlay_frame_still_deactivates_overlay() {
-        let mut app = build_test_app();
-        let poll_request = ExtensionUiRequest::new("req-poll", "custom", json!({}))
-            .with_extension_id(Some("snake".to_string()));
-        app.handle_custom_extension_ui_request(poll_request);
-        assert!(app.extension_custom_overlay.is_some());
-        assert!(app.extension_custom_active);
-
-        let clear_request =
-            ExtensionUiRequest::new("req-clear", "setWidget", json!({ "clear": true }))
-                .with_extension_id(Some("snake".to_string()));
-        app.apply_custom_overlay_widget_effect(&clear_request, Vec::new());
-
-        assert!(app.extension_custom_overlay.is_none());
-        assert!(!app.extension_custom_active);
-        assert!(app.extension_custom_key_queue.is_empty());
-    }
-
-    #[test]
-    fn custom_overlay_reduces_conversation_height_budget() {
-        let mut app = build_test_app();
-        app.term_height = 24;
-
-        let idle_height = app.view_effective_conversation_height();
-
-        app.extension_custom_overlay = Some(ExtensionCustomOverlay {
-            extension_id: Some("snake".to_string()),
-            title: Some("Snake".to_string()),
-            lines: vec![
-                "score: 1".to_string(),
-                "score: 2".to_string(),
-                "score: 3".to_string(),
-                "score: 4".to_string(),
-                "score: 5".to_string(),
-                "score: 6".to_string(),
-            ],
-        });
-
-        assert!(
-            !app.editor_input_is_available(),
-            "custom overlays should hide the normal editor input"
-        );
-        assert!(
-            app.view_effective_conversation_height() < idle_height,
-            "custom overlay rows must shrink the conversation viewport budget"
-        );
-    }
-
-    #[test]
-    fn capability_prompt_takes_key_priority_over_custom_overlay() {
-        let mut app = build_test_app();
-        let poll_request = ExtensionUiRequest::new(
-            "req-poll",
-            "custom",
-            json!({ "title": "Snake", "overlay": true }),
-        )
-        .with_extension_id(Some("snake".to_string()));
-        app.handle_custom_extension_ui_request(poll_request);
-
-        let capability_request = ExtensionUiRequest::new(
-            "req-cap",
-            "confirm",
-            json!({
-                "extension_id": "snake",
-                "capability": "exec",
-                "message": "Needs shell access",
-            }),
-        )
-        .with_extension_id(Some("snake".to_string()));
-        app.capability_prompt = Some(CapabilityPromptOverlay::from_request(capability_request));
-
-        let _ = app.update(Message::new(KeyMsg::from_type(KeyType::Right)));
-
-        let prompt = app
-            .capability_prompt
-            .as_ref()
-            .expect("capability prompt should remain active");
-        assert_eq!(
-            prompt.focused, 1,
-            "Right arrow should move capability prompt focus instead of being swallowed by the custom overlay"
-        );
-        assert!(
-            app.extension_custom_key_queue.is_empty(),
-            "modal prompt keys must not leak into the custom overlay key queue"
         );
     }
 }

@@ -38,7 +38,6 @@ pub fn hints_for_error(error: &Error) -> ErrorHint {
         Error::Provider { message, .. } => provider_hints(message),
         Error::Tool { tool, message } => tool_hints(tool, message),
         Error::Validation(msg) => validation_hints(msg),
-        Error::Extension(msg) => extension_hints(msg),
         Error::Io(err) => io_hints(err),
         Error::Json(err) => json_hints(err),
         Error::Sqlite(err) => sqlite_hints(err),
@@ -334,44 +333,6 @@ fn validation_hints(msg: &str) -> ErrorHint {
     }
 }
 
-fn extension_hints(msg: &str) -> ErrorHint {
-    if msg.contains("not found") {
-        return ErrorHint {
-            summary: "Extension not found",
-            hints: &[
-                "Check extension name is correct",
-                "Use 'pi list' to see installed extensions",
-            ],
-            context_fields: &["extension_name"],
-        };
-    }
-    if msg.contains("manifest") {
-        return ErrorHint {
-            summary: "Invalid extension manifest",
-            hints: &[
-                "Check extension manifest.json syntax",
-                "Verify required fields are present",
-            ],
-            context_fields: &["extension_name", "manifest_path"],
-        };
-    }
-    if msg.contains("capability") || msg.contains("permission") {
-        return ErrorHint {
-            summary: "Extension capability denied",
-            hints: &[
-                "Extension requires capabilities not granted by policy",
-                "Review extension security settings",
-            ],
-            context_fields: &["extension_name", "capability"],
-        };
-    }
-    ErrorHint {
-        summary: "Extension error",
-        hints: &["Check extension configuration"],
-        context_fields: &["extension_name"],
-    }
-}
-
 fn io_hints(err: &std::io::Error) -> ErrorHint {
     match err.kind() {
         std::io::ErrorKind::NotFound => ErrorHint {
@@ -422,7 +383,7 @@ fn json_hints(err: &serde_json::Error) -> ErrorHint {
     }
 }
 
-fn sqlite_hints(err: &sqlmodel_core::Error) -> ErrorHint {
+fn sqlite_hints(err: &rusqlite::Error) -> ErrorHint {
     let message = err.to_string();
     if message.contains("locked") {
         return ErrorHint {

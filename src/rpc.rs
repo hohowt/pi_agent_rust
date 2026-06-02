@@ -20,10 +20,6 @@ use crate::compaction::{
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::error_hints;
-use crate::extensions::{
-    EXTENSION_EVENT_TIMEOUT_MS, ExtensionEventName, ExtensionManager, ExtensionUiRequest,
-    ExtensionUiResponse,
-};
 use crate::model::{
     ContentBlock, ImageContent, Message, StopReason, TextContent, UserContent, UserMessage,
 };
@@ -42,10 +38,14 @@ use serde_json::{Value, json};
 use std::collections::VecDeque;
 use std::future::Future;
 use std::io::{self, BufRead, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+fn safe_canonicalize(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
 
 #[derive(Clone)]
 pub struct RpcOptions {
@@ -186,40 +186,9 @@ fn build_prompt_content_blocks(text: &str, images: &[ImageContent]) -> Vec<Conte
     blocks
 }
 
-fn parse_extension_command_line(message: &str) -> Option<(String, String)> {
-    let trimmed = message.trim_start();
-    let stripped = trimmed.strip_prefix('/')?;
-    let (command, args) = stripped
-        .split_once(char::is_whitespace)
-        .unwrap_or((stripped, ""));
-    let command = command.trim();
-    if command.is_empty() {
-        return None;
-    }
-    Some((command.to_string(), args.trim_start().to_string()))
-}
-
-fn resolve_extension_command(
-    message: &str,
-    manager: Option<&ExtensionManager>,
-) -> Option<(String, String)> {
-    if !message.trim_start().starts_with('/') {
-        return None;
-    }
-
-    let manager = manager?;
-    let (command_name, args) = parse_extension_command_line(message)?;
-    manager
-        .has_command(&command_name)
-        .then_some((command_name, args))
-}
-
 fn rpc_agent_event_handler(
     out_tx: std::sync::mpsc::SyncSender<String>,
-    runtime_handle: RuntimeHandle,
-    extensions: Option<ExtensionManager>,
 ) -> impl Fn(AgentEvent) + Send + Sync + 'static {
-    let coalescer = extensions.map(crate::extensions::EventCoalescer::new);
     let output_pressure = Arc::new(std::sync::Mutex::new(RpcOutputPressureState::default()));
 
     move |event: AgentEvent| {
@@ -246,9 +215,6 @@ fn rpc_agent_event_handler(
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .send_agent_event(&out_tx, &event, serialized);
-        if let Some(coalescer) = &coalescer {
-            coalescer.dispatch_agent_event_lazy(&event, &runtime_handle);
-        }
     }
 }
 
@@ -371,40 +337,6 @@ const fn rpc_output_pressure_class(event: &AgentEvent) -> RpcOutputPressureClass
     }
 }
 
-async fn rpc_dispatch_session_before_switch(
-    manager: Option<ExtensionManager>,
-    reason: &str,
-    target_session_file: Option<&str>,
-) -> bool {
-    let Some(manager) = manager else {
-        return false;
-    };
-
-    let payload = target_session_file.map_or_else(
-        || json!({ "reason": reason }),
-        |target_session_file| json!({ "reason": reason, "targetSessionFile": target_session_file }),
-    );
-
-    manager
-        .dispatch_cancellable_event(
-            ExtensionEventName::SessionBeforeSwitch,
-            Some(payload),
-            EXTENSION_EVENT_TIMEOUT_MS,
-        )
-        .await
-        .unwrap_or(false)
-}
-
-async fn rpc_dispatch_session_switch_event(manager: Option<ExtensionManager>, payload: Value) {
-    let Some(manager) = manager else {
-        return;
-    };
-
-    let _ = manager
-        .dispatch_event(ExtensionEventName::SessionSwitch, Some(payload))
-        .await;
-}
-
 fn try_send_line_with_backpressure(tx: &mpsc::Sender<String>, mut line: String) -> bool {
     loop {
         match tx.try_send(line) {
@@ -485,12 +417,6 @@ impl RpcSharedState {
 struct RunningBash {
     id: String,
     abort_tx: oneshot::Sender<()>,
-}
-
-#[derive(Debug, Default)]
-struct RpcUiBridgeState {
-    active: Option<ExtensionUiRequest>,
-    queue: VecDeque<ExtensionUiRequest>,
 }
 
 pub async fn run_stdio(mut session: AgentSession, options: RpcOptions) -> Result<()> {
@@ -598,82 +524,6 @@ pub async fn run(
         );
     }
 
-    // Set up extension UI channel for RPC mode.
-    // When extensions request UI (capability prompts, etc.), we emit them as
-    // JSON notifications so the RPC client can respond programmatically.
-    let rpc_extension_manager = {
-        let cx_ui = cx.clone();
-        let guard = session
-            .lock(&cx_ui)
-            .await
-            .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-        guard
-            .extensions
-            .as_ref()
-            .map(crate::extensions::ExtensionRegion::manager)
-            .cloned()
-    };
-
-    let rpc_ui_state: Option<Arc<Mutex<RpcUiBridgeState>>> = rpc_extension_manager
-        .as_ref()
-        .map(|_| Arc::new(Mutex::new(RpcUiBridgeState::default())));
-
-    if let Some(ref manager) = rpc_extension_manager {
-        let (extension_ui_tx, mut extension_ui_rx) =
-            asupersync::channel::mpsc::channel::<ExtensionUiRequest>(64);
-        manager.set_ui_sender(extension_ui_tx);
-
-        let out_tx_ui = out_tx.clone();
-        let ui_state = rpc_ui_state
-            .as_ref()
-            .map(Arc::clone)
-            .expect("rpc ui state should exist when extension manager exists");
-        let manager_ui = (*manager).clone();
-        let runtime_handle_ui = options.runtime_handle.clone();
-        options.runtime_handle.spawn(async move {
-            const MAX_UI_PENDING_REQUESTS: usize = 64;
-            let cx = AgentCx::for_request();
-            while let Ok(request) = extension_ui_rx.recv(&cx).await {
-                if request.expects_response() {
-                    let emit_now = {
-                        let Ok(mut guard) = ui_state.lock(&cx).await else {
-                            return;
-                        };
-                        if guard.active.is_none() {
-                            guard.active = Some(request.clone());
-                            true
-                        } else if guard.queue.len() < MAX_UI_PENDING_REQUESTS {
-                            guard.queue.push_back(request.clone());
-                            false
-                        } else {
-                            drop(guard);
-                            let _ = manager_ui.respond_ui(ExtensionUiResponse {
-                                id: request.id.clone(),
-                                value: None,
-                                cancelled: true,
-                            });
-                            false
-                        }
-                    };
-
-                    if emit_now {
-                        rpc_emit_extension_ui_request(
-                            &runtime_handle_ui,
-                            Arc::clone(&ui_state),
-                            manager_ui.clone(),
-                            out_tx_ui.clone(),
-                            request,
-                        );
-                    }
-                } else {
-                    // Fire-and-forget UI updates should not be queued.
-                    let rpc_event = request.to_rpc_event();
-                    let _ = out_tx_ui.send(event(&rpc_event));
-                }
-            }
-        });
-    }
-
     while let Ok(line) = in_rx.recv(&cx).await {
         if line.trim().is_empty() {
             continue;
@@ -728,21 +578,7 @@ pub async fn run(
                         }
                     };
 
-                let extension_command =
-                    resolve_extension_command(&message, rpc_extension_manager.as_ref());
-
                 if is_streaming.load(Ordering::SeqCst) {
-                    if extension_command.is_some() {
-                        let resp = response_error(
-                            id,
-                            "prompt",
-                            "Extension commands are not allowed while agent is streaming"
-                                .to_string(),
-                        );
-                        let _ = out_tx.send(resp);
-                        continue;
-                    }
-
                     if streaming_behavior.is_none() {
                         let resp = response_error(
                             id,
@@ -794,50 +630,26 @@ pub async fn run(
                 let is_compacting = Arc::clone(&is_compacting);
                 let abort_handle_slot = Arc::clone(&abort_handle);
                 let runtime_handle = options.runtime_handle.clone();
-                if let Some((command_name, args)) = extension_command {
-                    let command_runtime = runtime_handle.clone();
-                    let command_cx = cx.clone();
-                    runtime_handle.spawn(future_with_current_cx(
-                        command_cx.cx().clone(),
-                        async move {
-                            run_extension_command(
-                                session,
-                                is_streaming,
-                                abort_handle_slot,
-                                out_tx,
-                                command_runtime,
-                                command_name,
-                                args,
-                                command_cx,
-                            )
-                            .await;
-                        },
-                    ));
-                } else {
-                    let retry_abort = retry_abort.clone();
-                    let options = options.clone();
-                    let expanded = options.resources.expand_input(&message);
-                    let prompt_cx = cx.clone();
-                    runtime_handle.spawn(future_with_current_cx(
-                        prompt_cx.cx().clone(),
-                        async move {
-                            run_prompt_with_retry(
-                                session,
-                                shared_state,
-                                is_streaming,
-                                is_compacting,
-                                abort_handle_slot,
-                                out_tx,
-                                retry_abort,
-                                options,
-                                expanded,
-                                images,
-                                prompt_cx,
-                            )
-                            .await;
-                        },
-                    ));
-                }
+                let retry_abort = retry_abort.clone();
+                let options = options.clone();
+                let expanded = options.resources.expand_input(&message);
+                let prompt_cx = cx.clone();
+                runtime_handle.spawn(future_with_current_cx(prompt_cx.cx().clone(), async move {
+                    run_prompt_with_retry(
+                        session,
+                        shared_state,
+                        is_streaming,
+                        is_compacting,
+                        abort_handle_slot,
+                        out_tx,
+                        retry_abort,
+                        options,
+                        expanded,
+                        images,
+                        prompt_cx,
+                    )
+                    .await;
+                }));
             }
 
             "steer" => {
@@ -850,16 +662,6 @@ pub async fn run(
                     let _ = out_tx.send(resp);
                     continue;
                 };
-
-                if resolve_extension_command(&message, rpc_extension_manager.as_ref()).is_some() {
-                    let resp = response_error(
-                        id,
-                        "steer",
-                        "Extension commands are not allowed with steer".to_string(),
-                    );
-                    let _ = out_tx.send(resp);
-                    continue;
-                }
 
                 let expanded = options.resources.expand_input(&message);
                 if is_streaming.load(Ordering::SeqCst) {
@@ -923,16 +725,6 @@ pub async fn run(
                     let _ = out_tx.send(resp);
                     continue;
                 };
-
-                if resolve_extension_command(&message, rpc_extension_manager.as_ref()).is_some() {
-                    let resp = response_error(
-                        id,
-                        "follow_up",
-                        "Extension commands are not allowed with follow_up".to_string(),
-                    );
-                    let _ = out_tx.send(resp);
-                    continue;
-                }
 
                 let expanded = options.resources.expand_input(&message);
                 if is_streaming.load(Ordering::SeqCst) {
@@ -1127,13 +919,7 @@ pub async fn run(
                             .lock(&cx)
                             .await
                             .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                        let provider_impl = providers::create_provider(
-                            &entry,
-                            guard
-                                .extensions
-                                .as_ref()
-                                .map(crate::extensions::ExtensionRegion::manager),
-                        )?;
+                        let provider_impl = providers::create_provider(&entry)?;
                         guard.agent.set_provider(provider_impl);
                         guard.agent.stream_options_mut().api_key.clone_from(&key);
                         guard
@@ -1742,27 +1528,16 @@ pub async fn run(
             }
 
             "new_session" => {
-                if rpc_dispatch_session_before_switch(rpc_extension_manager.clone(), "new", None)
-                    .await
-                {
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "new_session",
-                        Some(json!({ "cancelled": true })),
-                    ));
-                    continue;
-                }
-
                 let parent = parsed
                     .get("parentSession")
                     .and_then(Value::as_str)
                     .map(str::to_string);
-                let (session_id, previous_session_file) = {
+                let _session_id = {
                     let mut guard = session
                         .lock(&cx)
                         .await
                         .map_err(|err| Error::session(format!("session lock failed: {err}")))?;
-                    let (session_dir, provider, model_id, thinking_level, previous_session_file) = {
+                    let (session_dir, provider, model_id, thinking_level) = {
                         let inner_session = guard.session.lock(&cx).await.map_err(|err| {
                             Error::session(format!("inner session lock failed: {err}"))
                         })?;
@@ -1771,7 +1546,6 @@ pub async fn run(
                             inner_session.header.provider.clone(),
                             inner_session.header.model_id.clone(),
                             inner_session.header.thinking_level.clone(),
-                            inner_session.path.as_ref().map(|p| p.display().to_string()),
                         )
                     };
                     let mut new_session = if guard.save_enabled() {
@@ -1798,7 +1572,7 @@ pub async fn run(
                     guard.agent.clear_messages();
                     guard.agent.stream_options_mut().session_id = Some(session_id.clone());
 
-                    (session_id, previous_session_file)
+                    session_id
                 };
                 {
                     let mut state = shared_state
@@ -1808,15 +1582,6 @@ pub async fn run(
                     state.steering.clear();
                     state.follow_up.clear();
                 }
-                rpc_dispatch_session_switch_event(
-                    rpc_extension_manager.clone(),
-                    json!({
-                        "reason": "new",
-                        "previousSessionFile": previous_session_file,
-                        "sessionId": session_id,
-                    }),
-                )
-                .await;
                 let _ = out_tx.send(response_ok(
                     id,
                     "new_session",
@@ -1834,21 +1599,6 @@ pub async fn run(
                     continue;
                 };
 
-                if rpc_dispatch_session_before_switch(
-                    rpc_extension_manager.clone(),
-                    "resume",
-                    Some(session_path),
-                )
-                .await
-                {
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "switch_session",
-                        Some(json!({ "cancelled": true })),
-                    ));
-                    continue;
-                }
-
                 // Validate relative paths against the sessions directory to prevent traversal.
                 let session_path_buf = std::path::PathBuf::from(session_path);
                 let sessions_dir = crate::config::Config::sessions_dir();
@@ -1858,9 +1608,8 @@ pub async fn run(
                     session_path_buf.clone()
                 };
                 if session_path_buf.is_relative() {
-                    let canonical_session = crate::extensions::safe_canonicalize(&resolved_path);
-                    let canonical_sessions_dir =
-                        crate::extensions::safe_canonicalize(&sessions_dir);
+                    let canonical_session = safe_canonicalize(&resolved_path);
+                    let canonical_sessions_dir = safe_canonicalize(&sessions_dir);
                     if !canonical_session.starts_with(&canonical_sessions_dir) {
                         let _ = out_tx.send(response_error(
                             id,
@@ -1881,7 +1630,6 @@ pub async fn run(
                         );
                         let messages = new_session.to_messages_for_current_path();
                         let session_id = new_session.header.id.clone();
-                        let previous_session_file;
                         let mut guard = session
                             .lock(&cx)
                             .await
@@ -1891,8 +1639,6 @@ pub async fn run(
                                 guard.session.lock(&cx).await.map_err(|err| {
                                     Error::session(format!("inner session lock failed: {err}"))
                                 })?;
-                            previous_session_file =
-                                inner_session.path.as_ref().map(|p| p.display().to_string());
                             *inner_session = new_session;
                         }
                         guard.agent.replace_messages(messages);
@@ -1906,16 +1652,7 @@ pub async fn run(
                         drop(state);
                         drop(guard);
 
-                        rpc_dispatch_session_switch_event(
-                            rpc_extension_manager.clone(),
-                            json!({
-                                "reason": "resume",
-                                "previousSessionFile": previous_session_file,
-                                "targetSessionFile": target_session_file,
-                                "sessionId": session_id,
-                            }),
-                        )
-                        .await;
+                        let _ = (target_session_file, session_id);
 
                         let _ = out_tx.send(response_ok(
                             id,
@@ -2052,91 +1789,6 @@ pub async fn run(
                 ));
             }
 
-            "extension_ui_response" => {
-                if let (Some(manager), Some(ui_state)) =
-                    (rpc_extension_manager.as_ref(), rpc_ui_state.as_ref())
-                {
-                    let Some(request_id) = rpc_parse_extension_ui_response_id(&parsed) else {
-                        let _ = out_tx.send(response_error(
-                            id,
-                            "extension_ui_response",
-                            "Missing requestId (or id) field",
-                        ));
-                        continue;
-                    };
-
-                    let (response, next_request) = {
-                        let Ok(mut guard) = ui_state.lock(&cx).await else {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                "Extension UI bridge unavailable",
-                            ));
-                            continue;
-                        };
-
-                        let Some(active) = guard.active.clone() else {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                "No active extension UI request",
-                            ));
-                            continue;
-                        };
-
-                        if active.id != request_id {
-                            let _ = out_tx.send(response_error(
-                                id,
-                                "extension_ui_response",
-                                format!(
-                                    "Unexpected requestId: {request_id} (active: {})",
-                                    active.id
-                                ),
-                            ));
-                            continue;
-                        }
-
-                        let response = match rpc_parse_extension_ui_response(&parsed, &active) {
-                            Ok(response) => response,
-                            Err(message) => {
-                                let _ = out_tx.send(response_error(
-                                    id,
-                                    "extension_ui_response",
-                                    message,
-                                ));
-                                continue;
-                            }
-                        };
-
-                        guard.active = None;
-                        let next = guard.queue.pop_front();
-                        if let Some(ref next) = next {
-                            guard.active = Some(next.clone());
-                        }
-                        (response, next)
-                    };
-
-                    let resolved = manager.respond_ui(response);
-                    let _ = out_tx.send(response_ok(
-                        id,
-                        "extension_ui_response",
-                        Some(json!({ "resolved": resolved })),
-                    ));
-
-                    if let Some(next) = next_request {
-                        rpc_emit_extension_ui_request(
-                            &options.runtime_handle,
-                            Arc::clone(ui_state),
-                            (*manager).clone(),
-                            out_tx.clone(),
-                            next,
-                        );
-                    }
-                } else {
-                    let _ = out_tx.send(response_ok(id, "extension_ui_response", None));
-                }
-            }
-
             _ => {
                 let _ = out_tx.send(response_error(
                     id,
@@ -2145,18 +1797,6 @@ pub async fn run(
                 ));
             }
         }
-    }
-
-    // Explicitly shut down extension runtimes before the session drops.
-    // Move the region out under lock, then await shutdown after releasing
-    // the lock so we don't hold the session mutex across an async wait.
-    let extension_region = session
-        .lock(&cx)
-        .await
-        .ok()
-        .and_then(|mut guard| guard.extensions.take());
-    if let Some(ext) = extension_region {
-        ext.shutdown().await;
     }
 
     Ok(())
@@ -2204,8 +1844,6 @@ async fn run_prompt_with_retry(
             return;
         }
 
-        let runtime_for_events = options.runtime_handle.clone();
-
         let result = {
             let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
                 Ok(guard) => guard,
@@ -2215,9 +1853,7 @@ async fn run_prompt_with_retry(
                     break;
                 }
             };
-            let extensions = guard.extensions.as_ref().map(|r| r.manager().clone());
-            let event_handler =
-                rpc_agent_event_handler(out_tx.clone(), runtime_for_events, extensions);
+            let event_handler = rpc_agent_event_handler(out_tx.clone());
 
             if images.is_empty() {
                 guard
@@ -2375,74 +2011,6 @@ async fn run_prompt_with_retry(
     }
 }
 
-async fn run_extension_command(
-    session: Arc<Mutex<AgentSession>>,
-    is_streaming: Arc<AtomicBool>,
-    abort_handle_slot: Arc<Mutex<Option<AbortHandle>>>,
-    out_tx: std::sync::mpsc::SyncSender<String>,
-    runtime_handle: RuntimeHandle,
-    command_name: String,
-    args: String,
-    cx: AgentCx,
-) {
-    is_streaming.store(true, Ordering::SeqCst);
-
-    let (abort_handle, abort_signal) = AbortHandle::new();
-    if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
-        *guard = Some(abort_handle);
-    } else {
-        is_streaming.store(false, Ordering::SeqCst);
-        return;
-    }
-
-    let result = {
-        let mut guard = match OwnedMutexGuard::lock(Arc::clone(&session), &cx).await {
-            Ok(guard) => guard,
-            Err(err) => {
-                let err = Error::session(format!("session lock failed: {err}"));
-                let mut payload = json!({
-                    "type": "agent_end",
-                    "messages": [],
-                    "error": err.to_string(),
-                });
-                payload["errorHints"] = error_hints_value(&err);
-                let _ = out_tx.send(event(&payload));
-                is_streaming.store(false, Ordering::SeqCst);
-                return;
-            }
-        };
-        let extensions = guard
-            .extensions
-            .as_ref()
-            .map(|region| region.manager().clone());
-        let event_handler = rpc_agent_event_handler(out_tx.clone(), runtime_handle, extensions);
-        guard
-            .execute_extension_command_with_abort(
-                &command_name,
-                &args,
-                EXTENSION_EVENT_TIMEOUT_MS,
-                Some(abort_signal),
-                event_handler,
-            )
-            .await
-    };
-
-    if let Ok(mut guard) = OwnedMutexGuard::lock(Arc::clone(&abort_handle_slot), &cx).await {
-        *guard = None;
-    }
-    is_streaming.store(false, Ordering::SeqCst);
-
-    if let Err(err) = result {
-        let mut payload = json!({
-            "type": "agent_end",
-            "messages": [],
-            "error": err.to_string(),
-        });
-        payload["errorHints"] = error_hints_value(&err);
-        let _ = out_tx.send(event(&payload));
-    }
-}
-
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -2501,423 +2069,6 @@ fn agent_event(event: AgentEvent) -> String {
         })
         .to_string()
     })
-}
-
-fn rpc_emit_extension_ui_request(
-    runtime_handle: &RuntimeHandle,
-    ui_state: Arc<Mutex<RpcUiBridgeState>>,
-    manager: ExtensionManager,
-    out_tx_ui: std::sync::mpsc::SyncSender<String>,
-    request: ExtensionUiRequest,
-) {
-    // Emit the UI request as a JSON notification to the client.
-    let rpc_event = request.to_rpc_event();
-    let _ = out_tx_ui.send(event(&rpc_event));
-
-    if !request.expects_response() {
-        return;
-    }
-
-    // For dialog methods, enforce deterministic ordering (one active request at a time) by
-    // auto-resolving timeouts as cancellation defaults (per bd-2hz.1).
-    let Some(timeout_ms) = request.effective_timeout_ms() else {
-        return;
-    };
-
-    // Fire a little early so ExtensionManager::request_ui doesn't hit its own timeout first.
-    let fire_ms = timeout_ms.saturating_sub(10).max(1);
-    let request_id = request.id;
-    let ui_state_timeout = Arc::clone(&ui_state);
-    let manager_timeout = manager;
-    let out_tx_timeout = out_tx_ui;
-    let runtime_handle_inner = runtime_handle.clone();
-
-    runtime_handle.spawn(async move {
-        sleep(wall_now(), Duration::from_millis(fire_ms)).await;
-        let cx = AgentCx::for_request();
-
-        let next = {
-            let Ok(mut guard) = ui_state_timeout.lock(cx.cx()).await else {
-                return;
-            };
-
-            let Some(active) = guard.active.as_ref() else {
-                return;
-            };
-
-            // No-op if the active request has already advanced.
-            if active.id != request_id {
-                return;
-            }
-
-            // Resolve with cancellation defaults (downstream maps method -> default return value).
-            let _ = manager_timeout.respond_ui(ExtensionUiResponse {
-                id: request_id,
-                value: None,
-                cancelled: true,
-            });
-
-            guard.active = None;
-            let next = guard.queue.pop_front();
-            if let Some(ref next) = next {
-                guard.active = Some(next.clone());
-            }
-            next
-        };
-
-        if let Some(next) = next {
-            rpc_emit_extension_ui_request(
-                &runtime_handle_inner,
-                ui_state_timeout,
-                manager_timeout,
-                out_tx_timeout,
-                next,
-            );
-        }
-    });
-}
-
-fn rpc_parse_extension_ui_response_id(parsed: &Value) -> Option<String> {
-    let request_id = parsed
-        .get("requestId")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(String::from);
-
-    request_id.or_else(|| {
-        parsed
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(String::from)
-    })
-}
-
-fn rpc_parse_extension_ui_response(
-    parsed: &Value,
-    active: &ExtensionUiRequest,
-) -> std::result::Result<ExtensionUiResponse, String> {
-    let cancelled = parsed
-        .get("cancelled")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-
-    if cancelled && active.method != "custom" {
-        return Ok(ExtensionUiResponse {
-            id: active.id.clone(),
-            value: None,
-            cancelled: true,
-        });
-    }
-
-    match active.method.as_str() {
-        "confirm" => {
-            let value = parsed
-                .get("confirmed")
-                .and_then(Value::as_bool)
-                .or_else(|| parsed.get("value").and_then(Value::as_bool))
-                .ok_or_else(|| "confirm requires boolean `confirmed` (or `value`)".to_string())?;
-            Ok(ExtensionUiResponse {
-                id: active.id.clone(),
-                value: Some(Value::Bool(value)),
-                cancelled: false,
-            })
-        }
-        "select" => {
-            let Some(value) = parsed.get("value") else {
-                return Err("select requires `value` field".to_string());
-            };
-
-            let options = active
-                .payload
-                .get("options")
-                .and_then(Value::as_array)
-                .ok_or_else(|| "select request missing `options` array".to_string())?;
-
-            let mut allowed = Vec::with_capacity(options.len());
-            for opt in options {
-                match opt {
-                    Value::String(s) => allowed.push(Value::String(s.clone())),
-                    Value::Object(map) => {
-                        let label = map
-                            .get("label")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .trim();
-                        if label.is_empty() {
-                            continue;
-                        }
-                        if let Some(v) = map.get("value") {
-                            allowed.push(v.clone());
-                        } else {
-                            allowed.push(Value::String(label.to_string()));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-
-            if !allowed.iter().any(|candidate| candidate == value) {
-                return Err("select response value did not match any option".to_string());
-            }
-
-            Ok(ExtensionUiResponse {
-                id: active.id.clone(),
-                value: Some(value.clone()),
-                cancelled: false,
-            })
-        }
-        "input" | "editor" => {
-            let Some(value) = parsed.get("value") else {
-                return Err(format!("{} requires `value` field", active.method));
-            };
-            if !value.is_string() {
-                return Err(format!("{} requires string `value`", active.method));
-            }
-            Ok(ExtensionUiResponse {
-                id: active.id.clone(),
-                value: Some(value.clone()),
-                cancelled: false,
-            })
-        }
-        "custom" => {
-            if let Some(value) = parsed.get("value").filter(|value| !value.is_null()) {
-                return Ok(ExtensionUiResponse {
-                    id: active.id.clone(),
-                    value: Some(value.clone()),
-                    cancelled: false,
-                });
-            }
-
-            let mut payload = serde_json::Map::new();
-            if let Some(key) = parsed.get("key").and_then(Value::as_str) {
-                payload.insert("key".to_string(), Value::String(key.to_string()));
-            }
-            if let Some(width) = parsed.get("width").and_then(Value::as_u64) {
-                payload.insert("width".to_string(), Value::from(width));
-            }
-            if let Some(close) = parsed
-                .get("cancelled")
-                .or_else(|| parsed.get("closed"))
-                .and_then(Value::as_bool)
-            {
-                payload.insert("closed".to_string(), Value::Bool(close));
-            }
-            if payload.is_empty() {
-                return Err("custom requires `value`, `key`, `width`, or `cancelled`".to_string());
-            }
-            Ok(ExtensionUiResponse {
-                id: active.id.clone(),
-                value: Some(Value::Object(payload)),
-                cancelled: false,
-            })
-        }
-        "notify" => Ok(ExtensionUiResponse {
-            id: active.id.clone(),
-            value: None,
-            cancelled: false,
-        }),
-        other => Err(format!("Unsupported extension UI method: {other}")),
-    }
-}
-
-#[cfg(test)]
-mod ui_bridge_tests {
-    use super::*;
-
-    #[test]
-    fn parse_extension_ui_response_id_prefers_request_id() {
-        let value = json!({"type":"extension_ui_response","id":"legacy","requestId":"canonical"});
-        assert_eq!(
-            rpc_parse_extension_ui_response_id(&value),
-            Some("canonical".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_extension_ui_response_id_accepts_id_alias() {
-        let value = json!({"type":"extension_ui_response","id":"legacy"});
-        assert_eq!(
-            rpc_parse_extension_ui_response_id(&value),
-            Some("legacy".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_confirm_response_accepts_confirmed_alias() {
-        let active = ExtensionUiRequest::new("req-1", "confirm", json!({"title":"t"}));
-        let value = json!({"type":"extension_ui_response","requestId":"req-1","confirmed":true});
-        let resp = rpc_parse_extension_ui_response(&value, &active).expect("parse confirm");
-        assert!(!resp.cancelled);
-        assert_eq!(resp.value, Some(json!(true)));
-    }
-
-    #[test]
-    fn parse_confirm_response_accepts_value_bool() {
-        let active = ExtensionUiRequest::new("req-1", "confirm", json!({"title":"t"}));
-        let value = json!({"type":"extension_ui_response","requestId":"req-1","value":false});
-        let resp = rpc_parse_extension_ui_response(&value, &active).expect("parse confirm");
-        assert!(!resp.cancelled);
-        assert_eq!(resp.value, Some(json!(false)));
-    }
-
-    #[test]
-    fn parse_cancelled_response_wins_over_value() {
-        let active = ExtensionUiRequest::new("req-1", "confirm", json!({"title":"t"}));
-        let value = json!({"type":"extension_ui_response","requestId":"req-1","cancelled":true,"value":true});
-        let resp = rpc_parse_extension_ui_response(&value, &active).expect("parse cancel");
-        assert!(resp.cancelled);
-        assert_eq!(resp.value, None);
-    }
-
-    #[test]
-    fn parse_select_response_validates_against_options() {
-        let active = ExtensionUiRequest::new(
-            "req-1",
-            "select",
-            json!({"title":"pick","options":["A","B"]}),
-        );
-        let ok_value = json!({"type":"extension_ui_response","requestId":"req-1","value":"B"});
-        let ok = rpc_parse_extension_ui_response(&ok_value, &active).expect("parse select ok");
-        assert_eq!(ok.value, Some(json!("B")));
-
-        let bad_value = json!({"type":"extension_ui_response","requestId":"req-1","value":"C"});
-        assert!(
-            rpc_parse_extension_ui_response(&bad_value, &active).is_err(),
-            "invalid selection should error"
-        );
-    }
-
-    #[test]
-    fn parse_input_requires_string_value() {
-        let active = ExtensionUiRequest::new("req-1", "input", json!({"title":"t"}));
-        let ok_value = json!({"type":"extension_ui_response","requestId":"req-1","value":"hi"});
-        let ok = rpc_parse_extension_ui_response(&ok_value, &active).expect("parse input ok");
-        assert_eq!(ok.value, Some(json!("hi")));
-
-        let bad_value = json!({"type":"extension_ui_response","requestId":"req-1","value":123});
-        assert!(
-            rpc_parse_extension_ui_response(&bad_value, &active).is_err(),
-            "non-string input should error"
-        );
-    }
-
-    #[test]
-    fn parse_editor_requires_string_value() {
-        let active = ExtensionUiRequest::new("req-1", "editor", json!({"title":"t"}));
-        let ok = json!({"requestId":"req-1","value":"multi\nline"});
-        let resp = rpc_parse_extension_ui_response(&ok, &active).expect("editor ok");
-        assert_eq!(resp.value, Some(json!("multi\nline")));
-
-        let bad = json!({"requestId":"req-1","value":42});
-        assert!(
-            rpc_parse_extension_ui_response(&bad, &active).is_err(),
-            "editor needs string"
-        );
-    }
-
-    #[test]
-    fn parse_notify_returns_no_value() {
-        let active = ExtensionUiRequest::new("req-1", "notify", json!({"title":"t"}));
-        let val = json!({"requestId":"req-1"});
-        let resp = rpc_parse_extension_ui_response(&val, &active).expect("notify ok");
-        assert!(!resp.cancelled);
-        assert!(resp.value.is_none());
-    }
-
-    #[test]
-    fn parse_custom_accepts_value_passthrough() {
-        let active = ExtensionUiRequest::new("req-1", "custom", json!({}));
-        let val = json!({"requestId":"req-1","value":{"key":"w","width":88}});
-        let resp = rpc_parse_extension_ui_response(&val, &active).expect("custom value");
-        assert_eq!(resp.value, Some(json!({"key":"w","width":88})));
-        assert!(!resp.cancelled);
-    }
-
-    #[test]
-    fn parse_custom_accepts_key_width_fields() {
-        let active = ExtensionUiRequest::new("req-1", "custom", json!({}));
-        let val = json!({"requestId":"req-1","key":"q","width":120});
-        let resp = rpc_parse_extension_ui_response(&val, &active).expect("custom key+width");
-        assert_eq!(resp.value, Some(json!({"key":"q","width":120})));
-        assert!(!resp.cancelled);
-    }
-
-    #[test]
-    fn parse_custom_preserves_cancelled_and_width_as_payload() {
-        let active = ExtensionUiRequest::new("req-1", "custom", json!({}));
-        let val = json!({"requestId":"req-1","width":120,"cancelled":true});
-        let resp = rpc_parse_extension_ui_response(&val, &active).expect("custom cancelled+width");
-        assert_eq!(resp.value, Some(json!({"width":120,"closed":true})));
-        assert!(!resp.cancelled);
-    }
-
-    #[test]
-    fn parse_custom_treats_null_value_as_absent_for_close_payloads() {
-        let active = ExtensionUiRequest::new("req-1", "custom", json!({}));
-        let val = json!({"requestId":"req-1","value":null,"cancelled":true});
-        let resp = rpc_parse_extension_ui_response(&val, &active).expect("custom null+cancelled");
-        assert_eq!(resp.value, Some(json!({"closed":true})));
-        assert!(!resp.cancelled);
-    }
-
-    #[test]
-    fn parse_unsupported_method_errors() {
-        let active = ExtensionUiRequest::new("req-1", "custom_method", json!({}));
-        let val = json!({"requestId":"req-1","value":"x"});
-        let err = rpc_parse_extension_ui_response(&val, &active).unwrap_err();
-        assert!(err.contains("Unsupported"), "err={err}");
-    }
-
-    #[test]
-    fn parse_select_missing_value_field() {
-        let active =
-            ExtensionUiRequest::new("req-1", "select", json!({"title":"pick","options":["A"]}));
-        let val = json!({"requestId":"req-1"});
-        let err = rpc_parse_extension_ui_response(&val, &active).unwrap_err();
-        assert!(err.contains("value"), "err={err}");
-    }
-
-    #[test]
-    fn parse_confirm_missing_value_errors() {
-        let active = ExtensionUiRequest::new("req-1", "confirm", json!({"title":"t"}));
-        let val = json!({"requestId":"req-1"});
-        let err = rpc_parse_extension_ui_response(&val, &active).unwrap_err();
-        assert!(err.contains("confirm"), "err={err}");
-    }
-
-    #[test]
-    fn parse_select_with_label_value_objects() {
-        let active = ExtensionUiRequest::new(
-            "req-1",
-            "select",
-            json!({
-                "title": "pick",
-                "options": [
-                    {"label": "Alpha", "value": "a"},
-                    {"label": "Beta", "value": "b"},
-                ]
-            }),
-        );
-        let val = json!({"requestId":"req-1","value":"a"});
-        let resp = rpc_parse_extension_ui_response(&val, &active).expect("select by value");
-        assert_eq!(resp.value, Some(json!("a")));
-    }
-
-    #[test]
-    fn parse_id_rejects_empty_and_whitespace() {
-        let val = json!({"requestId":"  ","id":""});
-        assert!(rpc_parse_extension_ui_response_id(&val).is_none());
-    }
-
-    #[test]
-    fn bridge_state_default_is_empty() {
-        let state = RpcUiBridgeState::default();
-        assert!(state.active.is_none());
-        assert!(state.queue.is_empty());
-    }
 }
 
 fn error_hints_value(error: &Error) -> Value {
@@ -5252,13 +4403,7 @@ async fn cycle_model_for_rpc(
         )));
     }
 
-    let provider_impl = crate::providers::create_provider(
-        &next_entry,
-        guard
-            .extensions
-            .as_ref()
-            .map(crate::extensions::ExtensionRegion::manager),
-    )?;
+    let provider_impl = crate::providers::create_provider(&next_entry)?;
     guard.agent.set_provider(provider_impl);
 
     guard.agent.stream_options_mut().api_key.clone_from(&key);
@@ -5347,7 +4492,6 @@ mod tests {
             headers: HashMap::new(),
             auth_header: false,
             compat: None,
-            oauth_config: None,
         }
     }
 
@@ -5738,42 +4882,15 @@ mod tests {
         let cli = ResourceCliOptions {
             no_skills: true,
             no_prompt_templates: false,
-            no_extensions: true,
             no_themes: true,
             skill_paths: Vec::new(),
             prompt_paths: vec![prompt_path.to_string_lossy().to_string()],
-            extension_paths: Vec::new(),
             theme_paths: Vec::new(),
         };
 
         ResourceLoader::load(&manager, cwd, &config, &cli)
             .await
             .expect("load prompt template resources")
-    }
-
-    async fn build_queue_state_rpc_fixture(
-        handle: &asupersync::runtime::RuntimeHandle,
-        cwd: &Path,
-    ) -> (AgentSession, RpcOptions) {
-        let ext_entry_path = cwd.join("queue-state-ext.mjs");
-        std::fs::write(&ext_entry_path, RPC_QUEUE_STATE_EXTENSION_EXT)
-            .expect("write extension source");
-
-        let mut agent_session = build_test_agent_session(Session::in_memory());
-        agent_session
-            .enable_extensions(&[], cwd, None, &[ext_entry_path])
-            .await
-            .expect("enable extensions");
-
-        let mut options = build_test_rpc_options(handle, cwd.join("auth.json"));
-        options.resources = load_test_prompt_template_resources(
-            cwd,
-            "report-queue-state",
-            "Prompt template shadow that should not win.\n",
-        )
-        .await;
-
-        (agent_session, options)
     }
 
     async fn recv_line(
@@ -5865,114 +4982,6 @@ mod tests {
             "expected error for {command}: {resp}"
         );
     }
-
-    async fn recv_ui_request(out_rx: &Arc<Mutex<Receiver<String>>>, label: &str) -> Value {
-        let start = Instant::now();
-        loop {
-            let recv_result = {
-                let rx = out_rx.lock().expect("lock rpc output receiver");
-                rx.try_recv()
-            };
-
-            match recv_result {
-                Ok(line) => {
-                    if let Ok(val) = serde_json::from_str::<Value>(&line) {
-                        if val.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
-                            return val;
-                        }
-                    }
-                }
-                Err(TryRecvError::Disconnected) => {
-                    unreachable!(
-                        "{label}: output channel disconnected while waiting for extension_ui_request"
-                    );
-                }
-                Err(TryRecvError::Empty) => {}
-            }
-
-            assert!(
-                start.elapsed() <= Duration::from_secs(10),
-                "{label}: timed out waiting for extension_ui_request"
-            );
-            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(5)).await;
-        }
-    }
-
-    async fn wait_for_custom_message(
-        in_tx: &asupersync::channel::mpsc::Sender<String>,
-        out_rx: &Arc<Mutex<Receiver<String>>>,
-        custom_type: &str,
-        label: &str,
-    ) -> Value {
-        let start = Instant::now();
-        let mut attempt = 0usize;
-
-        loop {
-            let response = send_recv(
-                in_tx,
-                out_rx,
-                &format!(r#"{{"id":"poll-{attempt}","type":"get_messages"}}"#),
-                label,
-            )
-            .await;
-            let messages = response["data"]["messages"]
-                .as_array()
-                .expect("messages array");
-            if let Some(message) = messages
-                .iter()
-                .find(|message| message["role"] == "custom" && message["customType"] == custom_type)
-            {
-                return message.clone();
-            }
-
-            assert!(
-                start.elapsed() <= Duration::from_secs(10),
-                "{label}: timed out waiting for custom message"
-            );
-            attempt = attempt.saturating_add(1);
-            asupersync::time::sleep(asupersync::time::wall_now(), Duration::from_millis(10)).await;
-        }
-    }
-
-    const RPC_BUSY_EXTENSION_COMMAND_EXT: &str = r#"
-export default function init(pi) {
-    pi.registerCommand("wait-confirm", {
-        description: "Block until RPC confirms",
-        handler: async () => {
-            const confirmed = await pi.ui("confirm", {
-                title: "Wait",
-                message: "Hold the command open"
-            });
-            return confirmed ? "confirmed" : "cancelled";
-        }
-    });
-}
-"#;
-
-    const RPC_QUEUE_STATE_EXTENSION_EXT: &str = r#"
-export default function init(pi) {
-    pi.registerCommand("report-queue-state", {
-        description: "Report queue modes visible to extensions",
-        handler: async () => {
-            const state = await pi.session("getState", {});
-            await pi.events("sendMessage", {
-                message: {
-                    customType: "queue-state",
-                    content: JSON.stringify({
-                        steeringMode: state.steeringMode,
-                        followUpMode: state.followUpMode
-                    }),
-                    display: false
-                },
-                options: {
-                    triggerTurn: false
-                }
-            });
-            return "reported";
-        }
-    });
-}
-"#;
 
     #[test]
     fn line_count_from_newline_count_matches_trailing_newline_semantics() {
@@ -6100,7 +5109,6 @@ export default function init(pi) {
         let mut entry = dummy_entry("dev-model", false);
         entry.model.provider = "acme-local".to_string();
         entry.auth_header = false;
-        entry.oauth_config = None;
 
         assert!(!model_requires_configured_credential(&entry));
     }
@@ -6110,7 +5118,6 @@ export default function init(pi) {
         let mut entry = dummy_entry("claude-sonnet-4-6", true);
         entry.model.provider = "anthropic".to_string();
         entry.auth_header = false;
-        entry.oauth_config = None;
 
         assert!(model_requires_configured_credential(&entry));
     }
@@ -6308,377 +5315,6 @@ export default function init(pi) {
             }
             other => unreachable!("expected different match, got: {other:?}"),
         }
-    }
-
-    // -----------------------------------------------------------------------
-    // parse_extension_command_line
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_extension_command_line_parses_simple_command() {
-        assert_eq!(
-            parse_extension_command_line("/mycommand"),
-            Some(("mycommand".to_string(), String::new()))
-        );
-    }
-
-    #[test]
-    fn parse_extension_command_line_preserves_arguments() {
-        assert_eq!(
-            parse_extension_command_line("/mycommand alpha beta"),
-            Some(("mycommand".to_string(), "alpha beta".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_extension_command_line_requires_leading_slash() {
-        assert_eq!(parse_extension_command_line("hello"), None);
-    }
-
-    #[test]
-    fn parse_extension_command_line_accepts_leading_whitespace() {
-        assert_eq!(
-            parse_extension_command_line("  /cmd\targ"),
-            Some(("cmd".to_string(), "arg".to_string()))
-        );
-    }
-
-    #[test]
-    fn parse_extension_command_line_rejects_blank_command_name() {
-        assert_eq!(parse_extension_command_line("/   "), None);
-    }
-
-    #[test]
-    fn rpc_busy_extension_command_rejects_follow_on_extension_prompt_without_blocking() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build test runtime");
-        let handle = runtime.handle();
-
-        runtime.block_on(async move {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let cwd = temp.path().to_path_buf();
-            let ext_entry_path = cwd.join("busy-ext.mjs");
-            std::fs::write(&ext_entry_path, RPC_BUSY_EXTENSION_COMMAND_EXT)
-                .expect("write extension source");
-
-            let mut agent_session = build_test_agent_session(Session::in_memory());
-            agent_session
-                .enable_extensions(&[], &cwd, None, &[ext_entry_path])
-                .await
-                .expect("enable extensions");
-
-            let options = build_test_rpc_options(&handle, cwd.join("auth.json"));
-            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
-            let out_rx = Arc::new(Mutex::new(out_rx));
-
-            let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
-
-            let first = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"1","type":"prompt","message":"/wait-confirm"}"#,
-                "prompt(wait-confirm:first)",
-            )
-            .await;
-            assert_ok(&first, "prompt");
-
-            let ui_event = recv_ui_request(&out_rx, "wait-confirm ui").await;
-            assert_eq!(ui_event["method"], "confirm");
-            let request_id = ui_event["id"]
-                .as_str()
-                .expect("ui request id should be a string")
-                .to_string();
-
-            let second = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"2","type":"prompt","message":"/wait-confirm"}"#,
-                "prompt(wait-confirm:busy)",
-            )
-            .await;
-            assert_err(&second, "prompt");
-            assert_eq!(
-                second["error"],
-                "Extension commands are not allowed while agent is streaming"
-            );
-
-            let response = json!({
-                "id": "3",
-                "type": "extension_ui_response",
-                "requestId": request_id,
-                "confirmed": true,
-            })
-            .to_string();
-            let ui_resp = send_recv(&in_tx, &out_rx, &response, "wait-confirm response").await;
-            assert_ok(&ui_resp, "extension_ui_response");
-
-            drop(in_tx);
-            let result = server.await;
-            assert!(result.is_ok(), "rpc server error: {result:?}");
-        });
-    }
-
-    #[test]
-    fn rpc_queue_mode_updates_reach_extension_session_state() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build test runtime");
-        let handle = runtime.handle();
-
-        runtime.block_on(async move {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let cwd = temp.path().to_path_buf();
-            let ext_entry_path = cwd.join("queue-state-ext.mjs");
-            std::fs::write(&ext_entry_path, RPC_QUEUE_STATE_EXTENSION_EXT)
-                .expect("write extension source");
-
-            let mut agent_session = build_test_agent_session(Session::in_memory());
-            agent_session
-                .enable_extensions(&[], &cwd, None, &[ext_entry_path])
-                .await
-                .expect("enable extensions");
-
-            let options = build_test_rpc_options(&handle, cwd.join("auth.json"));
-            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
-            let out_rx = Arc::new(Mutex::new(out_rx));
-
-            let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
-
-            let steering = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"1","type":"set_steering_mode","mode":"all"}"#,
-                "set_steering_mode(queue-state)",
-            )
-            .await;
-            assert_ok(&steering, "set_steering_mode");
-
-            let follow_up = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"2","type":"setFollowUpMode","mode":"all"}"#,
-                "setFollowUpMode(queue-state)",
-            )
-            .await;
-            assert_ok(&follow_up, "set_follow_up_mode");
-
-            let prompt = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"3","type":"prompt","message":"/report-queue-state"}"#,
-                "prompt(report-queue-state)",
-            )
-            .await;
-            assert_ok(&prompt, "prompt");
-
-            let message =
-                wait_for_custom_message(&in_tx, &out_rx, "queue-state", "queue-state message")
-                    .await;
-            let reported_state: Value = serde_json::from_str(
-                message["content"]
-                    .as_str()
-                    .expect("queue-state content should be string"),
-            )
-            .expect("queue-state content should be json");
-            assert_eq!(reported_state["steeringMode"], "all");
-            assert_eq!(reported_state["followUpMode"], "all");
-
-            drop(in_tx);
-            let result = server.await;
-            assert!(result.is_ok(), "rpc server error: {result:?}");
-        });
-    }
-
-    #[test]
-    fn rpc_prompt_prefers_extension_command_over_prompt_template_name_collision() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build test runtime");
-        let handle = runtime.handle();
-
-        runtime.block_on(async move {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let cwd = temp.path().to_path_buf();
-            let (agent_session, options) = build_queue_state_rpc_fixture(&handle, &cwd).await;
-            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
-            let out_rx = Arc::new(Mutex::new(out_rx));
-
-            let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
-
-            let prompt = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"1","type":"prompt","message":"/report-queue-state"}"#,
-                "prompt(report-queue-state:shadowed)",
-            )
-            .await;
-            assert_ok(&prompt, "prompt");
-
-            let message =
-                wait_for_custom_message(&in_tx, &out_rx, "queue-state", "queue-state shadowed")
-                    .await;
-            let reported_state: Value = serde_json::from_str(
-                message["content"]
-                    .as_str()
-                    .expect("queue-state content should be string"),
-            )
-            .expect("queue-state content should be json");
-            assert!(
-                reported_state["steeringMode"].is_string(),
-                "extension command should report steeringMode"
-            );
-            assert!(
-                reported_state["followUpMode"].is_string(),
-                "extension command should report followUpMode"
-            );
-
-            drop(in_tx);
-            let result = server.await;
-            assert!(result.is_ok(), "rpc server error: {result:?}");
-        });
-    }
-
-    #[test]
-    fn rpc_steer_rejects_extension_command_even_when_prompt_template_name_matches() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build test runtime");
-        let handle = runtime.handle();
-
-        runtime.block_on(async move {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let cwd = temp.path().to_path_buf();
-            let (agent_session, options) = build_queue_state_rpc_fixture(&handle, &cwd).await;
-            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
-            let out_rx = Arc::new(Mutex::new(out_rx));
-
-            let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
-
-            let response = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"1","type":"steer","message":"/report-queue-state"}"#,
-                "steer(report-queue-state:shadowed)",
-            )
-            .await;
-            assert_err(&response, "steer");
-            assert_eq!(
-                response["error"],
-                "Extension commands are not allowed with steer"
-            );
-
-            drop(in_tx);
-            let result = server.await;
-            assert!(result.is_ok(), "rpc server error: {result:?}");
-        });
-    }
-
-    #[test]
-    fn rpc_follow_up_rejects_extension_command_even_when_prompt_template_name_matches() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build test runtime");
-        let handle = runtime.handle();
-
-        runtime.block_on(async move {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let cwd = temp.path().to_path_buf();
-            let (agent_session, options) = build_queue_state_rpc_fixture(&handle, &cwd).await;
-            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
-            let out_rx = Arc::new(Mutex::new(out_rx));
-
-            let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
-
-            let response = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"1","type":"follow_up","message":"/report-queue-state"}"#,
-                "follow_up(report-queue-state:shadowed)",
-            )
-            .await;
-            assert_err(&response, "follow_up");
-            assert_eq!(
-                response["error"],
-                "Extension commands are not allowed with follow_up"
-            );
-
-            drop(in_tx);
-            let result = server.await;
-            assert!(result.is_ok(), "rpc server error: {result:?}");
-        });
-    }
-
-    #[test]
-    fn rpc_startup_queue_modes_reach_extension_session_state() {
-        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
-            .build()
-            .expect("build test runtime");
-        let handle = runtime.handle();
-
-        runtime.block_on(async move {
-            let temp = tempfile::tempdir().expect("tempdir");
-            let cwd = temp.path().to_path_buf();
-            let ext_entry_path = cwd.join("queue-state-ext.mjs");
-            std::fs::write(&ext_entry_path, RPC_QUEUE_STATE_EXTENSION_EXT)
-                .expect("write extension source");
-
-            let mut agent_session = build_test_agent_session(Session::in_memory());
-            agent_session
-                .enable_extensions(&[], &cwd, None, &[ext_entry_path])
-                .await
-                .expect("enable extensions");
-
-            let mut options = build_test_rpc_options(&handle, cwd.join("auth.json"));
-            options.config.steering_mode = Some("all".to_string());
-            options.config.follow_up_mode = Some("all".to_string());
-
-            let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(16);
-            let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
-            let out_rx = Arc::new(Mutex::new(out_rx));
-
-            let server =
-                handle.spawn(async move { run(agent_session, options, in_rx, out_tx).await });
-
-            let prompt = send_recv(
-                &in_tx,
-                &out_rx,
-                r#"{"id":"1","type":"prompt","message":"/report-queue-state"}"#,
-                "prompt(report-queue-state-startup)",
-            )
-            .await;
-            assert_ok(&prompt, "prompt");
-
-            let message = wait_for_custom_message(
-                &in_tx,
-                &out_rx,
-                "queue-state",
-                "queue-state startup message",
-            )
-            .await;
-            let reported_state: Value = serde_json::from_str(
-                message["content"]
-                    .as_str()
-                    .expect("queue-state content should be string"),
-            )
-            .expect("queue-state content should be json");
-            assert_eq!(reported_state["steeringMode"], "all");
-            assert_eq!(reported_state["followUpMode"], "all");
-
-            drop(in_tx);
-            let result = server.await;
-            assert!(result.is_ok(), "rpc server error: {result:?}");
-        });
     }
 
     // -----------------------------------------------------------------------
@@ -6976,15 +5612,6 @@ export default function init(pi) {
                     max_attempts: 3,
                     delay_ms: 10,
                     error_message: "temporary".to_string(),
-                },
-                RpcOutputPressureClass::Semantic,
-            ),
-            (
-                "extension_error",
-                AgentEvent::ExtensionError {
-                    extension_id: Some("ext.test".to_string()),
-                    event: "onAgentEvent".to_string(),
-                    error: "failed".to_string(),
                 },
                 RpcOutputPressureClass::Semantic,
             ),
@@ -7907,11 +6534,10 @@ export default function init(pi) {
                 headers: HashMap::new(),
                 auth_header: true,
                 compat: None,
-                oauth_config: None,
             };
 
             let provider =
-                crate::providers::create_provider(&current, None).expect("create current provider");
+                crate::providers::create_provider(&current).expect("create current provider");
             let agent = Agent::new(
                 provider,
                 ToolRegistry::new(&[], Path::new("."), None),
@@ -8304,7 +6930,7 @@ export default function init(pi) {
             next.api_key = Some("inline-next-key".to_string());
 
             let provider =
-                crate::providers::create_provider(&current, None).expect("create current provider");
+                crate::providers::create_provider(&current).expect("create current provider");
             let agent = Agent::new(
                 provider,
                 ToolRegistry::new(&[], Path::new("."), None),
@@ -8411,119 +7037,5 @@ export default function init(pi) {
         assert!(value.get("hints").is_some());
         assert!(value.get("contextFields").is_some());
         assert!(value["hints"].is_array());
-    }
-
-    // -----------------------------------------------------------------------
-    // rpc_parse_extension_ui_response_id edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_ui_response_id_empty_string() {
-        let value = json!({"requestId": ""});
-        assert_eq!(rpc_parse_extension_ui_response_id(&value), None);
-    }
-
-    #[test]
-    fn parse_ui_response_id_whitespace_only() {
-        let value = json!({"requestId": "   "});
-        assert_eq!(rpc_parse_extension_ui_response_id(&value), None);
-    }
-
-    #[test]
-    fn parse_ui_response_id_trims() {
-        let value = json!({"requestId": "  req-1  "});
-        assert_eq!(
-            rpc_parse_extension_ui_response_id(&value),
-            Some("req-1".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_ui_response_id_prefers_request_id_over_id_alias() {
-        let value = json!({"requestId": "req-1", "id": "legacy-id"});
-        assert_eq!(
-            rpc_parse_extension_ui_response_id(&value),
-            Some("req-1".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_ui_response_id_falls_back_to_id_alias_when_request_id_not_string() {
-        let value = json!({"requestId": 123, "id": "legacy-id"});
-        assert_eq!(
-            rpc_parse_extension_ui_response_id(&value),
-            Some("legacy-id".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_ui_response_id_falls_back_to_id_alias_when_request_id_blank() {
-        let value = json!({"requestId": "", "id": "legacy-id"});
-        assert_eq!(
-            rpc_parse_extension_ui_response_id(&value),
-            Some("legacy-id".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_ui_response_id_falls_back_to_id_alias_when_request_id_whitespace() {
-        let value = json!({"requestId": "   ", "id": "legacy-id"});
-        assert_eq!(
-            rpc_parse_extension_ui_response_id(&value),
-            Some("legacy-id".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_ui_response_id_neither_field() {
-        let value = json!({"type": "something"});
-        assert_eq!(rpc_parse_extension_ui_response_id(&value), None);
-    }
-
-    // -----------------------------------------------------------------------
-    // rpc_parse_extension_ui_response edge cases
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn parse_editor_response_requires_string() {
-        let active = ExtensionUiRequest::new("req-1", "editor", json!({"title": "t"}));
-        let ok = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "code"});
-        assert!(rpc_parse_extension_ui_response(&ok, &active).is_ok());
-
-        let bad = json!({"type": "extension_ui_response", "requestId": "req-1", "value": 42});
-        assert!(rpc_parse_extension_ui_response(&bad, &active).is_err());
-    }
-
-    #[test]
-    fn parse_notify_response_returns_ack() {
-        let active = ExtensionUiRequest::new("req-1", "notify", json!({"title": "t"}));
-        let val = json!({"type": "extension_ui_response", "requestId": "req-1"});
-        let resp = rpc_parse_extension_ui_response(&val, &active).unwrap();
-        assert!(!resp.cancelled);
-    }
-
-    #[test]
-    fn parse_unknown_method_errors() {
-        let active = ExtensionUiRequest::new("req-1", "unknown_method", json!({}));
-        let val = json!({"type": "extension_ui_response", "requestId": "req-1"});
-        assert!(rpc_parse_extension_ui_response(&val, &active).is_err());
-    }
-
-    #[test]
-    fn parse_select_with_object_options() {
-        let active = ExtensionUiRequest::new(
-            "req-1",
-            "select",
-            json!({"title": "pick", "options": [{"label": "Alpha", "value": "a"}, {"label": "Beta"}]}),
-        );
-        // Selecting by value key
-        let val_a = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "a"});
-        let resp = rpc_parse_extension_ui_response(&val_a, &active).unwrap();
-        assert_eq!(resp.value, Some(json!("a")));
-
-        // Selecting by label fallback (no value key in option)
-        let val_b = json!({"type": "extension_ui_response", "requestId": "req-1", "value": "Beta"});
-        let resp = rpc_parse_extension_ui_response(&val_b, &active).unwrap();
-        assert_eq!(resp.value, Some(json!("Beta")));
     }
 }

@@ -7,12 +7,10 @@ use crate::agent_cx::AgentCx;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use crate::extensions::ExtensionSession;
 use crate::model::{
     AssistantMessage, ContentBlock, Message, TextContent, ToolResultMessage, UserContent,
     UserMessage,
 };
-use crate::provider_metadata::{canonical_provider_id, provider_ids_match};
 use crate::session_index::{
     SessionIndex, SessionIndexRefreshSummary, enqueue_session_index_snapshot_update,
     is_session_file_path, session_file_stats,
@@ -20,8 +18,6 @@ use crate::session_index::{
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
 use asupersync::channel::oneshot;
-use asupersync::sync::Mutex;
-use async_trait::async_trait;
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -282,244 +278,6 @@ fn total_v2_message_count(store: &SessionStoreV2) -> Result<Option<u64>> {
         }
     }
     Ok(Some(total))
-}
-
-/// Handle to a thread-safe shared session.
-#[derive(Clone, Debug)]
-pub struct SessionHandle(pub Arc<Mutex<Session>>);
-
-fn current_path_model_pair(session: &Session) -> Option<(String, String)> {
-    session.effective_model_for_current_path()
-}
-
-fn current_path_model_fields(session: &Session) -> (Option<String>, Option<String>) {
-    if let Some((provider, model_id)) = current_path_model_pair(session) {
-        (Some(provider), Some(model_id))
-    } else {
-        session.header.branch_fallback_model_fields()
-    }
-}
-
-fn current_path_thinking_level(session: &Session) -> Option<String> {
-    session.effective_thinking_level_for_current_path()
-}
-
-#[async_trait]
-impl ExtensionSession for SessionHandle {
-    async fn get_state(&self) -> Value {
-        let cx = AgentCx::for_current_or_request();
-        let Ok(session) = self.0.lock(cx.cx()).await else {
-            return serde_json::json!({
-                "model": null,
-                "thinkingLevel": "off",
-                "durabilityMode": "balanced",
-                "isStreaming": false,
-                "isCompacting": false,
-                "steeringMode": "one-at-a-time",
-                "followUpMode": "one-at-a-time",
-                "sessionFile": null,
-                "sessionId": "",
-                "sessionName": null,
-                "autoCompactionEnabled": false,
-                "messageCount": 0,
-                "pendingMessageCount": 0,
-            });
-        };
-        let session_file = session.path.as_ref().map(|p| p.display().to_string());
-        let session_id = session.header.id.clone();
-        let session_name = session.get_name();
-        let model =
-            current_path_model_pair(&session).map_or(Value::Null, |(provider, model_id)| {
-                serde_json::json!({
-                    "provider": provider,
-                    "id": model_id,
-                })
-            });
-        let thinking_level =
-            current_path_thinking_level(&session).unwrap_or_else(|| "off".to_string());
-        let message_count = session
-            .entries_for_current_path()
-            .iter()
-            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
-            .count();
-        let pending_message_count = session.autosave_metrics().pending_mutations;
-        let durability_mode = session.autosave_durability_mode().as_str();
-        serde_json::json!({
-            "model": model,
-            "thinkingLevel": thinking_level,
-            "durabilityMode": durability_mode,
-            "isStreaming": false,
-            "isCompacting": false,
-            "steeringMode": "one-at-a-time",
-            "followUpMode": "one-at-a-time",
-            "sessionFile": session_file,
-            "sessionId": session_id,
-            "sessionName": session_name,
-            "autoCompactionEnabled": false,
-            "messageCount": message_count,
-            "pendingMessageCount": pending_message_count,
-        })
-    }
-
-    async fn get_messages(&self) -> Vec<SessionMessage> {
-        let cx = AgentCx::for_current_or_request();
-        let Ok(session) = self.0.lock(cx.cx()).await else {
-            return Vec::new();
-        };
-        // Return messages for the current branch only, filtered to
-        // user/assistant/toolResult/bashExecution/custom per spec §3.3.
-        session
-            .entries_for_current_path()
-            .iter()
-            .filter_map(|entry| match entry {
-                SessionEntry::Message(msg) => match msg.message {
-                    SessionMessage::User { .. }
-                    | SessionMessage::Assistant { .. }
-                    | SessionMessage::ToolResult { .. }
-                    | SessionMessage::BashExecution { .. }
-                    | SessionMessage::Custom { .. } => Some(msg.message.clone()),
-                    _ => None,
-                },
-                _ => None,
-            })
-            .collect()
-    }
-
-    async fn get_entries(&self) -> Vec<Value> {
-        let cx = AgentCx::for_current_or_request();
-        let Ok(session) = self.0.lock(cx.cx()).await else {
-            return Vec::new();
-        };
-        session
-            .entries
-            .iter()
-            .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
-            .collect()
-    }
-
-    async fn get_branch(&self) -> Vec<Value> {
-        let cx = AgentCx::for_current_or_request();
-        let Ok(session) = self.0.lock(cx.cx()).await else {
-            return Vec::new();
-        };
-        session
-            .entries_for_current_path()
-            .iter()
-            .map(|e| serde_json::to_value(e).unwrap_or(Value::Null))
-            .collect()
-    }
-
-    async fn set_name(&self, name: String) -> Result<()> {
-        let cx = AgentCx::for_current_or_request();
-        let mut session = self
-            .0
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        #[cfg(test)]
-        emit_set_name_deadline_probe(&session.header.id, cx.budget().deadline);
-        session.set_name(&name);
-        Ok(())
-    }
-
-    async fn append_message(&self, message: SessionMessage) -> Result<()> {
-        let cx = AgentCx::for_current_or_request();
-        let mut session = self
-            .0
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        session.append_message(message);
-        Ok(())
-    }
-
-    async fn append_custom_entry(&self, custom_type: String, data: Option<Value>) -> Result<()> {
-        let cx = AgentCx::for_current_or_request();
-        let mut session = self
-            .0
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        if custom_type.trim().is_empty() {
-            return Err(Error::validation("customType must not be empty"));
-        }
-        session.append_custom_entry(custom_type, data);
-        Ok(())
-    }
-
-    async fn set_model(&self, provider: String, model_id: String) -> Result<()> {
-        let cx = AgentCx::for_current_or_request();
-        let mut session = self
-            .0
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        let normalized_provider = canonical_provider_id(&provider)
-            .unwrap_or(&provider)
-            .to_string();
-        let (stored_provider, stored_model_id, changed) = match current_path_model_pair(&session) {
-            Some((current_provider, current_model_id))
-                if provider_ids_match(&current_provider, &provider)
-                    && current_model_id.eq_ignore_ascii_case(&model_id) =>
-            {
-                (current_provider, current_model_id, false)
-            }
-            _ => (normalized_provider, model_id.clone(), true),
-        };
-        if changed {
-            session.append_model_change(stored_provider.clone(), stored_model_id.clone());
-        }
-        session.set_model_header(Some(stored_provider), Some(stored_model_id), None);
-        Ok(())
-    }
-
-    async fn get_model(&self) -> (Option<String>, Option<String>) {
-        let cx = AgentCx::for_current_or_request();
-        let Ok(session) = self.0.lock(cx.cx()).await else {
-            return (None, None);
-        };
-        current_path_model_fields(&session)
-    }
-
-    async fn set_thinking_level(&self, level: String) -> Result<()> {
-        let cx = AgentCx::for_current_or_request();
-        let mut session = self
-            .0
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        let changed = !current_path_thinking_level(&session)
-            .as_deref()
-            .is_some_and(|current| current.eq(level.as_str()));
-        if changed {
-            session.append_thinking_level_change(level.clone());
-        }
-        session.set_model_header(None, None, Some(level));
-        Ok(())
-    }
-
-    async fn get_thinking_level(&self) -> Option<String> {
-        let cx = AgentCx::for_current_or_request();
-        let Ok(session) = self.0.lock(cx.cx()).await else {
-            return None;
-        };
-        current_path_thinking_level(&session)
-    }
-
-    async fn set_label(&self, target_id: String, label: Option<String>) -> Result<()> {
-        let cx = AgentCx::for_current_or_request();
-        let mut session = self
-            .0
-            .lock(cx.cx())
-            .await
-            .map_err(|e| Error::session(format!("Failed to lock session: {e}")))?;
-        if session.add_label(&target_id, label).is_none() {
-            return Err(Error::validation(format!(
-                "target entry '{target_id}' not found in session"
-            )));
-        }
-        Ok(())
-    }
 }
 
 /// Default base URL for the Pi session share viewer.
@@ -3747,7 +3505,7 @@ fn refresh_session_index_entries(
     reason: &'static str,
 ) {
     for entry in entries {
-        if let Err(err) = index.upsert_session_meta(entry.to_meta()) {
+        if let Err(err) = index.upsert_session_meta(&entry.to_meta()) {
             tracing::warn!(
                 path = %entry.path.display(),
                 error = %err,
