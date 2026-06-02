@@ -13,17 +13,19 @@ doctest = false
 
 [dependencies]
 base64 = "0.22"
-chrono = { version = "0.4", features = ["serde"] }
+chrono = "0.4"
 futures = "0.3"
 memchr = "2.8.0"
 pi-core = { path = "../pi-core" }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
-tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
 tracing = "0.1"
 url = "2"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"

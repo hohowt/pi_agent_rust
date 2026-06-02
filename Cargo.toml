@@ -99,7 +99,6 @@ lipgloss = { package = "charmed-lipgloss", version = "0.2.0" }
 bubbles = { package = "charmed-bubbles", version = "0.2.0" }
 glamour = { package = "charmed-glamour", version = "0.2.0" }
 unicode-width = "0.2"
-textwrap = "0.16"
 arboard = { version = "3.6.1", optional = true }
 
 # Filesystem
@@ -122,7 +121,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1.21.0", features = ["v4"] }
 memchr = "2.8.0"
 base64 = "0.22"
-flate2 = "1.1.9"
 sha2 = "0.10"
 regex = "1.12.3"
 crc32c = "0.6"
@@ -173,9 +171,8 @@ module_name_repetitions = "allow"
 # ---------------------------------------------------------------------------
 # Local development with sibling crates
 # ---------------------------------------------------------------------------
-# This project depends on published crates.io versions of asupersync,
-# rich_rust, and charmed-*. CI builds verify this (no sibling
-# repos are checked out).
+# This project depends on published crates.io versions of rich_rust and
+# charmed-*. CI builds verify this (no sibling repos are checked out).
 #
 # To develop against LOCAL checkouts of these crates, uncomment the
 # [patch.crates-io] section below. Cargo will use the local paths when they
@@ -187,7 +184,6 @@ module_name_repetitions = "allow"
 #   git update-index --no-skip-worktree Cargo.toml
 #
 # [patch.crates-io]
-# asupersync = { path = "../asupersync" }
 # rich_rust = { path = "../rich_rust" }
 # charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
 # charmed-bubbletea-macros = { path = "../charmed_rust/crates/bubbletea-macros" }
