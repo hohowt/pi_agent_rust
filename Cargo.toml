@@ -16,6 +16,7 @@ autobins = false
 autoexamples = false
 autobenches = false
 autotests = false
+
 # Binary organization per bd-uuwgi.1/bd-uuwgi.2 classification:
 # - SHIPPING: src/main.rs (pi) - main CLI binary
 # - RETIRABLE: src/bin/pi_legacy_capture.rs (pending RULE 1 approval)
@@ -45,6 +46,9 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
+pi-core = { path = "crates/pi-core" }
+pi-http = { path = "crates/pi-http" }
+
 # CLI
 clap = { version = "4.5.60", features = ["derive", "env", "string"] }
 
@@ -175,3 +179,11 @@ module_name_repetitions = "allow"
 # charmed-bubbles = { path = "../charmed_rust/crates/bubbles" }
 # charmed-glamour = { path = "../charmed_rust/crates/glamour" }
 # charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
+
+[workspace]
+members = [
+    ".",
+    "crates/pi-core",
+    "crates/pi-http",
+]
+resolver = "3"

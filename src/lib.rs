@@ -70,11 +70,11 @@ pub mod compaction_worker;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
-pub mod error;
+pub use pi_core::error;
 #[doc(hidden)]
 pub mod error_hints;
 #[doc(hidden)]
-pub mod http;
+pub use pi_http::http;
 #[doc(hidden)]
 pub mod interactive;
 #[doc(hidden)]
@@ -82,7 +82,7 @@ pub mod keybindings;
 #[doc(hidden)]
 pub mod migrations;
 #[doc(hidden)]
-pub mod model;
+pub use pi_core::model;
 #[doc(hidden)]
 pub mod model_routing;
 #[doc(hidden)]
@@ -94,9 +94,9 @@ pub mod package_manager;
 #[doc(hidden)]
 pub mod platform;
 #[doc(hidden)]
-pub mod provider;
+pub use pi_core::provider;
 #[doc(hidden)]
-pub mod provider_metadata;
+pub use pi_core::provider_metadata;
 #[doc(hidden)]
 pub mod providers;
 #[doc(hidden)]
@@ -122,7 +122,7 @@ pub mod session_sqlite;
 #[doc(hidden)]
 pub mod session_store_v2;
 #[doc(hidden)]
-pub mod sse;
+pub use pi_http::sse;
 #[doc(hidden)]
 pub mod swarm_activity_ledger;
 #[doc(hidden)]
@@ -134,6 +134,6 @@ pub mod tools;
 #[doc(hidden)]
 pub mod tui;
 #[doc(hidden)]
-pub mod vcr;
+pub use pi_http::vcr;
 
 pub use error::{Error, Result as PiResult};

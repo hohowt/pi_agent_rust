@@ -2458,6 +2458,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-core"
+version = "0.1.16"
+dependencies = [
+ "asupersync",
+ "async-trait",
+ "futures",
+ "regex",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "pi-http"
+version = "0.1.16"
+dependencies = [
+ "asupersync",
+ "base64",
+ "chrono",
+ "futures",
+ "memchr",
+ "pi-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "pi_agent_rust"
 version = "0.1.16"
 dependencies = [
@@ -2486,6 +2517,8 @@ dependencies = [
  "image",
  "json5",
  "memchr",
+ "pi-core",
+ "pi-http",
  "regex",
  "rich_rust",
  "rusqlite",

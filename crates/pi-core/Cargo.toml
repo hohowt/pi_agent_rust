@@ -1,0 +1,32 @@
+[package]
+name = "pi-core"
+version = "0.1.16"
+edition = "2024"
+rust-version = "1.85"
+license-file = "../../LICENSE"
+
+[lib]
+name = "pi_core"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+async-trait = "0.1"
+asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots", "test-internals"] }
+futures = "0.3"
+regex = "1.12.3"
+rusqlite = "0.37"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["raw_value"] }
+thiserror = "2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
