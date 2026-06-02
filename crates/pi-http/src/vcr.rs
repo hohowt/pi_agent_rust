@@ -1377,12 +1377,7 @@ mod tests {
     where
         T: Send + 'static,
     {
-        let runtime = asupersync::runtime::RuntimeBuilder::new()
-            .blocking_threads(1, 2)
-            .build()
-            .expect("build runtime");
-        let join = runtime.handle().spawn(future);
-        runtime.block_on(join)
+        futures::executor::block_on(future)
     }
 
     // ─── sanitize_test_name ──────────────────────────────────────────

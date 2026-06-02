@@ -2,6 +2,7 @@ use super::conversation::{
     add_usage, build_content_blocks_for_input, content_blocks_to_text, last_assistant_message,
 };
 use super::*;
+use crate::sync::OwnedMutexGuard;
 
 pub(super) fn build_user_message(text: String) -> ModelMessage {
     ModelMessage::User(UserMessage {
@@ -740,19 +741,18 @@ After approving access in the browser, press Enter in Pi to complete login."
         runtime_handle.spawn(async move {
             #[cfg(test)]
             emit_submit_continue_deadline_probe(task_cx.budget().deadline);
-            let mut agent_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
+            let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
@@ -776,8 +776,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             drop(agent_guard);
 
             let mut session_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                {
+                match OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -849,7 +848,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         if !display_owned.trim().is_empty() {
             self.messages.push(ConversationMessage {
                 role: MessageRole::User,
-                content: display_owned.clone(),
+                content: display_owned,
                 thinking: None,
                 collapsed: false,
             });
@@ -878,27 +877,7 @@ After approving access in the browser, press Enter in Pi to complete login."
         let task_cx = Cx::current().unwrap_or_else(Cx::for_request);
         runtime_handle.spawn(async move {
             let base_system_prompt = {
-                let guard =
-                    match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx)
-                        .await
-                    {
-                        Ok(guard) => guard,
-                        Err(err) => {
-                            let _ = crate::interactive::enqueue_pi_event(
-                                &event_tx,
-                                &Cx::for_request(),
-                                PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                            )
-                            .await;
-                            return;
-                        }
-                    };
-                let prompt = guard.system_prompt().map(str::to_string);
-                drop(guard);
-                prompt
-            };
-            let mut agent_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
+                let guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -910,6 +889,22 @@ After approving access in the browser, press Enter in Pi to complete login."
                         return;
                     }
                 };
+                let prompt = guard.system_prompt().map(str::to_string);
+                drop(guard);
+                prompt
+            };
+            let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
             agent_guard.set_system_prompt(base_system_prompt.clone());
             let previous_len = agent_guard.messages().len();
 
@@ -922,8 +917,7 @@ After approving access in the browser, press Enter in Pi to complete login."
                 content: UserContent::Blocks(content_for_agent),
                 timestamp: Utc::now().timestamp_millis(),
             });
-            let mut prompts = Vec::with_capacity(1);
-            prompts.push(user_message);
+            let prompts = vec![user_message];
 
             let result = agent_guard
                 .run_with_messages_with_abort(prompts, Some(abort_signal), move |event| {
@@ -943,8 +937,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             drop(agent_guard);
 
             let mut session_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                {
+                match OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -1117,19 +1110,18 @@ After approving access in the browser, press Enter in Pi to complete login."
         runtime_handle.spawn(async move {
             let input_images = Vec::new();
 
-            let mut agent_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
-                    Ok(guard) => guard,
-                    Err(err) => {
-                        let _ = crate::interactive::enqueue_pi_event(
-                            &event_tx,
-                            &Cx::for_request(),
-                            PiMsg::AgentError(format!("Failed to lock agent: {err}")),
-                        )
-                        .await;
-                        return;
-                    }
-                };
+            let mut agent_guard = match OwnedMutexGuard::lock(Arc::clone(&agent), &task_cx).await {
+                Ok(guard) => guard,
+                Err(err) => {
+                    let _ = crate::interactive::enqueue_pi_event(
+                        &event_tx,
+                        &Cx::for_request(),
+                        PiMsg::AgentError(format!("Failed to lock agent: {err}")),
+                    )
+                    .await;
+                    return;
+                }
+            };
             let previous_len = agent_guard.messages().len();
 
             let event_sender = event_tx.clone();
@@ -1172,8 +1164,7 @@ After approving access in the browser, press Enter in Pi to complete login."
             drop(agent_guard);
 
             let mut session_guard =
-                match asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await
-                {
+                match OwnedMutexGuard::lock(Arc::clone(&session), &task_cx).await {
                     Ok(guard) => guard,
                     Err(err) => {
                         let _ = crate::interactive::enqueue_pi_event(
@@ -1222,15 +1213,15 @@ After approving access in the browser, press Enter in Pi to complete login."
 
 #[cfg(test)]
 fn submit_continue_deadline_probe()
--> &'static std::sync::Mutex<Option<std::sync::mpsc::Sender<Option<asupersync::Time>>>> {
+-> &'static std::sync::Mutex<Option<std::sync::mpsc::Sender<Option<Time>>>> {
     static PROBE: std::sync::OnceLock<
-        std::sync::Mutex<Option<std::sync::mpsc::Sender<Option<asupersync::Time>>>>,
+        std::sync::Mutex<Option<std::sync::mpsc::Sender<Option<Time>>>>,
     > = std::sync::OnceLock::new();
     PROBE.get_or_init(|| std::sync::Mutex::new(None))
 }
 
 #[cfg(test)]
-fn emit_submit_continue_deadline_probe(deadline: Option<asupersync::Time>) {
+fn emit_submit_continue_deadline_probe(deadline: Option<Time>) {
     let probe = submit_continue_deadline_probe();
     let guard = probe.lock().expect("lock submit_continue deadline probe");
     if let Some(tx) = guard.as_ref() {
@@ -1588,7 +1579,7 @@ mod stream_delta_batcher_tests {
 
         runtime().block_on(async {
             let cx = Cx::for_request();
-            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+            let mut guard = OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
                 .await
                 .expect("lock agent");
             guard.add_message(ModelMessage::Custom(CustomMessage {
@@ -1648,10 +1639,9 @@ mod stream_delta_batcher_tests {
 
         runtime().block_on(async {
             let hold_cx = Cx::for_request();
-            let _held_guard =
-                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &hold_cx)
-                    .await
-                    .expect("lock session");
+            let _held_guard = OwnedMutexGuard::lock(Arc::clone(&app.session), &hold_cx)
+                .await
+                .expect("lock session");
 
             let ambient_cx = Cx::for_testing();
             ambient_cx.set_cancel_requested(true);
@@ -1674,8 +1664,8 @@ mod stream_delta_batcher_tests {
                 }
             };
             futures::pin_mut!(wait_for_error);
-            let err = asupersync::time::timeout(
-                asupersync::time::wall_now(),
+            let err = time::timeout(
+                time::wall_now(),
                 std::time::Duration::from_secs(1),
                 wait_for_error,
             )
@@ -1714,8 +1704,8 @@ mod stream_delta_batcher_tests {
                 }
             };
             futures::pin_mut!(wait_for_terminal);
-            let outcome = asupersync::time::timeout(
-                asupersync::time::wall_now(),
+            let outcome = time::timeout(
+                time::wall_now(),
                 std::time::Duration::from_secs(1),
                 wait_for_terminal,
             )
@@ -1758,7 +1748,7 @@ mod stream_delta_batcher_tests {
 
         runtime().block_on(async {
             let cx = Cx::for_request();
-            let mut guard = asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
+            let mut guard = OwnedMutexGuard::lock(Arc::clone(&app.agent), &cx)
                 .await
                 .expect("lock agent");
             guard.add_message(ModelMessage::Custom(CustomMessage {
@@ -1770,10 +1760,9 @@ mod stream_delta_batcher_tests {
             }));
         });
 
-        let expected_deadline = asupersync::time::wall_now() + std::time::Duration::from_secs(30);
-        let ambient_cx = Cx::for_testing_with_budget(
-            asupersync::Budget::INFINITE.with_deadline(expected_deadline),
-        );
+        let expected_deadline = time::wall_now() + std::time::Duration::from_secs(30);
+        let ambient_cx =
+            Cx::for_testing_with_budget(Budget::INFINITE.with_deadline(expected_deadline));
         let _current = Cx::set_current(Some(ambient_cx));
 
         let _ = app.handle_pi_message(PiMsg::EnqueuePendingInput(PendingInput::Continue));
@@ -1798,10 +1787,9 @@ mod stream_delta_batcher_tests {
 
         runtime().block_on(async {
             let cx = Cx::for_request();
-            let mut session_guard =
-                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
-                    .await
-                    .expect("lock session");
+            let mut session_guard = OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
+                .await
+                .expect("lock session");
             session_guard.header.provider = Some(next.model.provider.clone());
             session_guard.header.model_id = Some(next.model.id.clone());
             session_guard.header.thinking_level = Some("high".to_string());
@@ -1844,10 +1832,9 @@ mod stream_delta_batcher_tests {
 
         let (session_id, current_leaf_id, target_leaf_id) = runtime().block_on(async {
             let cx = Cx::for_request();
-            let mut session_guard =
-                asupersync::sync::OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
-                    .await
-                    .expect("lock session");
+            let mut session_guard = OwnedMutexGuard::lock(Arc::clone(&app.session), &cx)
+                .await
+                .expect("lock session");
             let root_id = session_guard.append_message(crate::session::SessionMessage::User {
                 content: crate::model::UserContent::Text("root".to_string()),
                 timestamp: Some(0),

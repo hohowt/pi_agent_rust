@@ -6,12 +6,15 @@
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
 //! rendering in the TUI and for inclusion in provider messages as tool results.
 
+use crate::Time;
 use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::fs;
+use crate::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt, ReadBuf, SeekFrom};
 use crate::model::{ContentBlock, ImageContent, TextContent};
-use asupersync::io::{AsyncRead, AsyncReadExt, AsyncWriteExt, ReadBuf, SeekFrom};
-use asupersync::time::{sleep, wall_now};
+use crate::runtime;
+use crate::time::{sleep, wall_now};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
@@ -59,6 +62,7 @@ fn safe_canonicalize(path: &Path) -> PathBuf {
     )
 }
 
+#[cfg_attr(not(windows), allow(clippy::missing_const_for_fn))]
 fn strip_unc_prefix(path: PathBuf) -> PathBuf {
     #[cfg(windows)]
     {
@@ -2903,7 +2907,7 @@ impl Tool for ReadTool {
         let path = resolve_read_path(&input.path, &self.cwd);
         let path = enforce_read_scope(&path, &self.cwd)?;
 
-        let meta = asupersync::fs::metadata(&path).await.ok();
+        let meta = fs::metadata(&path).await.ok();
         if let Some(meta) = &meta {
             if !meta.is_file() {
                 return Err(Error::tool(
@@ -2920,7 +2924,7 @@ impl Tool for ReadTool {
             return Ok(output);
         }
 
-        let mut file = asupersync::fs::File::open(&path)
+        let mut file = fs::File::open(&path)
             .await
             .map_err(|e| Error::tool("read", e.to_string()))?;
 
@@ -3490,7 +3494,7 @@ pub(crate) async fn run_bash_command(
         .timer_driver()
         .map_or_else(wall_now, |timer| timer.now());
     let timeout = timeout_secs.map(Duration::from_secs);
-    let mut terminate_deadline: Option<asupersync::Time> = None;
+    let mut terminate_deadline: Option<Time> = None;
 
     let tick = Duration::from_millis(10);
     loop {
@@ -4500,18 +4504,16 @@ impl Tool for EditTool {
         let absolute_path = resolve_read_path(&input.path, &self.cwd);
         let absolute_path = enforce_cwd_scope(&absolute_path, &self.cwd, "edit")?;
 
-        let meta = asupersync::fs::metadata(&absolute_path)
-            .await
-            .map_err(|err| {
-                let message = match err.kind() {
-                    std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!("Permission denied: {}", input.path)
-                    }
-                    _ => format!("Failed to access file {}: {err}", input.path),
-                };
-                Error::tool("edit", message)
-            })?;
+        let meta = fs::metadata(&absolute_path).await.map_err(|err| {
+            let message = match err.kind() {
+                std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", input.path)
+                }
+                _ => format!("Failed to access file {}: {err}", input.path),
+            };
+            Error::tool("edit", message)
+        })?;
 
         if !meta.is_file() {
             return Err(Error::tool(
@@ -4530,7 +4532,7 @@ impl Tool for EditTool {
             ));
         }
 
-        if let Err(err) = asupersync::fs::OpenOptions::new()
+        if let Err(err) = fs::OpenOptions::new()
             .read(true)
             .write(true)
             .open(&absolute_path)
@@ -4547,7 +4549,7 @@ impl Tool for EditTool {
         }
 
         // Read bytes strictly up to the limit to prevent OOM if metadata failed or file grows.
-        let file = asupersync::fs::File::open(&absolute_path)
+        let file = fs::File::open(&absolute_path)
             .await
             .map_err(|e| Error::tool("edit", format!("Failed to open file: {e}")))?;
         let mut raw = Vec::new();
@@ -4704,7 +4706,7 @@ impl Tool for EditTool {
         // Atomic write (safe improvement vs legacy, behavior-equivalent).
         let absolute_path_clone = absolute_path.clone();
         let final_content_bytes = final_content.into_bytes();
-        asupersync::runtime::spawn_blocking_io(move || {
+        runtime::spawn_blocking_io(move || {
             // Capture original permissions before the file is replaced.
             let original_perms = std::fs::metadata(&absolute_path_clone)
                 .ok()
@@ -4837,18 +4839,14 @@ impl Tool for WriteTool {
         let path = resolve_path(&input.path, &self.cwd);
         let path = enforce_cwd_scope(&path, &self.cwd, "write")?;
 
-        if let Ok(meta) = asupersync::fs::metadata(&path).await {
+        if let Ok(meta) = fs::metadata(&path).await {
             if !meta.is_file() {
                 return Err(Error::tool(
                     "write",
                     format!("Path {} is not a regular file", path.display()),
                 ));
             }
-            if let Err(err) = asupersync::fs::OpenOptions::new()
-                .write(true)
-                .open(&path)
-                .await
-            {
+            if let Err(err) = fs::OpenOptions::new().write(true).open(&path).await {
                 let message = match err.kind() {
                     std::io::ErrorKind::PermissionDenied => {
                         format!("Permission denied: {}", input.path)
@@ -4861,7 +4859,7 @@ impl Tool for WriteTool {
 
         // Create parent directories if needed
         if let Some(parent) = path.parent() {
-            asupersync::fs::create_dir_all(parent)
+            fs::create_dir_all(parent)
                 .await
                 .map_err(|e| Error::tool("write", format!("Failed to create directories: {e}")))?;
         }
@@ -4872,7 +4870,7 @@ impl Tool for WriteTool {
         // Write atomically using tempfile on a blocking thread
         let path_clone = path.clone();
         let content_bytes = input.content.into_bytes();
-        asupersync::runtime::spawn_blocking_io(move || {
+        runtime::spawn_blocking_io(move || {
             // Capture original permissions before the file is replaced (new files get None).
             let original_perms = std::fs::metadata(&path_clone).ok().map(|m| m.permissions());
             let parent = path_clone.parent().unwrap_or_else(|| Path::new("."));
@@ -5148,7 +5146,7 @@ impl Tool for GrepTool {
         let search_path = resolve_read_path(search_dir, &self.cwd);
         let search_path = enforce_cwd_scope(&search_path, &self.cwd, "grep")?;
 
-        let is_directory = asupersync::fs::metadata(&search_path)
+        let is_directory = fs::metadata(&search_path)
             .await
             .map_err(|e| {
                 Error::tool(
@@ -6080,7 +6078,7 @@ impl Tool for LsTool {
         }
 
         let mut entries = Vec::new();
-        let mut read_dir = asupersync::fs::read_dir(&dir_path)
+        let mut read_dir = fs::read_dir(&dir_path)
             .await
             .map_err(|e| Error::tool("ls", format!("Cannot read directory: {e}")))?;
 
@@ -6369,7 +6367,7 @@ async fn drain_bash_output(
     rx: &mut mpsc::Receiver<BashPipeFrame>,
     bash_output: &mut BashOutputState,
     cx: &AgentCx,
-    drain_deadline: asupersync::Time,
+    drain_deadline: Time,
     tick: Duration,
     allow_cancellation: bool,
 ) -> Result<bool> {
@@ -6410,7 +6408,7 @@ struct BashOutputState {
     start_time: std::time::Instant,
     timeout_ms: Option<u64>,
     temp_file_path: Option<PathBuf>,
-    temp_file: Option<asupersync::fs::File>,
+    temp_file: Option<fs::File>,
     chunks: VecDeque<Vec<u8>>,
     chunks_bytes: usize,
     max_chunks_bytes: usize,
@@ -6477,7 +6475,7 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
         // We also capture the inode (on Unix) to verify identity later.
         let path_clone = path.clone();
         let expected_inode: Option<u64> =
-            asupersync::runtime::spawn_blocking_io(move || -> std::io::Result<Option<u64>> {
+            runtime::spawn_blocking_io(move || -> std::io::Result<Option<u64>> {
                 let mut options = std::fs::OpenOptions::new();
                 options.write(true).create_new(true);
 
@@ -6510,11 +6508,7 @@ async fn ingest_bash_chunk(chunk: Vec<u8>, state: &mut BashOutputState) -> Resul
             .unwrap_or(None);
 
         if expected_inode.is_some() || !cfg!(unix) {
-            match asupersync::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .await
-            {
+            match fs::OpenOptions::new().append(true).open(&path).await {
                 Ok(mut file) => {
                     #[cfg_attr(not(unix), allow(unused_mut))]
                     let mut identity_match = true;
@@ -6982,7 +6976,7 @@ async fn get_file_lines_async<'a>(
 ) -> &'a [String] {
     if !cache.contains_key(path) {
         // Prevent OOM on huge files and hangs on pipes
-        if let Ok(meta) = asupersync::fs::metadata(path).await {
+        if let Ok(meta) = fs::metadata(path).await {
             if !meta.is_file() || meta.len() > 10 * 1024 * 1024 {
                 cache.insert(path.to_path_buf(), Vec::new());
                 return &[];
@@ -6993,7 +6987,7 @@ async fn get_file_lines_async<'a>(
         }
 
         // Match Node's `readFileSync(..., "utf-8")` behavior: decode lossily rather than failing.
-        let bytes = match asupersync::fs::read(path).await {
+        let bytes = match fs::read(path).await {
             Ok(bytes) => bytes,
             Err(err) => {
                 tracing::debug!("Failed to read grep file {}: {err}", path.display());
@@ -7427,18 +7421,16 @@ impl Tool for HashlineEditTool {
         let absolute_path = enforce_cwd_scope(&resolved, &self.cwd, "hashline_edit")?;
 
         // Check file size
-        let metadata = asupersync::fs::metadata(&absolute_path)
-            .await
-            .map_err(|err| {
-                let message = match err.kind() {
-                    std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
-                    std::io::ErrorKind::PermissionDenied => {
-                        format!("Permission denied: {}", input.path)
-                    }
-                    _ => format!("Cannot read file metadata: {err}"),
-                };
-                Error::tool("hashline_edit", message)
-            })?;
+        let metadata = fs::metadata(&absolute_path).await.map_err(|err| {
+            let message = match err.kind() {
+                std::io::ErrorKind::NotFound => format!("File not found: {}", input.path),
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Permission denied: {}", input.path)
+                }
+                _ => format!("Cannot read file metadata: {err}"),
+            };
+            Error::tool("hashline_edit", message)
+        })?;
         if !metadata.is_file() {
             return Err(Error::tool(
                 "hashline_edit",
@@ -7457,7 +7449,7 @@ impl Tool for HashlineEditTool {
         }
 
         // Read file content
-        let file = asupersync::fs::File::open(&absolute_path)
+        let file = fs::File::open(&absolute_path)
             .await
             .map_err(|e| Error::tool("hashline_edit", format!("Cannot open file: {e}")))?;
         let mut raw = Vec::new();
@@ -7711,7 +7703,7 @@ impl Tool for HashlineEditTool {
         // Atomic write (same pattern as EditTool)
         let absolute_path_clone = absolute_path.clone();
         let final_content_bytes = final_content.into_bytes();
-        asupersync::runtime::spawn_blocking_io(move || {
+        runtime::spawn_blocking_io(move || {
             let original_perms = std::fs::metadata(&absolute_path_clone)
                 .ok()
                 .map(|m| m.permissions());

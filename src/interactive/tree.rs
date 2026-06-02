@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
 
+use crate::Cx;
 use crate::model::{ContentBlock, UserContent};
 use crate::session::{Session, SessionEntry, SessionMessage};
 use crate::theme::TuiStyles;
@@ -355,7 +356,7 @@ impl PiApp {
 
         let runtime_handle = self.runtime_handle.clone();
         runtime_handle.spawn(async move {
-            let cx = asupersync::Cx::for_request();
+            let cx = Cx::for_request();
             let (fork_plan, parent_path, session_dir) = {
                 let guard = match session.lock(&cx).await {
                     Ok(guard) => guard,
@@ -400,7 +401,7 @@ impl PiApp {
             if let Err(err) = new_session.save().await {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    &Cx::current().unwrap_or_else(Cx::for_request),
                     PiMsg::AgentError(format!("Failed to save fork: {err}")),
                 )
                 .await;
@@ -458,7 +459,7 @@ impl PiApp {
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
-                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                &Cx::current().unwrap_or_else(Cx::for_request),
                 PiMsg::ConversationReset {
                     messages,
                     usage,
@@ -469,7 +470,7 @@ impl PiApp {
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
-                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                &Cx::current().unwrap_or_else(Cx::for_request),
                 PiMsg::SetEditorText(selected_text),
             )
             .await;

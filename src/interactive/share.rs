@@ -1,3 +1,4 @@
+use crate::{Cx, fs};
 use chrono::Utc;
 use std::ffi::OsString;
 use std::path::Path;
@@ -15,7 +16,7 @@ pub(super) async fn run_command_output(
     cwd: &Path,
     abort_signal: &crate::agent::AbortSignal,
 ) -> std::io::Result<std::process::Output> {
-    use asupersync::time::{sleep, wall_now};
+    use crate::time::{sleep, wall_now};
     use std::process::{Command, Stdio};
     use std::sync::mpsc as std_mpsc;
     use std::time::Duration;
@@ -319,7 +320,7 @@ impl PiApp {
                         );
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
-                            &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                            &Cx::current().unwrap_or_else(Cx::for_request),
                             PiMsg::AgentError(message),
                         )
                         .await;
@@ -332,7 +333,7 @@ impl PiApp {
                         .to_string();
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        &Cx::current().unwrap_or_else(Cx::for_request),
                         PiMsg::AgentError(message),
                     )
                     .await;
@@ -341,7 +342,7 @@ impl PiApp {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        &Cx::current().unwrap_or_else(Cx::for_request),
                         PiMsg::System("Share cancelled".to_string()),
                     )
                     .await;
@@ -350,7 +351,7 @@ impl PiApp {
                 Err(err) => {
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        &Cx::current().unwrap_or_else(Cx::for_request),
                         PiMsg::AgentError(format!("Failed to run `gh auth status`: {err}")),
                     )
                     .await;
@@ -361,14 +362,14 @@ impl PiApp {
             if abort_signal.is_aborted() {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    &Cx::current().unwrap_or_else(Cx::for_request),
                     PiMsg::System("Share cancelled".to_string()),
                 )
                 .await;
                 return;
             }
 
-            let cx = asupersync::Cx::for_request();
+            let cx = Cx::for_request();
             let (html, session_name) = match session.lock(&cx).await {
                 Ok(guard) => (guard.to_html(), guard.get_name()),
                 Err(err) => {
@@ -385,7 +386,7 @@ impl PiApp {
             if abort_signal.is_aborted() {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    &Cx::current().unwrap_or_else(Cx::for_request),
                     PiMsg::System("Share cancelled".to_string()),
                 )
                 .await;
@@ -403,7 +404,7 @@ impl PiApp {
                 Err(err) => {
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        &Cx::current().unwrap_or_else(Cx::for_request),
                         PiMsg::AgentError(format!("Failed to create temp file: {err}")),
                     )
                     .await;
@@ -411,10 +412,10 @@ impl PiApp {
                 }
             };
             let temp_path = temp_file.into_temp_path();
-            if let Err(err) = asupersync::fs::write(&temp_path, html.as_bytes()).await {
+            if let Err(err) = fs::write(&temp_path, html.as_bytes()).await {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    &Cx::current().unwrap_or_else(Cx::for_request),
                     PiMsg::AgentError(format!("Failed to write temp file: {err}")),
                 )
                 .await;
@@ -437,7 +438,7 @@ impl PiApp {
                         .to_string();
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        &Cx::current().unwrap_or_else(Cx::for_request),
                         PiMsg::AgentError(message),
                     )
                     .await;
@@ -446,7 +447,7 @@ impl PiApp {
                 Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        &Cx::current().unwrap_or_else(Cx::for_request),
                         PiMsg::System("Share cancelled".to_string()),
                     )
                     .await;
@@ -455,7 +456,7 @@ impl PiApp {
                 Err(err) => {
                     let _ = crate::interactive::enqueue_pi_event(
                         &event_tx,
-                        &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                        &Cx::current().unwrap_or_else(Cx::for_request),
                         PiMsg::AgentError(format!("Failed to run `gh gist create`: {err}")),
                     )
                     .await;
@@ -467,7 +468,7 @@ impl PiApp {
                 let details = format_command_output(&output);
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    &Cx::current().unwrap_or_else(Cx::for_request),
                     PiMsg::AgentError(format!("`gh gist create` failed.\n\n{details}")),
                 )
                 .await;
@@ -479,7 +480,7 @@ impl PiApp {
                 let details = format_command_output(&output);
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    &Cx::current().unwrap_or_else(Cx::for_request),
                     PiMsg::AgentError(format!(
                         "Failed to parse gist URL from `gh gist create` output.\n\n{details}"
                     )),
@@ -504,7 +505,7 @@ impl PiApp {
                 format!("Created {privacy} gist\nShare URL: {share_url}\nGist: {gist_url}");
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
-                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                &Cx::current().unwrap_or_else(Cx::for_request),
                 PiMsg::System(message),
             )
             .await;

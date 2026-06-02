@@ -26,6 +26,7 @@ use crate::compaction::ResolvedCompactionSettings;
 use crate::models::default_models_path;
 use crate::provider::ThinkingBudgets;
 use crate::providers;
+use crate::sync::Mutex as AsyncMutex;
 use clap::Parser;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Map, Value};
@@ -1696,7 +1697,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         || ToolRegistry::new(&enabled_tools, &cwd, Some(&config)),
         |factory| factory.create_tool_registry(&enabled_tools, &cwd, &config),
     );
-    let session_arc = Arc::new(asupersync::sync::Mutex::new(session));
+    let session_arc = Arc::new(AsyncMutex::new(session));
 
     let context_window_tokens = if selection.model_entry.model.context_window == 0 {
         ResolvedCompactionSettings::default().context_window_tokens

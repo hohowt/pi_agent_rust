@@ -41,6 +41,7 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::module_name_repetitions,
+    clippy::significant_drop_tightening,
     clippy::similar_names,
     clippy::wildcard_imports
 )]
@@ -62,6 +63,8 @@ pub mod auth;
 #[doc(hidden)]
 pub mod autocomplete;
 #[doc(hidden)]
+pub mod channel;
+#[doc(hidden)]
 pub mod cli;
 #[doc(hidden)]
 pub mod compaction;
@@ -69,6 +72,16 @@ pub mod compaction;
 pub mod compaction_worker;
 #[doc(hidden)]
 pub mod config;
+#[doc(hidden)]
+pub mod fs;
+#[doc(hidden)]
+pub mod io;
+#[doc(hidden)]
+pub mod runtime;
+#[doc(hidden)]
+pub mod sync;
+#[doc(hidden)]
+pub mod time;
 #[doc(hidden)]
 pub use pi_core::error;
 #[doc(hidden)]
@@ -136,4 +149,8 @@ pub mod tui;
 #[doc(hidden)]
 pub use pi_http::vcr;
 
+#[doc(hidden)]
+pub use agent_cx::{Budget, Cx};
 pub use error::{Error, Result as PiResult};
+#[doc(hidden)]
+pub use time::Time;

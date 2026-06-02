@@ -17,11 +17,9 @@ use std::sync::Mutex as StdMutex;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
-use asupersync::runtime::reactor::create_reactor;
-use asupersync::runtime::{RuntimeBuilder, RuntimeHandle};
-use asupersync::sync::Mutex;
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
+use pi::Cx;
 use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::app::StartupError;
 use pi::auth::{AuthCredential, AuthStorage};
@@ -38,8 +36,11 @@ use pi::provider::InputType;
 use pi::provider_metadata::{self, PROVIDER_METADATA};
 use pi::providers;
 use pi::resources::{ResourceCliOptions, ResourceLoader};
+use pi::runtime::reactor::create_reactor;
+use pi::runtime::{RuntimeBuilder, RuntimeHandle};
 use pi::session::Session;
 use pi::session_index::SessionIndex;
+use pi::sync::Mutex;
 use pi::tools::ToolRegistry;
 use pi::tui::PiConsole;
 use serde::{Deserialize, Serialize};
@@ -298,7 +299,7 @@ fn main_impl() -> Result<()> {
                     }
                 }
             }
-            _ => {}
+            cli::Commands::Migrate { .. } => {}
         }
     }
 
@@ -398,11 +399,11 @@ fn main_impl() -> Result<()> {
         .init();
 
     // Run the application
-    let reactor = create_reactor()?;
+    create_reactor()?;
     let runtime = RuntimeBuilder::multi_thread()
         .blocking_threads(1, 2)
         .enable_parking(false)
-        .with_reactor(reactor)
+        .with_reactor(())
         .build()
         .map_err(|e| anyhow::anyhow!(e.to_string()))?;
     let handle = runtime.handle();
@@ -658,10 +659,9 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     if has_cli_api_key_override(cli.api_key.as_deref())
         && cli.provider.is_none()
         && cli.model.is_none()
+        && scoped_models.is_empty()
     {
-        if scoped_models.is_empty() {
-            bail!("--api-key requires a model to be specified via --provider/--model or --models");
-        }
+        bail!("--api-key requires a model to be specified via --provider/--model or --models");
     }
 
     let allow_setup_prompt =
@@ -823,7 +823,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         )
         .await
     } else {
-        let result = run_print_mode(
+        run_print_mode(
             &mut agent_session,
             &mode,
             initial,
@@ -832,8 +832,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
             runtime_handle.clone(),
             &config,
         )
-        .await;
-        result
+        .await
     };
 
     // Best-effort autosave flush on shutdown.
@@ -3404,10 +3403,10 @@ async fn export_session(input_path: &str, output_path: Option<&str>) -> Result<P
 
     if let Some(parent) = output_path.parent() {
         if !parent.as_os_str().is_empty() {
-            asupersync::fs::create_dir_all(parent).await?;
+            pi::fs::create_dir_all(parent).await?;
         }
     }
-    asupersync::fs::write(&output_path, html).await?;
+    pi::fs::write(&output_path, html).await?;
     Ok(output_path)
 }
 
@@ -3519,6 +3518,7 @@ async fn run_print_mode(
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))?;
         println!("{}", serde_json::to_string(&session.header)?);
+        drop(session);
     }
     if initial.is_none() && messages.is_empty() {
         if mode.eq("json") {
@@ -3773,10 +3773,10 @@ fn print_mode_retry_delay_ms(config: &Config, attempt: u32) -> u32 {
 }
 
 async fn sleep_with_current_timer(duration: Duration) {
-    let now = asupersync::Cx::current()
+    let now = Cx::current()
         .and_then(|cx| cx.timer_driver())
-        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-    asupersync::time::sleep(now, duration).await;
+        .map_or_else(pi::time::wall_now, |timer| timer.now());
+    pi::time::sleep(now, duration).await;
 }
 
 /// Emit a JSON-serialized [`AgentEvent`] to stdout (for JSON print mode).

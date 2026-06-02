@@ -45,6 +45,22 @@ name = "pi"
 path = "src/main.rs"
 test = false
 
+[[test]]
+name = "auth_storage_async"
+path = "tests/auth_storage_async.rs"
+
+[[test]]
+name = "package_manager_async"
+path = "tests/package_manager_async.rs"
+
+[[test]]
+name = "agent_cx_tokio"
+path = "tests/agent_cx_tokio.rs"
+
+[[test]]
+name = "root_tokio_runtime"
+path = "tests/root_tokio_runtime.rs"
+
 [dependencies]
 pi-core = { path = "crates/pi-core" }
 pi-http = { path = "crates/pi-http" }
@@ -53,9 +69,9 @@ pi-http = { path = "crates/pi-http" }
 clap = { version = "4.5.60", features = ["derive", "env", "string"] }
 
 # Async runtime
-asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots", "test-internals"] }
 futures = "0.3"
 async-trait = "0.1"
+tokio = { version = "1", features = ["fs", "io-util", "process", "rt-multi-thread", "sync", "time"] }
 
 # URL parsing/building
 url = "2"

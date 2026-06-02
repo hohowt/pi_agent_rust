@@ -1,4 +1,5 @@
 use super::*;
+use crate::Cx;
 
 impl PiApp {
     #[allow(clippy::too_many_lines)]
@@ -436,7 +437,7 @@ impl PiApp {
                     if !guard.navigate_to(target_id) {
                         let _ = crate::interactive::enqueue_pi_event(
                             &event_tx,
-                            &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                            &Cx::current().unwrap_or_else(Cx::for_request),
                             PiMsg::AgentError(format!("Branch target not found: {target_id}")),
                         )
                         .await;
@@ -515,7 +516,7 @@ impl PiApp {
 
             let _ = crate::interactive::enqueue_pi_event(
                 &event_tx,
-                &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                &Cx::current().unwrap_or_else(Cx::for_request),
                 PiMsg::ConversationReset {
                     messages,
                     usage,
@@ -527,7 +528,7 @@ impl PiApp {
             if let Some(text) = pending.editor_text {
                 let _ = crate::interactive::enqueue_pi_event(
                     &event_tx,
-                    &asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request),
+                    &Cx::current().unwrap_or_else(Cx::for_request),
                     PiMsg::SetEditorText(text),
                 )
                 .await;

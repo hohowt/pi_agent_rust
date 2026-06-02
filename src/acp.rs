@@ -31,20 +31,21 @@ use crate::agent::{
 };
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
+use crate::channel::{mpsc, oneshot};
 use crate::compaction::ResolvedCompactionSettings;
 use crate::config::Config;
 use crate::error::{Error, Result};
+use crate::fs;
 use crate::model::{AssistantMessageEvent, ContentBlock};
 use crate::models::ModelEntry;
 use crate::provider::StreamOptions;
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
+use crate::runtime::RuntimeHandle;
 use crate::session::Session;
+use crate::sync::Mutex;
+use crate::time::{timeout, wall_now};
 use crate::tools::ToolRegistry;
-use asupersync::channel::oneshot;
-use asupersync::runtime::RuntimeHandle;
-use asupersync::sync::Mutex;
-use asupersync::time::{timeout, wall_now};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -277,7 +278,7 @@ impl AcpPermissionClient {
 /// Reads JSON-RPC requests line-by-line from stdin, dispatches them,
 /// and writes JSON-RPC responses/notifications to stdout.
 pub async fn run_stdio(options: AcpOptions) -> Result<()> {
-    let (in_tx, in_rx) = asupersync::channel::mpsc::channel::<String>(256);
+    let (in_tx, in_rx) = mpsc::channel::<String>(256);
     let (out_tx, out_rx) = std::sync::mpsc::sync_channel::<String>(1024);
 
     // Stdin reader thread.
@@ -299,7 +300,7 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
                     loop {
                         match in_tx.try_send(to_send) {
                             Ok(()) => break,
-                            Err(asupersync::channel::mpsc::SendError::Full(unsent)) => {
+                            Err(mpsc::SendError::Full(unsent)) => {
                                 to_send = unsent;
                                 std::thread::sleep(std::time::Duration::from_millis(10));
                             }
@@ -334,7 +335,7 @@ pub async fn run_stdio(options: AcpOptions) -> Result<()> {
 /// Core ACP event loop.
 async fn run(
     options: AcpOptions,
-    mut in_rx: asupersync::channel::mpsc::Receiver<String>,
+    mut in_rx: mpsc::Receiver<String>,
     out_tx: std::sync::mpsc::SyncSender<String>,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
@@ -754,7 +755,7 @@ async fn run(
                 }
 
                 let max_bytes = 10 * 1024 * 1024; // 10MB limit for ACP
-                match asupersync::fs::metadata(path_str).await {
+                match fs::metadata(path_str).await {
                     Ok(meta) if meta.len() > max_bytes => {
                         let _ = out_tx.send(json_rpc_error(
                             id,
@@ -770,7 +771,7 @@ async fn run(
                     _ => {}
                 }
 
-                match asupersync::fs::read(path_str).await {
+                match fs::read(path_str).await {
                     Ok(bytes) => {
                         let contents = String::from_utf8_lossy(&bytes).into_owned();
                         let _ = out_tx.send(json_rpc_ok(id, json!({ "contents": contents })));
@@ -812,7 +813,7 @@ async fn run(
                     continue;
                 }
 
-                match asupersync::fs::write(path_str, contents.as_bytes()).await {
+                match fs::write(path_str, contents.as_bytes()).await {
                     Ok(()) => {
                         let _ = out_tx.send(json_rpc_ok(id, json!({ "success": true })));
                     }

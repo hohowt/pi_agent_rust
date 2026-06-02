@@ -1,4 +1,5 @@
 use crate::error::{Error, Result};
+use crate::fs;
 use crate::session::{SessionEntry, SessionHeader};
 use crate::session_metrics;
 use rusqlite::{Connection, OpenFlags, params};
@@ -807,7 +808,7 @@ pub async fn save_session(
     let _save_timer = metrics.start_timer(&metrics.sqlite_save);
 
     if let Some(parent) = path.parent() {
-        asupersync::fs::create_dir_all(parent).await?;
+        fs::create_dir_all(parent).await?;
     }
 
     let conn = open_sqlite_connection_read_write(path)?;

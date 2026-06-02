@@ -13,7 +13,6 @@ doctest = false
 
 [dependencies]
 async-trait = "0.1"
-asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots", "test-internals"] }
 futures = "0.3"
 regex = "1.12.3"
 rusqlite = "0.37"

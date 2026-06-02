@@ -14,6 +14,7 @@
 use crate::agent::{AbortHandle, AgentEvent, AgentSession, InputSource, QueueMode};
 use crate::agent_cx::AgentCx;
 use crate::auth::AuthStorage;
+use crate::channel::{mpsc, oneshot};
 use crate::compaction::{
     ResolvedCompactionSettings, compact, compaction_details_to_value, prepare_compaction,
 };
@@ -27,12 +28,12 @@ use crate::models::{ModelEntry, model_requires_configured_credential, normalize_
 use crate::provider_metadata::provider_ids_match;
 use crate::providers;
 use crate::resources::ResourceLoader;
+use crate::runtime::RuntimeHandle;
 use crate::session::SessionMessage;
+use crate::sync::{Mutex, OwnedMutexGuard};
+use crate::time::{sleep, wall_now};
 use crate::tools::{DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncate_tail};
-use asupersync::channel::{mpsc, oneshot};
-use asupersync::runtime::RuntimeHandle;
-use asupersync::sync::{Mutex, OwnedMutexGuard};
-use asupersync::time::{sleep, wall_now};
+use crate::{Cx, fs, runtime};
 use memchr::memchr_iter;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
@@ -134,7 +135,7 @@ fn parse_optional_u32_field(parsed: &Value, field: &str) -> Result<Option<u32>> 
 }
 
 fn future_with_current_cx<F>(
-    current_cx: asupersync::Cx,
+    current_cx: Cx,
     future: F,
 ) -> impl Future<Output = F::Output> + Send + 'static
 where
@@ -142,7 +143,7 @@ where
 {
     let mut future = Box::pin(future);
     std::future::poll_fn(move |poll_cx| {
-        let _guard = asupersync::Cx::set_current(Some(current_cx.clone()));
+        let _guard = Cx::set_current(Some(current_cx.clone()));
         future.as_mut().poll(poll_cx)
     })
 }
@@ -3566,9 +3567,9 @@ async fn export_html_snapshot(
     );
 
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-        asupersync::fs::create_dir_all(parent).await?;
+        fs::create_dir_all(parent).await?;
     }
-    asupersync::fs::write(&path, html).await?;
+    fs::write(&path, html).await?;
     Ok(path.display().to_string())
 }
 
@@ -3614,7 +3615,7 @@ fn pump_bash_rpc_stream(
 }
 
 fn abandon_bash_rpc_spill_file(
-    temp_file: &mut Option<asupersync::fs::File>,
+    temp_file: &mut Option<fs::File>,
     temp_file_path: &mut Option<PathBuf>,
     spill_failed: &mut bool,
 ) {
@@ -3654,7 +3655,7 @@ async fn ingest_bash_rpc_chunk(
     total_bytes: &mut usize,
     total_lines: &mut usize,
     last_byte_was_newline: &mut bool,
-    temp_file: &mut Option<asupersync::fs::File>,
+    temp_file: &mut Option<fs::File>,
     temp_file_path: &mut Option<PathBuf>,
     spill_failed: &mut bool,
     max_chunks_bytes: usize,
@@ -3676,7 +3677,7 @@ async fn ingest_bash_rpc_chunk(
         // Secure synchronous creation
         let path_clone = path.clone();
         let expected_inode: Option<u64> =
-            asupersync::runtime::spawn_blocking_io(move || -> std::io::Result<Option<u64>> {
+            runtime::spawn_blocking_io(move || -> std::io::Result<Option<u64>> {
                 let mut options = std::fs::OpenOptions::new();
                 options.write(true).create_new(true);
                 #[cfg(unix)]
@@ -3709,11 +3710,7 @@ async fn ingest_bash_rpc_chunk(
 
         if expected_inode.is_some() || !cfg!(unix) {
             // Re-open async for writing
-            match asupersync::fs::OpenOptions::new()
-                .append(true)
-                .open(&path)
-                .await
-            {
+            match fs::OpenOptions::new().append(true).open(&path).await {
                 Ok(mut file) => {
                     // Validate identity to prevent TOCTOU/symlink attacks
                     #[cfg_attr(not(unix), allow(unused_mut))]
@@ -3741,7 +3738,7 @@ async fn ingest_bash_rpc_chunk(
                         // Flush existing chunks to the new file
                         let mut failed_flush = false;
                         for existing in chunks.iter() {
-                            use asupersync::io::AsyncWriteExt;
+                            use crate::io::AsyncWriteExt;
                             if let Err(e) = file.write_all(existing).await {
                                 tracing::warn!("Failed to flush bash chunk to temp file: {e}");
                                 failed_flush = true;
@@ -3775,7 +3772,7 @@ async fn ingest_bash_rpc_chunk(
     let mut close_spill_file = false;
     if let Some(file) = temp_file.as_mut() {
         if *total_bytes <= crate::tools::BASH_FILE_LIMIT_BYTES {
-            use asupersync::io::AsyncWriteExt;
+            use crate::io::AsyncWriteExt;
             if let Err(e) = file.write_all(&bytes).await {
                 tracing::warn!("Failed to write bash chunk to temp file: {e}");
                 abandon_spill_file = true;
@@ -3810,7 +3807,7 @@ async fn ingest_bash_rpc_frame(
     total_bytes: &mut usize,
     total_lines: &mut usize,
     last_byte_was_newline: &mut bool,
-    temp_file: &mut Option<asupersync::fs::File>,
+    temp_file: &mut Option<fs::File>,
     temp_file_path: &mut Option<PathBuf>,
     spill_failed: &mut bool,
     max_chunks_bytes: usize,
@@ -3918,7 +3915,7 @@ async fn run_bash_rpc(
     let _stderr_handle = std::thread::spawn(move || pump_bash_rpc_stream(stderr, tx, "stderr"));
 
     let tick = Duration::from_millis(10);
-    let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
+    let cx = Cx::current().unwrap_or_else(Cx::for_request);
 
     // Bounded buffer state (same logic as BashTool)
     let mut chunks: VecDeque<Vec<u8>> = VecDeque::new();
@@ -3926,7 +3923,7 @@ async fn run_bash_rpc(
     let mut total_bytes = 0usize;
     let mut total_lines = 0usize;
     let mut last_byte_was_newline = false;
-    let mut temp_file: Option<asupersync::fs::File> = None;
+    let mut temp_file: Option<fs::File> = None;
     let mut temp_file_path: Option<PathBuf> = None;
     let max_chunks_bytes = DEFAULT_MAX_BYTES * 2;
 
@@ -4183,7 +4180,7 @@ fn model_entry_for_provider_and_id<'a>(
 }
 
 async fn apply_thinking_level(
-    session: Arc<asupersync::sync::Mutex<AgentSession>>,
+    session: Arc<Mutex<AgentSession>>,
     level: crate::model::ThinkingLevel,
 ) -> Result<()> {
     let cx = AgentCx::for_current_or_request();
@@ -4220,7 +4217,7 @@ async fn apply_thinking_level(
 }
 
 async fn apply_thinking_level_for_session(
-    session: Arc<asupersync::sync::Mutex<AgentSession>>,
+    session: Arc<Mutex<AgentSession>>,
     level: crate::model::ThinkingLevel,
     cx: &AgentCx,
 ) -> Result<()> {

@@ -1,7 +1,6 @@
-//! Server-Sent Events (SSE) parser for asupersync HTTP client.
+//! Server-Sent Events (SSE) parser for streaming HTTP responses.
 //!
-//! Implements the SSE protocol (text/event-stream) on top of asupersync's
-//! HTTP client for streaming LLM responses.
+//! Implements the SSE protocol (text/event-stream) for streaming LLM responses.
 
 use std::borrow::Cow;
 use std::collections::VecDeque;

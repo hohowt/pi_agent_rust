@@ -869,21 +869,6 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<asupersync::sync::LockError> for Error {
-    fn from(value: asupersync::sync::LockError) -> Self {
-        match value {
-            asupersync::sync::LockError::Cancelled => Self::Aborted,
-            asupersync::sync::LockError::Poisoned
-            | asupersync::sync::LockError::PolledAfterCompletion
-            // asupersync 0.3.2 added LockError::TimedOut(Time) (lock-acquire deadline
-            // elapsed); surface it as a session error — its Display carries the detail.
-            | asupersync::sync::LockError::TimedOut(_) => {
-                Self::session(value.to_string())
-            }
-        }
-    }
-}
-
 impl From<serde_json::Error> for Error {
     fn from(value: serde_json::Error) -> Self {
         Self::Json(Box::new(value))

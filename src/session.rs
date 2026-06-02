@@ -4,6 +4,7 @@
 //! branching and history navigation.
 
 use crate::agent_cx::AgentCx;
+use crate::channel::oneshot;
 use crate::cli::Cli;
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -17,7 +18,7 @@ use crate::session_index::{
 };
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
-use asupersync::channel::oneshot;
+use crate::{fs, runtime};
 use fs4::fs_std::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2169,7 +2170,7 @@ impl Session {
             let encoded_cwd = encode_cwd(&cwd);
             let project_session_dir = base_dir.join(&encoded_cwd);
 
-            asupersync::fs::create_dir_all(&project_session_dir).await?;
+            fs::create_dir_all(&project_session_dir).await?;
 
             let timestamp = chrono::Utc::now().format("%Y-%m-%dT%H-%M-%S%.3fZ");
             // Robust against malformed/legacy session ids: keep a short, filename-safe suffix.
@@ -2234,18 +2235,17 @@ impl Session {
                     let header_dirty = self.header_dirty;
                     let path_for_task = path_clone.clone();
                     let sessions_root_for_task = sessions_root.clone();
-                    let (saved_header, saved_entries) =
-                        asupersync::runtime::spawn_blocking(move || {
-                            save_jsonl_full_rewrite_blocking(
-                                &path_for_task,
-                                &sessions_root_for_task,
-                                &header_snapshot,
-                                &entries_to_save,
-                                persisted_entry_count,
-                                header_dirty,
-                            )
-                        })
-                        .await?;
+                    let (saved_header, saved_entries) = runtime::spawn_blocking(move || {
+                        save_jsonl_full_rewrite_blocking(
+                            &path_for_task,
+                            &sessions_root_for_task,
+                            &header_snapshot,
+                            &entries_to_save,
+                            persisted_entry_count,
+                            header_dirty,
+                        )
+                    })
+                    .await?;
 
                     let previous_leaf = self.leaf_id.clone();
                     self.header = saved_header;
@@ -2276,7 +2276,7 @@ impl Session {
                         let new_entries = &self.entries[new_start..];
                         // Scale buffer reservation from observed on-disk average entry size to
                         // avoid repeated growth/copy when appending large entries.
-                        let estimated_entry_bytes = asupersync::fs::metadata(&path_clone)
+                        let estimated_entry_bytes = fs::metadata(&path_clone)
                             .await
                             .ok()
                             .and_then(|meta| usize::try_from(meta.len()).ok())
@@ -2298,7 +2298,7 @@ impl Session {
                         let header_snapshot = self.header.clone();
                         let path_for_task = path_clone.clone();
                         let sessions_root_for_task = sessions_root.clone();
-                        asupersync::runtime::spawn_blocking(move || {
+                        runtime::spawn_blocking(move || {
                             append_jsonl_entries_blocking(
                                 &path_for_task,
                                 &sessions_root_for_task,

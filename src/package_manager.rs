@@ -6,10 +6,8 @@
 //! - Global npm installs use `npm install -g` (npm-managed global root)
 //! - Git installs are under Pi's agent/project directories (`~/.pi/agent/git`, `./.pi/git`)
 
-use crate::agent_cx::AgentCx;
 use crate::config::Config;
 use crate::error::{Error, Result};
-use asupersync::channel::oneshot;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -19,17 +17,20 @@ use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::thread;
 
-fn finish_package_task<T, E>(
-    handle: thread::JoinHandle<()>,
-    recv_result: std::result::Result<Result<T>, E>,
+async fn run_package_task<T>(
+    task: impl FnOnce() -> Result<T> + Send + 'static,
     cancelled_message: &'static str,
-) -> Result<T> {
-    if let Err(panic_payload) = handle.join() {
-        std::panic::resume_unwind(panic_payload);
-    }
-    recv_result.map_err(|_| Error::tool("package_manager", cancelled_message))?
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(task).await.map_err(|err| {
+        if err.is_panic() {
+            std::panic::resume_unwind(err.into_panic());
+        }
+        Error::tool("package_manager", format!("{cancelled_message}: {err}"))
+    })?
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -254,17 +255,11 @@ impl PackageManager {
     pub async fn install(&self, source: &str, scope: PackageScope) -> Result<()> {
         let this = self.clone();
         let source = source.to_string();
-        let (tx, mut rx) = oneshot::channel();
-
-        let handle = thread::spawn(move || {
-            let res = this.install_sync(&source, scope);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "Install task cancelled")
+        run_package_task(
+            move || this.install_sync(&source, scope),
+            "Install task failed",
+        )
+        .await
     }
 
     /// Synchronous variant of [`Self::install`] for startup subcommand fast paths.
@@ -302,17 +297,11 @@ impl PackageManager {
     pub async fn remove(&self, source: &str, scope: PackageScope) -> Result<()> {
         let this = self.clone();
         let source = source.to_string();
-        let (tx, mut rx) = oneshot::channel();
-
-        let handle = thread::spawn(move || {
-            let res = this.remove_sync(&source, scope);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "Remove task cancelled")
+        run_package_task(
+            move || this.remove_sync(&source, scope),
+            "Remove task failed",
+        )
+        .await
     }
 
     /// Synchronous variant of [`Self::remove`] for startup subcommand fast paths.
@@ -335,17 +324,11 @@ impl PackageManager {
     pub async fn update_source(&self, source: &str, scope: PackageScope) -> Result<()> {
         let this = self.clone();
         let source = source.to_string();
-        let (tx, mut rx) = oneshot::channel();
-
-        let handle = thread::spawn(move || {
-            let res = this.update_source_sync(&source, scope);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "Update task cancelled")
+        run_package_task(
+            move || this.update_source_sync(&source, scope),
+            "Update task failed",
+        )
+        .await
     }
 
     /// Synchronous variant of [`Self::update_source`] for startup subcommand fast paths.
@@ -386,17 +369,11 @@ impl PackageManager {
     ) -> Result<Option<PathBuf>> {
         let this = self.clone();
         let source = source.to_string();
-        let (tx, mut rx) = oneshot::channel();
-
-        let handle = thread::spawn(move || {
-            let res = this.installed_path_sync(&source, scope);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "Installed path lookup cancelled")
+        run_package_task(
+            move || this.installed_path_sync(&source, scope),
+            "Installed path lookup failed",
+        )
+        .await
     }
 
     /// Synchronous variant of [`Self::installed_path`] for startup fast paths.
@@ -422,17 +399,11 @@ impl PackageManager {
 
     pub async fn list_packages(&self) -> Result<Vec<PackageEntry>> {
         let this = self.clone();
-        let (tx, mut rx) = oneshot::channel();
-
-        let handle = thread::spawn(move || {
-            let res = this.list_packages_sync();
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "List packages task cancelled")
+        run_package_task(
+            move || this.list_packages_sync(),
+            "List packages task failed",
+        )
+        .await
     }
 
     /// Synchronous variant of [`Self::list_packages`] for startup fast paths.
@@ -590,9 +561,8 @@ impl PackageManager {
     /// not block the other.
     pub async fn reconcile_all_lockfiles(&self) -> Result<Vec<PackageLockEntry>> {
         let this = self.clone();
-        let (tx, mut rx) = oneshot::channel();
-
-        let handle = thread::spawn(move || {
+        run_package_task(
+            move || {
             let mut pruned = Vec::new();
             for scope in [PackageScope::User, PackageScope::Project] {
                 match this.reconcile_lockfile_sync(scope) {
@@ -605,13 +575,11 @@ impl PackageManager {
                     ),
                 }
             }
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), Ok::<_, Error>(pruned));
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "Lockfile reconcile task cancelled")
+                Ok(pruned)
+            },
+            "Lockfile reconcile task failed",
+        )
+        .await
     }
 
     async fn ensure_package_entries_installed(
@@ -647,11 +615,10 @@ impl PackageManager {
     pub async fn resolve_with_roots(&self, roots: &ResolveRoots) -> Result<ResolvedPaths> {
         let this_for_setup = self.clone();
         let roots_for_setup = roots.clone();
-        let (tx, mut rx) = oneshot::channel();
 
         // Offload the heavy lifting (sync I/O) to a thread
-        let handle = thread::spawn(move || {
-            let res: Result<(SettingsSnapshot, SettingsSnapshot, Vec<ScopedPackage>)> = (|| {
+        let (global, project, package_sources) = run_package_task(
+            move || {
                 let global = read_settings_snapshot(&roots_for_setup.global_settings_path)?;
                 let project = read_project_settings_snapshot(&roots_for_setup)?;
 
@@ -671,16 +638,10 @@ impl PackageManager {
                 }
                 let package_sources = this_for_setup.dedupe_packages(all_packages);
                 Ok((global, project, package_sources))
-            })(
-            );
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        let (global, project, package_sources) =
-            finish_package_task(handle, recv_result, "Resolve setup task cancelled")?;
+            },
+            "Resolve setup task failed",
+        )
+        .await?;
 
         let mut accumulator = ResourceAccumulator::new();
 
@@ -690,81 +651,73 @@ impl PackageManager {
         // Offload the rest of sync resolution
         let this = self.clone();
         let roots = roots.clone();
-        let (tx, mut rx) = oneshot::channel();
         let accumulator = std::sync::Mutex::new(accumulator);
 
-        let handle = thread::spawn(move || {
-            let mut accumulator = accumulator
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        run_package_task(
+            move || {
+                let mut accumulator = accumulator
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-            // 2) Local entries from settings (global and project)
-            for resource_type in ResourceType::all() {
-                let target = accumulator.target_mut(resource_type);
-                Self::resolve_local_entries(
-                    global.entries_for(resource_type),
-                    resource_type,
-                    target,
-                    &PathMetadata {
-                        source: "local".to_string(),
-                        scope: PackageScope::User,
-                        origin: ResourceOrigin::TopLevel,
-                        base_dir: Some(roots.global_base_dir.clone()),
-                    },
-                    &roots.global_base_dir,
-                );
-
-                if roots.project_settings_enabled {
+                // 2) Local entries from settings (global and project)
+                for resource_type in ResourceType::all() {
+                    let target = accumulator.target_mut(resource_type);
                     Self::resolve_local_entries(
-                        project.entries_for(resource_type),
+                        global.entries_for(resource_type),
                         resource_type,
                         target,
                         &PathMetadata {
                             source: "local".to_string(),
-                            scope: PackageScope::Project,
+                            scope: PackageScope::User,
                             origin: ResourceOrigin::TopLevel,
-                            base_dir: Some(roots.project_base_dir.clone()),
+                            base_dir: Some(roots.global_base_dir.clone()),
                         },
-                        &roots.project_base_dir,
+                        &roots.global_base_dir,
                     );
+
+                    if roots.project_settings_enabled {
+                        Self::resolve_local_entries(
+                            project.entries_for(resource_type),
+                            resource_type,
+                            target,
+                            &PathMetadata {
+                                source: "local".to_string(),
+                                scope: PackageScope::Project,
+                                origin: ResourceOrigin::TopLevel,
+                                base_dir: Some(roots.project_base_dir.clone()),
+                            },
+                            &roots.project_base_dir,
+                        );
+                    }
                 }
-            }
 
-            // 3) Auto-discovered resources from standard dirs (global and project)
-            this.add_auto_discovered_resources(
-                &mut accumulator,
-                &global,
-                &project,
-                &roots.global_base_dir,
-                &roots.project_base_dir,
-                roots.project_settings_enabled,
-            );
+                // 3) Auto-discovered resources from standard dirs (global and project)
+                this.add_auto_discovered_resources(
+                    &mut accumulator,
+                    &global,
+                    &project,
+                    &roots.global_base_dir,
+                    &roots.project_base_dir,
+                    roots.project_settings_enabled,
+                );
 
-            let resolved = accumulator.clone().into_resolved_paths();
-            drop(accumulator);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), Ok(resolved));
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "Resolve processing task cancelled")
+                let resolved = accumulator.clone().into_resolved_paths();
+                drop(accumulator);
+                Ok(resolved)
+            },
+            "Resolve processing task failed",
+        )
+        .await
     }
 
     pub async fn add_package_source(&self, source: &str, scope: PackageScope) -> Result<()> {
         let this = self.clone();
         let source = source.to_string();
-        let (tx, mut rx) = oneshot::channel();
-
-        let handle = thread::spawn(move || {
-            let res = this.add_package_source_sync(&source, scope);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "Add source task cancelled")
+        run_package_task(
+            move || this.add_package_source_sync(&source, scope),
+            "Add source task failed",
+        )
+        .await
     }
 
     /// Synchronous variant of [`Self::add_package_source`] for startup subcommand fast paths.
@@ -788,17 +741,11 @@ impl PackageManager {
     pub async fn remove_package_source(&self, source: &str, scope: PackageScope) -> Result<()> {
         let this = self.clone();
         let source = source.to_string();
-        let (tx, mut rx) = oneshot::channel();
-
-        let handle = thread::spawn(move || {
-            let res = this.remove_package_source_sync(&source, scope);
-            let cx = AgentCx::for_request();
-            let _ = tx.send(cx.cx(), res);
-        });
-
-        let cx = AgentCx::for_request();
-        let recv_result = rx.recv(cx.cx()).await;
-        finish_package_task(handle, recv_result, "Remove source task cancelled")
+        run_package_task(
+            move || this.remove_package_source_sync(&source, scope),
+            "Remove source task failed",
+        )
+        .await
     }
 
     /// Synchronous variant of [`Self::remove_package_source`] for startup subcommand fast paths.
@@ -3794,26 +3741,28 @@ fn write_settings_json_atomic(path: &Path, value: &Value) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use asupersync::runtime::RuntimeBuilder;
     use serde_json::json;
     use std::fs;
     use std::future::Future;
 
     fn run_async<T>(future: impl Future<Output = T>) -> T {
-        let runtime = RuntimeBuilder::current_thread()
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .expect("build runtime");
         runtime.block_on(future)
     }
 
     #[test]
-    fn test_finish_package_task_propagates_panic_before_cancellation() {
-        let handle = std::thread::spawn(|| -> () {
-            panic!("package manager worker panic");
-        });
-
+    fn test_run_package_task_propagates_panic() {
         let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _: Result<()> = finish_package_task(handle, Err(()), "Install task cancelled");
+            run_async(run_package_task(
+                || -> Result<()> {
+                    panic!("package manager worker panic");
+                },
+                "Install task failed",
+            ))
+            .expect("join should panic before returning an error");
         }));
 
         assert!(
@@ -3823,24 +3772,22 @@ mod tests {
     }
 
     #[test]
-    fn test_finish_package_task_maps_nonpanic_cancellation_to_tool_error() {
-        let handle = std::thread::spawn(|| {});
-
-        let err = finish_package_task::<(), _>(handle, Err(()), "Install task cancelled")
-            .expect_err("error");
+    fn test_run_package_task_returns_task_error() {
+        let err = run_async(run_package_task(
+            || -> Result<()> { Err(Error::tool("package_manager", "task error")) },
+            "Install task failed",
+        ))
+        .expect_err("error");
 
         assert!(
-            err.to_string().contains("Install task cancelled"),
+            err.to_string().contains("task error"),
             "unexpected error: {err}"
         );
     }
 
     #[test]
-    fn test_finish_package_task_returns_success_payload() {
-        let handle = std::thread::spawn(|| {});
-
-        let value =
-            finish_package_task::<usize, ()>(handle, Ok(Ok(7usize)), "task cancelled").unwrap();
+    fn test_run_package_task_returns_success_payload() {
+        let value = run_async(run_package_task(|| Ok(7usize), "task failed")).unwrap();
 
         assert_eq!(value, 7);
     }

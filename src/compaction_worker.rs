@@ -6,7 +6,7 @@
 use crate::compaction::{self, CompactionPreparation, CompactionResult};
 use crate::error::{Error, Result};
 use crate::provider::Provider;
-use asupersync::runtime::{JoinHandle, RuntimeHandle};
+use crate::runtime::{JoinHandle, RuntimeHandle};
 use futures::FutureExt;
 use futures::channel::oneshot;
 use serde::Serialize;

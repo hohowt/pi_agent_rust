@@ -1,4 +1,6 @@
 use super::*;
+use crate::Cx;
+use crate::channel::mpsc::SendError;
 
 use crate::models::{ModelEntry, model_requires_configured_credential, normalize_api_key_opt};
 use crate::provider_metadata::{
@@ -1908,7 +1910,7 @@ impl PiApp {
             let event_tx = self.event_tx.clone();
             let provider_clone = provider;
             let runtime_handle = self.runtime_handle.clone();
-            let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
+            let cx = Cx::current().unwrap_or_else(Cx::for_request);
 
             runtime_handle.spawn(async move {
                 match crate::auth::start_kimi_code_device_flow().await {
@@ -1948,7 +1950,7 @@ impl PiApp {
             let event_tx = self.event_tx.clone();
             let provider_clone = provider;
             let runtime_handle = self.runtime_handle.clone();
-            let cx = asupersync::Cx::current().unwrap_or_else(asupersync::Cx::for_request);
+            let cx = Cx::current().unwrap_or_else(Cx::for_request);
             let client_id = std::env::var("GITHUB_COPILOT_CLIENT_ID").unwrap_or_default();
             let copilot_config = crate::auth::CopilotOAuthConfig {
                 client_id,
@@ -2091,9 +2093,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                             let full_url = format!("http://localhost{path}");
                             let mut send_result =
                                 event_tx.try_send(PiMsg::OAuthCallbackReceived(full_url));
-                            while let Err(asupersync::channel::mpsc::SendError::Full(unsent)) =
-                                send_result
-                            {
+                            while let Err(SendError::Full(unsent)) = send_result {
                                 std::thread::sleep(std::time::Duration::from_millis(50));
                                 send_result = event_tx.try_send(unsent);
                             }

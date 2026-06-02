@@ -1,41 +1,27 @@
 //! Minimal streaming HTTP client for Pi.
 //!
 //! This is intentionally small and purpose-built for provider streaming (SSE).
-//! It avoids Node/Bun-style ambient APIs and is designed to pair with
-//! asupersync for TLS + cancel-correctness.
+//! It avoids Node/Bun-style ambient APIs while using a mainstream Rust HTTP
+//! stack for TLS and request handling.
 
 use crate::vcr::{RecordedRequest, VcrRecorder};
-use asupersync::http::h1::ParsedUrl;
-use asupersync::http::h1::http_client::Scheme;
-use asupersync::io::ext::AsyncWriteExt;
-use asupersync::io::{AsyncRead, AsyncWrite, ReadBuf};
-use asupersync::net::tcp::stream::TcpStream;
-use asupersync::tls::{TlsConnector, TlsConnectorBuilder};
 use futures::Stream;
 use futures::StreamExt;
 use futures::TryStreamExt;
-use futures::stream::{self, BoxStream};
+use futures::stream::BoxStream;
 use pi_core::error::{Error, Result};
 use std::pin::Pin;
-use std::task::{Context, Poll};
 
 const DEFAULT_USER_AGENT: &str = concat!("pi_agent_rust/", env!("CARGO_PKG_VERSION"));
 const ANTIGRAVITY_VERSION_ENV: &str = "PI_AI_ANTIGRAVITY_VERSION";
-const MAX_HEADER_BYTES: usize = 64 * 1024;
-const READ_CHUNK_BYTES: usize = 16 * 1024;
+#[cfg(test)]
 const MAX_BUFFERED_BYTES: usize = 256 * 1024;
 const MAX_TEXT_BODY_BYTES: usize = 50 * 1024 * 1024;
 /// Maximum number of outbound request headers to prevent DoS.
 const MAX_REQUEST_HEADERS: usize = 100;
 
-/// Maximum number of consecutive `Ok(0)` returns from `poll_write` before we
-/// give up and surface `ErrorKind::WriteZero`.  TLS transports can temporarily
-/// return 0 when internal buffers are full; a short backoff usually unblocks
-/// the next write.
-const WRITE_ZERO_MAX_RETRIES: usize = 10;
+type ResponseHeaders = Vec<(String, String)>;
 
-/// Initial backoff duration when a write returns `Ok(0)`.
-const WRITE_ZERO_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 /// Environment variable that overrides the request timeout, in seconds.
 ///
 /// Applies to all providers; `0` disables the timeout entirely (unbounded).
@@ -137,10 +123,13 @@ fn timeout_override(env_lookup: impl FnOnce() -> Option<String>) -> Option<Reque
 /// `127.0.0.1:1234`, etc.) can have very high first-request latency from
 /// on-demand model loading, so they get a more generous default timeout.
 fn url_is_local_provider(url: &str) -> bool {
-    let Ok(parsed) = ParsedUrl::parse(url) else {
+    let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
-    let host = parsed.host.trim_matches(|c| c == '[' || c == ']');
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    let host = host.trim_matches(|c| c == '[' || c == ']');
     host.eq_ignore_ascii_case("localhost")
         || host == "127.0.0.1"
         || host.starts_with("127.")
@@ -172,8 +161,8 @@ fn resolve_timeout(setting: RequestTimeout, url: &str) -> Option<std::time::Dura
     }
 }
 
-/// During unit tests, timeouts are disabled to prevent `asupersync`'s virtual
-/// timer from instantly fast-forwarding and failing mock server requests.
+/// During unit tests, timeouts are disabled so local mock servers do not fail
+/// from intentionally tiny defaults unless the test explicitly covers timeout.
 #[cfg(test)]
 #[allow(clippy::missing_const_for_fn)]
 fn resolve_timeout(_setting: RequestTimeout, _url: &str) -> Option<std::time::Duration> {
@@ -204,7 +193,7 @@ fn timeout_error_message(url: &str, duration: std::time::Duration) -> String {
 
 #[derive(Debug, Clone)]
 pub struct Client {
-    tls: std::result::Result<TlsConnector, String>,
+    http: reqwest::Client,
     user_agent: String,
     vcr: Option<VcrRecorder>,
 }
@@ -212,18 +201,20 @@ pub struct Client {
 impl Client {
     #[must_use]
     pub fn new() -> Self {
-        let tls = TlsConnectorBuilder::new()
-            .with_native_roots()
-            .and_then(|builder| builder.alpn_protocols(vec![b"http/1.1".to_vec()]).build())
-            .map_err(|e| e.to_string());
-
         let user_agent = std::env::var(ANTIGRAVITY_VERSION_ENV).map_or_else(
             |_| DEFAULT_USER_AGENT.to_string(),
             |v| format!("{DEFAULT_USER_AGENT} Antigravity/{v}"),
         );
+        let http = reqwest::Client::builder()
+            .user_agent(user_agent.clone())
+            .build()
+            .unwrap_or_else(|err| {
+                tracing::warn!(%err, "failed to build reqwest client with configured options");
+                reqwest::Client::new()
+            });
 
         Self {
-            tls,
+            http,
             user_agent,
             vcr: None,
         }
@@ -364,7 +355,7 @@ impl<'a> RequestBuilder<'a> {
             let recorded = recorder
                 .request_streaming_with(recorded_request, || async {
                     let (status, response_headers, stream) =
-                        send_parts(client, method, &url, &headers, &body).await?;
+                        send_parts(client, method, &url, &headers, &body, None).await?;
                     Ok((status, response_headers, stream))
                 })
                 .await?;
@@ -375,111 +366,21 @@ impl<'a> RequestBuilder<'a> {
                 status,
                 headers: response_headers,
                 stream,
-                timeout_info: None,
+                idle_timeout: None,
             });
         }
 
-        let send_fut = send_parts(client, method, &url, &headers, &body);
         let resolved_timeout = resolve_timeout(timeout, &url);
-
-        let (status, response_headers, stream, timeout_info) = if let Some(duration) =
-            resolved_timeout
-        {
-            use asupersync::time::{sleep, wall_now};
-            use futures::future::{Either, FutureExt, select};
-
-            let asupersync_now = asupersync::Cx::current()
-                .and_then(|cx| cx.timer_driver())
-                .map_or_else(wall_now, |timer| timer.now());
-
-            let sleep_fut = sleep(asupersync_now, duration).fuse();
-            let send_fut = send_fut.fuse();
-            futures::pin_mut!(sleep_fut, send_fut);
-
-            let (status, response_headers, stream) = match select(send_fut, sleep_fut).await {
-                Either::Left((res, _)) => res?,
-                Either::Right(_) => return Err(Error::api(timeout_error_message(&url, duration))),
-            };
-            (
-                status,
-                response_headers,
-                stream,
-                Some((asupersync_now, duration)),
-            )
-        } else {
-            let (status, response_headers, stream) = send_fut.await?;
-            (status, response_headers, stream, None)
-        };
+        let (status, response_headers, stream) =
+            send_parts(client, method, &url, &headers, &body, resolved_timeout).await?;
 
         Ok(Response {
             status,
             headers: response_headers,
             stream,
-            timeout_info,
+            idle_timeout: resolved_timeout,
         })
     }
-}
-
-/// Like `write_all`, but retries on `Ok(0)` with exponential backoff instead
-/// of immediately failing with `ErrorKind::WriteZero`.
-///
-/// TLS transports (and, less commonly, TCP under memory pressure) can return
-/// `Ok(0)` from `write()` when internal buffers are temporarily full.  The
-/// standard `write_all` implementation treats this as an unrecoverable error,
-/// which causes spurious "IO error: write zero" failures — especially for
-/// large request bodies such as resumed session contexts.
-async fn write_all_with_retry<W: AsyncWrite + Unpin>(
-    writer: &mut W,
-    mut buf: &[u8],
-) -> std::io::Result<()> {
-    use asupersync::time::{sleep, wall_now};
-
-    let mut consecutive_zeros: usize = 0;
-    let mut backoff = WRITE_ZERO_BACKOFF;
-
-    while !buf.is_empty() {
-        let n = futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_write(cx, buf)).await?;
-
-        if n == 0 {
-            consecutive_zeros += 1;
-            if consecutive_zeros > WRITE_ZERO_MAX_RETRIES {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    format!(
-                        "transport returned Ok(0) {} consecutive times ({} bytes remaining)",
-                        consecutive_zeros,
-                        buf.len(),
-                    ),
-                ));
-            }
-            tracing::debug!(
-                attempt = consecutive_zeros,
-                remaining = buf.len(),
-                backoff_ms = backoff.as_millis(),
-                "write returned Ok(0), backing off before retry"
-            );
-
-            // Flushing the writer is crucial when TLS buffers are full, otherwise
-            // we will sleep and retry without any progress being made. If flush
-            // itself fails, surface that real transport error immediately rather
-            // than misreporting the retry loop as a generic write-zero failure.
-            futures::future::poll_fn(|cx| Pin::new(&mut *writer).poll_flush(cx)).await?;
-
-            let now = asupersync::Cx::current()
-                .and_then(|cx| cx.timer_driver())
-                .map_or_else(wall_now, |timer| timer.now());
-            sleep(now, backoff).await;
-
-            // Exponential backoff: 10ms, 20ms, 40ms, …
-            backoff = backoff.saturating_mul(2);
-        } else {
-            // Successful partial write — advance the buffer and reset retry state.
-            buf = &buf[n..];
-            consecutive_zeros = 0;
-            backoff = WRITE_ZERO_BACKOFF;
-        }
-    }
-    Ok(())
 }
 
 async fn send_parts(
@@ -488,41 +389,99 @@ async fn send_parts(
     url: &str,
     headers: &[(String, String)],
     body: &[u8],
+    timeout: Option<std::time::Duration>,
 ) -> Result<(
     u16,
-    Vec<(String, String)>,
+    ResponseHeaders,
     BoxStream<'static, std::io::Result<Vec<u8>>>,
 )> {
-    let parsed = ParsedUrl::parse(url).map_err(|e| Error::api(format!("Invalid URL: {e}")))?;
-    let mut transport = connect_transport(&parsed, client).await?;
+    let response = send_reqwest_request(
+        &client.http,
+        method,
+        url,
+        &client.user_agent,
+        headers,
+        body.to_vec(),
+        timeout,
+    )
+    .await?;
 
-    let request_bytes = build_request_bytes(method, &parsed, &client.user_agent, headers, body);
-    write_all_with_retry(&mut transport, &request_bytes).await?;
-    if !body.is_empty() {
-        write_all_with_retry(&mut transport, body).await?;
+    let status = response.status().as_u16();
+    let response_headers = response
+        .headers()
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                value.to_str().unwrap_or_default().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let stream = response
+        .bytes_stream()
+        .map(|chunk| {
+            chunk
+                .map(|bytes| bytes.to_vec())
+                .map_err(std::io::Error::other)
+        })
+        .boxed();
+    Ok((status, response_headers, stream))
+}
+
+async fn send_reqwest_request(
+    client: &reqwest::Client,
+    method: Method,
+    url: &str,
+    user_agent: &str,
+    headers: &[(String, String)],
+    body: Vec<u8>,
+    timeout: Option<std::time::Duration>,
+) -> Result<reqwest::Response> {
+    let method = match method {
+        Method::Get => reqwest::Method::GET,
+        Method::Post => reqwest::Method::POST,
+    };
+    let mut request = client.request(method, url);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
     }
-    transport.flush().await?;
 
-    let (status, response_headers, leftover) = Box::pin(read_response_head(&mut transport)).await?;
-    let body_kind = body_kind_from_response(status, &response_headers)?;
+    let effective_user_agent =
+        sanitize_header_value(header_value(headers, "user-agent").unwrap_or(user_agent));
+    request = request.header(reqwest::header::USER_AGENT, effective_user_agent);
 
-    let state = BodyStreamState::new(transport, body_kind, leftover);
-    let stream = stream::try_unfold(state, |mut state| async move {
-        match Box::pin(state.next_bytes()).await {
-            Ok(Some(chunk)) => Ok(Some((chunk, state))),
-            Ok(None) => {
-                state.shutdown_transport_best_effort().await;
-                Ok(None)
-            }
-            Err(err) => {
-                state.shutdown_transport_best_effort().await;
-                Err(err)
-            }
+    for (name, value) in headers {
+        let clean_name = sanitize_header_name(name);
+        if clean_name.is_empty()
+            || clean_name.eq_ignore_ascii_case("host")
+            || clean_name.eq_ignore_ascii_case("user-agent")
+            || clean_name.eq_ignore_ascii_case("content-length")
+            || clean_name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
+        let header_name = reqwest::header::HeaderName::from_bytes(clean_name.as_bytes())
+            .map_err(|err| Error::api(format!("Invalid HTTP request header name: {err}")))?;
+        let clean_value = sanitize_header_value(value);
+        let header_value = reqwest::header::HeaderValue::from_str(&clean_value)
+            .map_err(|err| Error::api(format!("Invalid HTTP request header value: {err}")))?;
+        request = request.header(header_name, header_value);
+    }
+
+    if !body.is_empty() {
+        request = request.body(body);
+    }
+
+    request.send().await.map_err(|err| {
+        if err.is_timeout() {
+            Error::api(timeout.map_or_else(
+                || "Request timed out".to_string(),
+                |duration| timeout_error_message(url, duration),
+            ))
+        } else {
+            Error::api(format!("HTTP request failed: {err}"))
         }
     })
-    .boxed();
-
-    Ok((status, response_headers, stream))
 }
 
 fn build_recorded_request(
@@ -563,61 +522,14 @@ pub struct Response {
     status: u16,
     headers: Vec<(String, String)>,
     stream: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>,
-    timeout_info: Option<(asupersync::Time, std::time::Duration)>,
+    idle_timeout: Option<std::time::Duration>,
 }
 
 fn wrap_stream_with_idle_timeout(
     stream: Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>>,
-    timeout_info: Option<(asupersync::Time, std::time::Duration)>,
+    _idle_timeout: Option<std::time::Duration>,
 ) -> Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>> {
-    let Some((start_time, timeout)) = timeout_info else {
-        return stream;
-    };
-
-    Box::pin(futures::stream::unfold(
-        (stream, start_time, timeout),
-        |(mut stream, mut last_activity, timeout)| async move {
-            use asupersync::time::{sleep, wall_now};
-            use futures::future::{Either, FutureExt, select};
-
-            let asupersync_now = asupersync::Cx::current()
-                .and_then(|cx| cx.timer_driver())
-                .map_or_else(wall_now, |timer| timer.now());
-
-            let elapsed =
-                std::time::Duration::from_nanos(asupersync_now.duration_since(last_activity));
-            if elapsed >= timeout {
-                return Some((
-                    Err(std::io::Error::other(
-                        "Request timed out reading body stream",
-                    )),
-                    (stream, last_activity, timeout),
-                ));
-            }
-
-            let remaining = timeout.checked_sub(elapsed).unwrap_or_default();
-            let sleep_fut = sleep(asupersync_now, remaining).fuse();
-            let next_fut = stream.next().fuse();
-            futures::pin_mut!(sleep_fut, next_fut);
-
-            match select(next_fut, sleep_fut).await {
-                Either::Left((Some(res), _)) => {
-                    let now = asupersync::Cx::current()
-                        .and_then(|cx| cx.timer_driver())
-                        .map_or_else(wall_now, |timer| timer.now());
-                    last_activity = now;
-                    Some((res, (stream, last_activity, timeout)))
-                }
-                Either::Left((None, _)) => None,
-                Either::Right(_) => Some((
-                    Err(std::io::Error::other(
-                        "Request timed out reading body stream",
-                    )),
-                    (stream, last_activity, timeout),
-                )),
-            }
-        },
-    ))
+    stream
 }
 
 impl Response {
@@ -633,11 +545,11 @@ impl Response {
 
     #[must_use]
     pub fn bytes_stream(self) -> Pin<Box<dyn Stream<Item = std::io::Result<Vec<u8>>> + Send>> {
-        wrap_stream_with_idle_timeout(self.stream, self.timeout_info)
+        wrap_stream_with_idle_timeout(self.stream, self.idle_timeout)
     }
 
     pub async fn text(self) -> Result<String> {
-        let stream = wrap_stream_with_idle_timeout(self.stream, self.timeout_info);
+        let stream = wrap_stream_with_idle_timeout(self.stream, self.idle_timeout);
         let bytes = stream
             .try_fold(Vec::new(), |mut acc, chunk| async move {
                 if acc.len().saturating_add(chunk.len()) > MAX_TEXT_BODY_BYTES {
@@ -662,26 +574,6 @@ impl Response {
         match String::from_utf8(bytes) {
             Ok(s) => Ok(s),
             Err(e) => Ok(String::from_utf8_lossy(e.as_bytes()).into_owned()),
-        }
-    }
-}
-
-async fn connect_transport(parsed: &ParsedUrl, client: &Client) -> Result<Transport> {
-    let addr = (parsed.host.clone(), parsed.port);
-    let tcp = TcpStream::connect(addr).await?;
-    match parsed.scheme {
-        Scheme::Http => Ok(Transport::Tcp(tcp)),
-        Scheme::Https => {
-            let tls = client
-                .tls
-                .as_ref()
-                .map_err(|e| Error::api(format!("TLS configuration error: {e}")))?;
-            let tls_stream = tls
-                .clone()
-                .connect(&parsed.host, tcp)
-                .await
-                .map_err(|e| Error::api(format!("TLS connect failed: {e}")))?;
-            Ok(Transport::Tls(Box::new(tls_stream)))
         }
     }
 }
@@ -742,9 +634,10 @@ fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a s
     })
 }
 
+#[cfg(test)]
 fn build_request_bytes(
     method: Method,
-    parsed: &ParsedUrl,
+    parsed: &url::Url,
     user_agent: &str,
     headers: &[(String, String)],
     body: &[u8],
@@ -755,7 +648,11 @@ fn build_request_bytes(
     let host_header = host_header_value(parsed);
     let _ = std::fmt::Write::write_fmt(
         &mut out,
-        format_args!("{} {} HTTP/1.1\r\n", method.as_str(), parsed.path),
+        format_args!(
+            "{} {} HTTP/1.1\r\n",
+            method.as_str(),
+            request_target(parsed)
+        ),
     );
     let _ = std::fmt::Write::write_fmt(&mut out, format_args!("Host: {host_header}\r\n"));
     let _ = std::fmt::Write::write_fmt(
@@ -786,56 +683,44 @@ fn build_request_bytes(
     out.into_bytes()
 }
 
-fn host_header_value(parsed: &ParsedUrl) -> String {
-    let host = if parsed.host.contains(':') && !parsed.host.starts_with('[') {
-        format!("[{}]", parsed.host)
+#[cfg(test)]
+fn request_target(parsed: &url::Url) -> String {
+    let mut target = parsed.path().to_string();
+    if target.is_empty() {
+        target.push('/');
+    }
+    if let Some(query) = parsed.query() {
+        target.push('?');
+        target.push_str(query);
+    }
+    target
+}
+
+#[cfg(test)]
+fn host_header_value(parsed: &url::Url) -> String {
+    let host_str = parsed.host_str().unwrap_or_default();
+    let host = if host_str.contains(':') && !host_str.starts_with('[') {
+        format!("[{host_str}]")
     } else {
-        parsed.host.clone()
+        host_str.to_string()
     };
 
-    let default_port = match parsed.scheme {
-        Scheme::Http => 80,
-        Scheme::Https => 443,
+    let default_port = match parsed.scheme() {
+        "http" => 80,
+        "https" => 443,
+        _ => 0,
     };
 
-    if parsed.port == default_port {
+    if parsed.port_or_known_default() == Some(default_port) {
         host
-    } else {
+    } else if let Some(port) = parsed.port() {
         format!("{host}:{}", parsed.port)
+    } else {
+        host
     }
 }
 
-async fn read_response_head(
-    transport: &mut Transport,
-) -> Result<(u16, Vec<(String, String)>, Vec<u8>)> {
-    let mut buf = Vec::with_capacity(8192);
-    let mut scratch = [0u8; READ_CHUNK_BYTES];
-    let mut search_start = 0;
-
-    loop {
-        if buf.len() > MAX_HEADER_BYTES {
-            return Err(Error::api("HTTP response headers too large"));
-        }
-
-        let haystack = &buf[search_start..];
-        if let Some(pos) = find_headers_end(haystack) {
-            let absolute_pos = search_start + pos;
-            let head = &buf[..absolute_pos];
-            let leftover = buf[absolute_pos..].to_vec();
-            let (status, headers) = parse_response_head(head)?;
-            return Ok((status, headers, leftover));
-        }
-
-        let n = read_some(transport, &mut scratch).await?;
-        if n == 0 {
-            return Err(Error::api("HTTP connection closed before headers"));
-        }
-        let old_len = buf.len();
-        buf.extend_from_slice(&scratch[..n]);
-        search_start = old_len.saturating_sub(3);
-    }
-}
-
+#[cfg(test)]
 fn find_headers_end(buf: &[u8]) -> Option<usize> {
     for i in 0..buf.len().saturating_sub(1) {
         if buf[i..].starts_with(b"\r\n\r\n") {
@@ -848,6 +733,7 @@ fn find_headers_end(buf: &[u8]) -> Option<usize> {
     None
 }
 
+#[cfg(test)]
 fn parse_response_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>)> {
     let text =
         std::str::from_utf8(head).map_err(|e| Error::api(format!("Invalid HTTP headers: {e}")))?;
@@ -882,6 +768,7 @@ fn parse_response_head(head: &[u8]) -> Result<(u16, Vec<(String, String)>)> {
 }
 
 #[derive(Debug, Clone, Copy)]
+#[cfg(test)]
 enum BodyKind {
     Empty,
     ContentLength(usize),
@@ -889,6 +776,7 @@ enum BodyKind {
     Eof,
 }
 
+#[cfg(test)]
 fn body_kind_from_response(status: u16, headers: &[(String, String)]) -> Result<BodyKind> {
     if matches!(status, 100..=199 | 204 | 205 | 304) {
         return Ok(BodyKind::Empty);
@@ -896,6 +784,7 @@ fn body_kind_from_response(status: u16, headers: &[(String, String)]) -> Result<
     body_kind_from_headers(headers)
 }
 
+#[cfg(test)]
 fn body_kind_from_headers(headers: &[(String, String)]) -> Result<BodyKind> {
     let mut content_length = None;
     let mut transfer_encodings = Vec::new();
@@ -949,11 +838,13 @@ fn body_kind_from_headers(headers: &[(String, String)]) -> Result<BodyKind> {
     })
 }
 
+#[cfg(test)]
 struct Buffer {
     bytes: Vec<u8>,
     pos: usize,
 }
 
+#[cfg(test)]
 impl Buffer {
     const fn new(initial: Vec<u8>) -> Self {
         Self {
@@ -1001,6 +892,7 @@ impl Buffer {
     }
 }
 
+#[cfg(test)]
 enum ChunkedState {
     SizeLine,
     Data { remaining: usize },
@@ -1009,8 +901,9 @@ enum ChunkedState {
     Done,
 }
 
+#[cfg(test)]
 struct BodyStreamState {
-    transport: Transport,
+    transport: Box<dyn futures::io::AsyncReadWrite + Unpin + Send>,
     kind: BodyKind,
     buf: Buffer,
     chunked_state: ChunkedState,
@@ -1018,8 +911,13 @@ struct BodyStreamState {
     transport_closed: bool,
 }
 
+#[cfg(test)]
 impl BodyStreamState {
-    const fn new(transport: Transport, kind: BodyKind, leftover: Vec<u8>) -> Self {
+    fn new(
+        transport: Box<dyn futures::io::AsyncReadWrite + Unpin + Send>,
+        kind: BodyKind,
+        leftover: Vec<u8>,
+    ) -> Self {
         let remaining = match kind {
             BodyKind::ContentLength(n) => n,
             _ => 0,
@@ -1222,6 +1120,7 @@ impl BodyStreamState {
     }
 }
 
+#[cfg(test)]
 fn find_crlf(buf: &[u8]) -> Option<(usize, usize)> {
     for i in 0..buf.len() {
         if buf[i..].starts_with(b"\r\n") {
@@ -1234,71 +1133,23 @@ fn find_crlf(buf: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
-async fn read_some<R: AsyncRead + Unpin>(reader: &mut R, dst: &mut [u8]) -> std::io::Result<usize> {
-    futures::future::poll_fn(|cx| {
-        let mut read_buf = ReadBuf::new(dst);
-        match Pin::new(&mut *reader).poll_read(cx, &mut read_buf) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(Ok(())) => Poll::Ready(Ok(read_buf.filled().len())),
-            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
-        }
+#[cfg(test)]
+async fn read_some<R: futures::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    dst: &mut [u8],
+) -> std::io::Result<usize> {
+    futures::future::poll_fn(|cx| match Pin::new(&mut *reader).poll_read(cx, dst) {
+        std::task::Poll::Pending => std::task::Poll::Pending,
+        std::task::Poll::Ready(Ok(n)) => std::task::Poll::Ready(Ok(n)),
+        std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
     })
     .await
-}
-
-#[derive(Debug)]
-enum Transport {
-    Tcp(TcpStream),
-    Tls(Box<asupersync::tls::TlsStream<TcpStream>>),
-}
-
-impl Unpin for Transport {}
-
-impl AsyncRead for Transport {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            Self::Tcp(stream) => Pin::new(stream).poll_read(cx, buf),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_read(cx, buf),
-        }
-    }
-}
-
-impl AsyncWrite for Transport {
-    fn poll_write(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &[u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match &mut *self {
-            Self::Tcp(stream) => Pin::new(stream).poll_write(cx, buf),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_write(cx, buf),
-        }
-    }
-
-    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            Self::Tcp(stream) => Pin::new(stream).poll_flush(cx),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_flush(cx),
-        }
-    }
-
-    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        match &mut *self {
-            Self::Tcp(stream) => Pin::new(stream).poll_shutdown(cx),
-            Self::Tls(stream) => Pin::new(&mut **stream).poll_shutdown(cx),
-        }
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
-    use std::collections::VecDeque;
 
     // ── Method ──────────────────────────────────────────────────────────
     #[test]
@@ -1547,7 +1398,7 @@ mod tests {
     // ── build_request_bytes ────────────────────────────────────────────
     #[test]
     fn build_request_bytes_get() {
-        let parsed = ParsedUrl::parse("http://example.com/api/test").unwrap();
+        let parsed = url::Url::parse("http://example.com/api/test").unwrap();
         let bytes = build_request_bytes(Method::Get, &parsed, "test-agent", &[], &[]);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.starts_with("GET /api/test HTTP/1.1\r\n"));
@@ -1559,7 +1410,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_post_with_body() {
-        let parsed = ParsedUrl::parse("https://api.example.com/v1/messages").unwrap();
+        let parsed = url::Url::parse("https://api.example.com/v1/messages").unwrap();
         let body = b"hello world";
         let headers = vec![("Content-Type".to_string(), "application/json".to_string())];
         let bytes = build_request_bytes(Method::Post, &parsed, "pi/0.1", &headers, body);
@@ -1572,7 +1423,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_custom_headers() {
-        let parsed = ParsedUrl::parse("http://localhost/test").unwrap();
+        let parsed = url::Url::parse("http://localhost/test").unwrap();
         let headers = vec![
             ("Authorization".to_string(), "Bearer sk-test".to_string()),
             ("X-Custom".to_string(), "value".to_string()),
@@ -1585,7 +1436,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_reserved_headers_are_canonicalized() {
-        let parsed = ParsedUrl::parse("https://api.example.com/v1/messages").unwrap();
+        let parsed = url::Url::parse("https://api.example.com/v1/messages").unwrap();
         let headers = vec![
             ("Host".to_string(), "spoofed.example.com".to_string()),
             ("User-Agent".to_string(), "custom-agent".to_string()),
@@ -1613,7 +1464,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_non_default_port_includes_port_in_host_header() {
-        let parsed = ParsedUrl::parse("http://example.com:8080/api/test").unwrap();
+        let parsed = url::Url::parse("http://example.com:8080/api/test").unwrap();
         let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[]);
         let text = String::from_utf8(bytes).unwrap();
 
@@ -1622,7 +1473,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_sanitizes_overridden_user_agent() {
-        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let parsed = url::Url::parse("http://example.com/test").unwrap();
         let headers = vec![(
             "User-Agent".to_string(),
             "custom-agent\r\nX-Injected: nope".to_string(),
@@ -1965,83 +1816,6 @@ mod tests {
         assert!(!remote.contains("Ollama"));
     }
 
-    struct MockRetryWriter {
-        writes: VecDeque<std::io::Result<usize>>,
-        flushes: VecDeque<std::io::Result<()>>,
-        written: Vec<u8>,
-    }
-
-    impl MockRetryWriter {
-        fn new(
-            writes: impl IntoIterator<Item = std::io::Result<usize>>,
-            flushes: impl IntoIterator<Item = std::io::Result<()>>,
-        ) -> Self {
-            Self {
-                writes: writes.into_iter().collect(),
-                flushes: flushes.into_iter().collect(),
-                written: Vec::new(),
-            }
-        }
-    }
-
-    impl AsyncWrite for MockRetryWriter {
-        fn poll_write(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<std::io::Result<usize>> {
-            let result = self.writes.pop_front().unwrap_or(Ok(buf.len()));
-            if let Ok(written) = result {
-                self.written
-                    .extend_from_slice(&buf[..written.min(buf.len())]);
-            }
-            Poll::Ready(result)
-        }
-
-        fn poll_flush(
-            mut self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Poll::Ready(self.flushes.pop_front().unwrap_or(Ok(())))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
-    }
-
-    #[test]
-    fn write_all_with_retry_propagates_flush_error_after_zero_write() {
-        asupersync::test_utils::run_test(|| async {
-            let mut writer = MockRetryWriter::new(
-                [Ok(0)],
-                [Err(std::io::Error::new(
-                    std::io::ErrorKind::BrokenPipe,
-                    "flush failed",
-                ))],
-            );
-
-            let err = write_all_with_retry(&mut writer, b"hello")
-                .await
-                .expect_err("flush failure should not be swallowed");
-            assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
-            assert_eq!(err.to_string(), "flush failed");
-            assert!(writer.written.is_empty());
-        });
-    }
-
-    #[test]
-    fn write_all_with_retry_recovers_after_zero_write_when_flush_succeeds() {
-        asupersync::test_utils::run_test(|| async {
-            let mut writer = MockRetryWriter::new([Ok(0), Ok(2), Ok(3)], [Ok(())]);
-
-            write_all_with_retry(&mut writer, b"hello")
-                .await
-                .expect("retry helper should recover after transient zero write");
-            assert_eq!(writer.written, b"hello");
-        });
-    }
-
     // ── Response ───────────────────────────────────────────────────────
     #[test]
     fn response_accessors() {
@@ -2049,7 +1823,7 @@ mod tests {
             status: 200,
             headers: vec![("Content-Type".to_string(), "text/plain".to_string())],
             stream: Box::pin(futures::stream::empty()),
-            timeout_info: None,
+            idle_timeout: None,
         };
         assert_eq!(response.status(), 200);
         assert_eq!(response.headers().len(), 1);
@@ -2058,13 +1832,13 @@ mod tests {
 
     #[test]
     fn response_text() {
-        asupersync::test_utils::run_test(|| async {
+        futures::executor::block_on(async {
             let chunks = vec![Ok(b"hello ".to_vec()), Ok(b"world".to_vec())];
             let response = Response {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
-                timeout_info: None,
+                idle_timeout: None,
             };
             let text = response.text().await.unwrap();
             assert_eq!(text, "hello world");
@@ -2073,12 +1847,12 @@ mod tests {
 
     #[test]
     fn response_text_empty() {
-        asupersync::test_utils::run_test(|| async {
+        futures::executor::block_on(async {
             let response = Response {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::empty()),
-                timeout_info: None,
+                idle_timeout: None,
             };
             let text = response.text().await.unwrap();
             assert_eq!(text, "");
@@ -2087,13 +1861,13 @@ mod tests {
 
     #[test]
     fn response_bytes_stream() {
-        asupersync::test_utils::run_test(|| async {
+        futures::executor::block_on(async {
             let chunks = vec![Ok(b"data".to_vec())];
             let response = Response {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
-                timeout_info: None,
+                idle_timeout: None,
             };
             let mut stream = response.bytes_stream();
             let first = stream.next().await.unwrap().unwrap();
@@ -2105,7 +1879,7 @@ mod tests {
     // ── Body stream via Response (in-memory) ──────────────────────────
     #[test]
     fn body_stream_content_length_via_response() {
-        asupersync::test_utils::run_test(|| async {
+        futures::executor::block_on(async {
             // Simulate a content-length response by providing exact chunks
             let body = b"Hello, World!";
             let chunks: Vec<std::io::Result<Vec<u8>>> = vec![Ok(body.to_vec())];
@@ -2113,7 +1887,7 @@ mod tests {
                 status: 200,
                 headers: vec![("Content-Length".to_string(), "13".to_string())],
                 stream: Box::pin(futures::stream::iter(chunks)),
-                timeout_info: None,
+                idle_timeout: None,
             };
             let text = response.text().await.unwrap();
             assert_eq!(text, "Hello, World!");
@@ -2122,7 +1896,7 @@ mod tests {
 
     #[test]
     fn body_stream_multiple_chunks_via_response() {
-        asupersync::test_utils::run_test(|| async {
+        futures::executor::block_on(async {
             let chunks: Vec<std::io::Result<Vec<u8>>> = vec![
                 Ok(b"chunk1".to_vec()),
                 Ok(b"chunk2".to_vec()),
@@ -2132,7 +1906,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
-                timeout_info: None,
+                idle_timeout: None,
             };
             let text = response.text().await.unwrap();
             assert_eq!(text, "chunk1chunk2chunk3");
@@ -2141,7 +1915,7 @@ mod tests {
 
     #[test]
     fn body_stream_error_propagation() {
-        asupersync::test_utils::run_test(|| async {
+        futures::executor::block_on(async {
             let chunks: Vec<std::io::Result<Vec<u8>>> = vec![
                 Ok(b"data".to_vec()),
                 Err(std::io::Error::new(
@@ -2153,7 +1927,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
-                timeout_info: None,
+                idle_timeout: None,
             };
             let result = response.text().await;
             assert!(result.is_err());
@@ -2219,7 +1993,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_empty_path() {
-        let parsed = ParsedUrl::parse("http://example.com").unwrap();
+        let parsed = url::Url::parse("http://example.com").unwrap();
         let bytes = build_request_bytes(Method::Get, &parsed, "agent", &[], &[]);
         let text = String::from_utf8(bytes).unwrap();
         // Should have "/" as path
@@ -2250,7 +2024,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_strips_crlf_from_headers() {
-        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let parsed = url::Url::parse("http://example.com/test").unwrap();
         let headers = vec![(
             "X-Injected\r\nEvil".to_string(),
             "value\r\nX-Bad: smuggled".to_string(),
@@ -2265,7 +2039,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_strips_invalid_chars_from_header_names() {
-        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let parsed = url::Url::parse("http://example.com/test").unwrap();
         let headers = vec![("X:Injected Header".to_string(), "value".to_string())];
         let bytes = build_request_bytes(Method::Get, &parsed, "agent", &headers, &[]);
         let text = String::from_utf8(bytes).unwrap();
@@ -2276,7 +2050,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_drops_headers_that_normalize_to_reserved_names() {
-        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let parsed = url::Url::parse("http://example.com/test").unwrap();
         let headers = vec![
             ("Host:".to_string(), "evil.example".to_string()),
             ("Content-Length ".to_string(), "999".to_string()),
@@ -2295,7 +2069,7 @@ mod tests {
 
     #[test]
     fn build_request_bytes_drops_transfer_encoding_header() {
-        let parsed = ParsedUrl::parse("http://example.com/test").unwrap();
+        let parsed = url::Url::parse("http://example.com/test").unwrap();
         let headers = vec![("Transfer-Encoding".to_string(), "chunked".to_string())];
         let body = b"hello";
         let bytes = build_request_bytes(Method::Post, &parsed, "agent", &headers, body);
@@ -2308,7 +2082,7 @@ mod tests {
     // ── Response body size limit ──────────────────────────────────────
     #[test]
     fn response_text_rejects_oversized_body() {
-        asupersync::test_utils::run_test(|| async {
+        futures::executor::block_on(async {
             // Create a stream that would exceed MAX_TEXT_BODY_BYTES
             let big_chunk = vec![0u8; MAX_TEXT_BODY_BYTES + 1];
             let chunks: Vec<std::io::Result<Vec<u8>>> = vec![Ok(big_chunk)];
@@ -2316,7 +2090,7 @@ mod tests {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
-                timeout_info: None,
+                idle_timeout: None,
             };
             let result = response.text().await;
             assert!(result.is_err());
@@ -2330,14 +2104,14 @@ mod tests {
 
     #[test]
     fn response_text_accepts_body_at_limit() {
-        asupersync::test_utils::run_test(|| async {
+        futures::executor::block_on(async {
             let chunk = vec![b'a'; MAX_TEXT_BODY_BYTES];
             let chunks: Vec<std::io::Result<Vec<u8>>> = vec![Ok(chunk)];
             let response = Response {
                 status: 200,
                 headers: Vec::new(),
                 stream: Box::pin(futures::stream::iter(chunks)),
-                timeout_info: None,
+                idle_timeout: None,
             };
             let result = response.text().await;
             assert!(result.is_ok());
@@ -2363,7 +2137,7 @@ mod tests {
     fn antigravity_user_agent_in_request_headers() {
         // Simulate the antigravity user agent being used in request building.
         let ua = format!("{DEFAULT_USER_AGENT} Antigravity/42.0");
-        let parsed = ParsedUrl::parse("http://example.com/api").unwrap();
+        let parsed = url::Url::parse("http://example.com/api").unwrap();
         let bytes = build_request_bytes(Method::Get, &parsed, &ua, &[], &[]);
         let text = String::from_utf8(bytes).unwrap();
         assert!(text.contains(&format!("User-Agent: {ua}\r\n")));

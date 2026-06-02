@@ -11,10 +11,10 @@
 //! - **Token tracking**: Real-time cost and token usage display
 //! - **Markdown rendering**: Assistant responses rendered with syntax highlighting
 
-use asupersync::Cx;
-use asupersync::channel::mpsc;
-use asupersync::runtime::RuntimeHandle;
-use asupersync::sync::Mutex;
+use crate::Cx;
+use crate::channel::mpsc;
+use crate::runtime::RuntimeHandle;
+use crate::sync::Mutex;
 use bubbles::spinner::{SpinnerModel, TickMsg as SpinnerTickMsg, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
@@ -654,7 +654,7 @@ impl PiApp {
             SettingsUiEntry::SteeringMode | SettingsUiEntry::FollowUpMode => {
                 self.toggle_queue_mode_setting(entry);
             }
-            SettingsUiEntry::DefaultPermissive => {}
+            SettingsUiEntry::DefaultPermissive | SettingsUiEntry::Summary => {}
             SettingsUiEntry::QuietStartup => {
                 let next = !self.config.quiet_startup.unwrap_or(false);
                 if self.persist_project_settings_patch(
@@ -766,7 +766,6 @@ impl PiApp {
                 picker.max_visible = overlay_max_visible(self.term_height);
                 self.theme_picker = Some(picker);
             }
-            SettingsUiEntry::Summary => {}
         }
     }
 
@@ -2292,7 +2291,7 @@ impl PiApp {
             resource_cli,
             cwd,
             model_entry,
-            model_entry_shared: model_entry_shared.clone(),
+            model_entry_shared,
             model_scope,
             available_models,
             model,

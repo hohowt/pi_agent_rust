@@ -1,18 +1,107 @@
 //! Capability-scoped async context for Pi.
 //!
-//! Pi builds on `asupersync` which provides a capability-based [`asupersync::Cx`] for cancellation,
-//! budgeting, and deterministic testing hooks. Historically this codebase has sometimes passed raw
-//! `Cx` instances around ad-hoc (or constructed them at call sites), which makes it harder to audit
-//! the *intended* capability boundary between subsystems.
+//! Pi uses a capability-style context for cancellation and budgeting. Historically this codebase
+//! passed raw context instances around ad-hoc (or constructed them at call sites), which makes it
+//! harder to audit the *intended* capability boundary between subsystems.
 //!
 //! `AgentCx` is a thin, explicit wrapper used at API boundaries (agent loop ↔ tools ↔ sessions ↔
-//! RPC). It is intentionally small: it does **not** try to introduce a new runtime or replace
-//! `asupersync::Cx`; it just centralizes how Pi threads context through async code.
+//! RPC). It is intentionally small and centralizes how Pi threads context through async code.
 
-use asupersync::{Budget, Cx};
+use std::cell::RefCell;
 use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
+
+#[derive(Debug, Clone, Copy)]
+pub struct Budget {
+    pub deadline: Option<crate::Time>,
+}
+
+impl Budget {
+    pub const INFINITE: Self = Self { deadline: None };
+
+    #[must_use]
+    pub const fn with_deadline(mut self, deadline: crate::Time) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Cx {
+    budget: Budget,
+}
+
+thread_local! {
+    static CURRENT_CX: RefCell<Option<Cx>> = const { RefCell::new(None) };
+}
+
+pub struct CurrentCxGuard {
+    previous: Option<Cx>,
+}
+
+impl Drop for CurrentCxGuard {
+    fn drop(&mut self) {
+        let previous = self.previous.take();
+        CURRENT_CX.with(|slot| {
+            *slot.borrow_mut() = previous;
+        });
+    }
+}
+
+impl Cx {
+    pub fn current() -> Option<Self> {
+        CURRENT_CX.with(|slot| slot.borrow().clone())
+    }
+
+    pub fn set_current(cx: Option<Self>) -> CurrentCxGuard {
+        let previous = CURRENT_CX.with(|slot| slot.replace(cx));
+        CurrentCxGuard { previous }
+    }
+
+    pub const fn for_request() -> Self {
+        Self {
+            budget: Budget::INFINITE,
+        }
+    }
+
+    pub const fn for_request_with_budget(budget: Budget) -> Self {
+        Self { budget }
+    }
+
+    pub const fn for_testing() -> Self {
+        Self::for_request()
+    }
+
+    pub const fn for_testing_with_io() -> Self {
+        Self::for_request()
+    }
+
+    pub const fn for_testing_with_budget(budget: Budget) -> Self {
+        Self { budget }
+    }
+
+    pub const fn budget(&self) -> Budget {
+        self.budget
+    }
+
+    pub const fn timer_driver(&self) -> Option<TimerDriver> {
+        None
+    }
+
+    pub const fn checkpoint(&self) -> Result<(), std::convert::Infallible> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TimerDriver;
+
+impl TimerDriver {
+    pub fn now(&self) -> crate::Time {
+        crate::time::wall_now()
+    }
+}
 
 /// A capability-scoped context for agent operations.
 ///
@@ -47,7 +136,7 @@ impl AgentCx {
 
     /// Create a request-scoped context (infinite budget).
     #[must_use]
-    pub fn for_request() -> Self {
+    pub const fn for_request() -> Self {
         Self {
             cx: Cx::for_request(),
         }
@@ -55,7 +144,7 @@ impl AgentCx {
 
     /// Create a request-scoped context with an explicit budget.
     #[must_use]
-    pub fn for_request_with_budget(budget: Budget) -> Self {
+    pub const fn for_request_with_budget(budget: Budget) -> Self {
         Self {
             cx: Cx::for_request_with_budget(budget),
         }
@@ -63,7 +152,7 @@ impl AgentCx {
 
     /// Create a test-only context (infinite budget).
     #[must_use]
-    pub fn for_testing() -> Self {
+    pub const fn for_testing() -> Self {
         Self {
             cx: Cx::for_testing(),
         }
@@ -71,7 +160,7 @@ impl AgentCx {
 
     /// Create a test-only context with lab I/O capability.
     #[must_use]
-    pub fn for_testing_with_io() -> Self {
+    pub const fn for_testing_with_io() -> Self {
         Self {
             cx: Cx::for_testing_with_io(),
         }
@@ -92,7 +181,7 @@ impl AgentCx {
     /// Time capability accessor.
     #[must_use]
     pub const fn time(&self) -> AgentTime<'_> {
-        AgentTime { cx: self }
+        AgentTime { _cx: self }
     }
 
     /// HTTP capability accessor.
@@ -123,7 +212,7 @@ pub struct AgentFs<'a> {
 
 impl AgentFs<'_> {
     pub async fn read(&self, path: impl AsRef<Path>) -> std::io::Result<Vec<u8>> {
-        asupersync::fs::read(path).await
+        tokio::fs::read(path).await
     }
 
     pub async fn write(
@@ -131,27 +220,22 @@ impl AgentFs<'_> {
         path: impl AsRef<Path>,
         contents: impl AsRef<[u8]>,
     ) -> std::io::Result<()> {
-        asupersync::fs::write(path, contents).await
+        tokio::fs::write(path, contents).await
     }
 
     pub async fn create_dir_all(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
-        asupersync::fs::create_dir_all(path).await
+        tokio::fs::create_dir_all(path).await
     }
 }
 
 /// Time-related operations.
 pub struct AgentTime<'a> {
-    cx: &'a AgentCx,
+    _cx: &'a AgentCx,
 }
 
 impl AgentTime<'_> {
     pub async fn sleep(&self, duration: Duration) {
-        let now = self
-            .cx
-            .cx()
-            .timer_driver()
-            .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-        asupersync::time::sleep(now, duration).await;
+        tokio::time::sleep(duration).await;
     }
 }
 

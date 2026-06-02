@@ -12,15 +12,16 @@ test = false
 doctest = false
 
 [dependencies]
-asupersync = { version = "=0.3.2", default-features = false, features = ["tls-native-roots", "test-internals"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 memchr = "2.8.0"
 pi-core = { path = "../pi-core" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
 sha2 = "0.10"
+tokio = { version = "1", features = ["net", "rt-multi-thread", "time"] }
 tracing = "0.1"
 url = "2"
 

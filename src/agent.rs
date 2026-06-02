@@ -27,11 +27,12 @@ use crate::models::{
     ModelEntry, ModelRegistry, model_requires_configured_credential, normalize_api_key_opt,
 };
 use crate::provider::{Context, Provider, StreamOptions, ToolDef};
+use crate::runtime::RuntimeHandle;
 use crate::semantic_workspace_graph::{ContextBundleItem, SemanticContextBundle};
 use crate::session::{AutosaveFlushTrigger, Session};
+use crate::sync::{Mutex, Notify};
+use crate::time;
 use crate::tools::{Tool, ToolEffects, ToolOutput, ToolRegistry, ToolUpdate};
-use asupersync::runtime::{Runtime, RuntimeBuilder, RuntimeHandle};
-use asupersync::sync::{Mutex, Notify};
 use chrono::Utc;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -1520,7 +1521,7 @@ impl Agent {
                         }
 
                         let error_message = self.build_error_message(None, err_string.clone());
-                        let assistant_event_message = Message::assistant(error_message.clone());
+                        let assistant_event_message = Message::assistant(error_message);
                         self.messages.push(assistant_event_message.clone());
                         new_messages.push(assistant_event_message.clone());
                         on_event(AgentEvent::MessageStart {
@@ -1932,9 +1933,8 @@ impl Agent {
                     let now = checkpoint_cx
                         .cx()
                         .timer_driver()
-                        .map_or_else(asupersync::time::wall_now, |timer| timer.now());
-                    let tick_fut =
-                        asupersync::time::sleep(now, std::time::Duration::from_millis(25)).fuse();
+                        .map_or_else(time::wall_now, |timer| timer.now());
+                    let tick_fut = time::sleep(now, std::time::Duration::from_millis(25)).fuse();
                     futures::pin_mut!(tick_fut);
 
                     match futures::future::select(tick_fut, &mut event_fut).await {
@@ -2994,7 +2994,6 @@ pub struct AgentSession {
     save_enabled: bool,
     input_source: InputSource,
     compaction_settings: ResolvedCompactionSettings,
-    compaction_runtime: Option<Runtime>,
     runtime_handle: Option<RuntimeHandle>,
     compaction_worker: CompactionWorkerState,
     model_registry: Option<ModelRegistry>,
@@ -6886,7 +6885,6 @@ impl AgentSession {
             save_enabled,
             input_source: InputSource::Interactive,
             compaction_settings,
-            compaction_runtime: None,
             runtime_handle: None,
             compaction_worker: CompactionWorkerState::new(CompactionQuota::default()),
             model_registry: None,
@@ -6902,7 +6900,6 @@ impl AgentSession {
 
     #[must_use]
     pub fn with_runtime_handle(mut self, runtime_handle: RuntimeHandle) -> Self {
-        self.compaction_runtime = None;
         self.runtime_handle = Some(runtime_handle);
         self
     }
@@ -6948,7 +6945,7 @@ impl AgentSession {
         self.semantic_context_bundle.as_ref()
     }
 
-    pub fn set_queue_modes(&mut self, steering_mode: QueueMode, follow_up_mode: QueueMode) {
+    pub const fn set_queue_modes(&mut self, steering_mode: QueueMode, follow_up_mode: QueueMode) {
         self.agent.set_queue_modes(steering_mode, follow_up_mode);
     }
 
@@ -7282,18 +7279,14 @@ impl AgentSession {
         Ok(())
     }
 
-    fn compaction_runtime_handle(&mut self) -> Result<RuntimeHandle> {
+    fn compaction_runtime_handle(&self) -> Result<RuntimeHandle> {
         if let Some(runtime_handle) = self.runtime_handle.clone() {
             return Ok(runtime_handle);
         }
 
-        let runtime = RuntimeBuilder::new().build().map_err(|e| {
-            Error::session(format!("Background compaction runtime init failed: {e}"))
-        })?;
-        let runtime_handle = runtime.handle();
-        self.compaction_runtime = Some(runtime);
-        self.runtime_handle = Some(runtime_handle.clone());
-        Ok(runtime_handle)
+        Err(Error::session(
+            "Background compaction requires the application Tokio runtime handle",
+        ))
     }
 
     fn auto_compaction_result_payload(
@@ -9421,23 +9414,41 @@ mod tests {
     }
 
     #[test]
-    fn compaction_runtime_handle_creates_fallback_runtime() {
+    fn compaction_runtime_handle_requires_application_runtime_handle() {
         let dir = tempfile::tempdir().expect("tempdir");
         let auth_path = dir.path().join("auth.json");
         let auth = AuthStorage::load(auth_path).expect("load auth");
         let mut agent_session = build_switch_test_session(&auth);
 
-        assert!(agent_session.compaction_runtime.is_none());
         assert!(agent_session.runtime_handle.is_none());
+
+        let err = agent_session
+            .compaction_runtime_handle()
+            .expect_err("missing application runtime handle should fail");
+        assert!(
+            err.to_string()
+                .contains("requires the application Tokio runtime handle")
+        );
+    }
+
+    #[test]
+    fn compaction_runtime_handle_uses_injected_application_runtime_handle() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let auth_path = dir.path().join("auth.json");
+        let auth = AuthStorage::load(auth_path).expect("load auth");
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("build test runtime");
+        let mut agent_session =
+            build_switch_test_session(&auth).with_runtime_handle(runtime.handle());
+
+        assert!(agent_session.runtime_handle.is_some());
 
         let runtime_handle = agent_session
             .compaction_runtime_handle()
-            .expect("create fallback compaction runtime");
+            .expect("use injected compaction runtime handle");
         let join = runtime_handle.spawn(async { 7_u8 });
-        assert_eq!(futures::executor::block_on(join), 7);
-
-        assert!(agent_session.compaction_runtime.is_some());
-        assert!(agent_session.runtime_handle.is_some());
+        assert_eq!(runtime.block_on(join), 7);
     }
 
     #[test]
