@@ -10,7 +10,7 @@
   - Full init/sync for supported files.
   - Incremental sync for changed paths.
   - Removal handling for indexed files that no longer exist.
-- [ ] 3. Add query APIs matching codegraph-style behavior.
+- [x] 3. Add query APIs matching codegraph-style behavior.
   - `codegraph_search`
   - `codegraph_callers`
   - `codegraph_callees`

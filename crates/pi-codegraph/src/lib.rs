@@ -9,7 +9,7 @@
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::error::Error as StdError;
 use std::fmt;
 use std::fs;
@@ -54,6 +54,48 @@ pub struct IndexedFile {
     pub mtime_unix_ns: Option<u64>,
     pub symbol_count: usize,
     pub call_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeGraphSymbol {
+    pub source_path: String,
+    pub language_id: String,
+    pub kind: String,
+    pub name: String,
+    pub line_start: usize,
+    pub line_end: usize,
+    pub is_test: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeGraphCall {
+    pub source_path: String,
+    pub language_id: String,
+    pub caller: String,
+    pub callee: String,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeGraphNode {
+    pub symbol: CodeGraphSymbol,
+    pub callers: Vec<CodeGraphCall>,
+    pub callees: Vec<CodeGraphCall>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeGraphTrace {
+    pub from: String,
+    pub to: String,
+    pub path: Vec<CodeGraphCall>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeGraphImpact {
+    pub symbol: String,
+    pub depth: usize,
+    pub impacted_symbols: Vec<CodeGraphSymbol>,
+    pub paths: Vec<CodeGraphTrace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -185,6 +227,142 @@ impl CodeGraphIndex {
         Ok(files)
     }
 
+    pub fn search(&self, query: &str, limit: usize) -> CodeGraphResult<Vec<CodeGraphSymbol>> {
+        let conn = self.open_connection()?;
+        let pattern = format!("%{}%", escape_like(query));
+        let max_rows = bounded_limit(limit);
+        let mut stmt = conn.prepare(
+            "SELECT source_path, language_id, kind, name, line_start, line_end, is_test
+             FROM symbols
+             WHERE name LIKE ?1 ESCAPE '\\'
+                OR kind LIKE ?1 ESCAPE '\\'
+                OR source_path LIKE ?1 ESCAPE '\\'
+             ORDER BY
+                CASE WHEN name = ?2 THEN 0
+                     WHEN name LIKE ?1 ESCAPE '\\' THEN 1
+                     ELSE 2
+                END,
+                source_path,
+                line_start
+             LIMIT ?3",
+        )?;
+        let symbols = stmt
+            .query_map(params![pattern, query, max_rows], symbol_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(symbols)
+    }
+
+    pub fn callers(&self, symbol: &str, limit: usize) -> CodeGraphResult<Vec<CodeGraphCall>> {
+        self.calls_by_column("callee", symbol, limit)
+    }
+
+    pub fn callees(&self, symbol: &str, limit: usize) -> CodeGraphResult<Vec<CodeGraphCall>> {
+        self.calls_by_column("caller", symbol, limit)
+    }
+
+    pub fn node(&self, symbol: &str) -> CodeGraphResult<Option<CodeGraphNode>> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT source_path, language_id, kind, name, line_start, line_end, is_test
+             FROM symbols
+             WHERE name = ?1
+             ORDER BY source_path, line_start
+             LIMIT 1",
+        )?;
+        let symbol = stmt
+            .query_row(params![symbol], symbol_from_row)
+            .optional()?;
+        let Some(symbol) = symbol else {
+            return Ok(None);
+        };
+        let incoming = self.callers(&symbol.name, 100)?;
+        let outgoing = self.callees(&symbol.name, 100)?;
+        Ok(Some(CodeGraphNode {
+            symbol,
+            callers: incoming,
+            callees: outgoing,
+        }))
+    }
+
+    pub fn impact(&self, symbol: &str, depth: usize) -> CodeGraphResult<CodeGraphImpact> {
+        let max_depth = depth.clamp(1, 8);
+        let call_graph = self.load_calls()?;
+        let symbols = self.symbols_by_name()?;
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        let mut paths = Vec::new();
+        visited.insert(symbol.to_string());
+        queue.push_back((symbol.to_string(), Vec::<CodeGraphCall>::new(), 0usize));
+
+        while let Some((current, path, current_depth)) = queue.pop_front() {
+            if current_depth >= max_depth {
+                continue;
+            }
+            for call in call_graph.callers_of(&current) {
+                let next = call.caller.clone();
+                let mut next_path = path.clone();
+                next_path.push(call.clone());
+                paths.push(CodeGraphTrace {
+                    from: next.clone(),
+                    to: symbol.to_string(),
+                    path: next_path.clone(),
+                });
+                if visited.insert(next.clone()) {
+                    queue.push_back((next, next_path, current_depth + 1));
+                }
+            }
+        }
+
+        let impacted_symbols = visited
+            .iter()
+            .filter(|name| name.as_str() != symbol)
+            .filter_map(|name| symbols.get(name).cloned())
+            .collect();
+        Ok(CodeGraphImpact {
+            symbol: symbol.to_string(),
+            depth: max_depth,
+            impacted_symbols,
+            paths,
+        })
+    }
+
+    pub fn trace(
+        &self,
+        from: &str,
+        to: &str,
+        max_depth: usize,
+    ) -> CodeGraphResult<Option<CodeGraphTrace>> {
+        let max_depth = max_depth.clamp(1, 16);
+        let call_graph = self.load_calls()?;
+        let mut visited = BTreeSet::new();
+        let mut queue = VecDeque::new();
+        visited.insert(from.to_string());
+        queue.push_back((from.to_string(), Vec::<CodeGraphCall>::new()));
+
+        while let Some((current, path)) = queue.pop_front() {
+            if path.len() >= max_depth {
+                continue;
+            }
+            for call in call_graph.callees_of(&current) {
+                let next = call.callee.clone();
+                let mut next_path = path.clone();
+                next_path.push(call.clone());
+                if next == to {
+                    return Ok(Some(CodeGraphTrace {
+                        from: from.to_string(),
+                        to: to.to_string(),
+                        path: next_path,
+                    }));
+                }
+                if visited.insert(next.clone()) {
+                    queue.push_back((next, next_path));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
     fn sync_discovered_files(
         &self,
         mut absolute_paths: Vec<PathBuf>,
@@ -254,6 +432,65 @@ impl CodeGraphIndex {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?)
+    }
+
+    fn calls_by_column(
+        &self,
+        column: &str,
+        symbol: &str,
+        limit: usize,
+    ) -> CodeGraphResult<Vec<CodeGraphCall>> {
+        let conn = self.open_connection()?;
+        let sql = match column {
+            "caller" => {
+                "SELECT source_path, language_id, caller, callee, line
+                 FROM calls
+                 WHERE caller = ?1
+                 ORDER BY source_path, line
+                 LIMIT ?2"
+            }
+            "callee" => {
+                "SELECT source_path, language_id, caller, callee, line
+                 FROM calls
+                 WHERE callee = ?1
+                 ORDER BY source_path, line
+                 LIMIT ?2"
+            }
+            _ => unreachable!("invalid calls column"),
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let calls = stmt
+            .query_map(params![symbol, bounded_limit(limit)], call_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(calls)
+    }
+
+    fn load_calls(&self) -> CodeGraphResult<CallGraph> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT source_path, language_id, caller, callee, line
+             FROM calls
+             ORDER BY source_path, line",
+        )?;
+        let calls = stmt
+            .query_map([], call_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(CallGraph::new(calls))
+    }
+
+    fn symbols_by_name(&self) -> CodeGraphResult<BTreeMap<String, CodeGraphSymbol>> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT source_path, language_id, kind, name, line_start, line_end, is_test
+             FROM symbols
+             ORDER BY source_path, line_start",
+        )?;
+        let mut symbols = BTreeMap::new();
+        for symbol in stmt.query_map([], symbol_from_row)? {
+            let symbol = symbol?;
+            symbols.entry(symbol.name.clone()).or_insert(symbol);
+        }
+        Ok(symbols)
     }
 }
 
@@ -489,6 +726,78 @@ fn indexed_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedFil
         symbol_count: usize::try_from(symbol_count).unwrap_or_default(),
         call_count: usize::try_from(call_count).unwrap_or_default(),
     })
+}
+
+#[derive(Debug, Clone)]
+struct CallGraph {
+    by_caller: BTreeMap<String, Vec<CodeGraphCall>>,
+    by_callee: BTreeMap<String, Vec<CodeGraphCall>>,
+}
+
+impl CallGraph {
+    fn new(calls: Vec<CodeGraphCall>) -> Self {
+        let mut outgoing: BTreeMap<String, Vec<CodeGraphCall>> = BTreeMap::new();
+        let mut incoming: BTreeMap<String, Vec<CodeGraphCall>> = BTreeMap::new();
+        for call in calls {
+            outgoing
+                .entry(call.caller.clone())
+                .or_default()
+                .push(call.clone());
+            incoming.entry(call.callee.clone()).or_default().push(call);
+        }
+        Self {
+            by_caller: outgoing,
+            by_callee: incoming,
+        }
+    }
+
+    fn callees_of(&self, symbol: &str) -> &[CodeGraphCall] {
+        self.by_caller.get(symbol).map_or(&[], Vec::as_slice)
+    }
+
+    fn callers_of(&self, symbol: &str) -> &[CodeGraphCall] {
+        self.by_callee.get(symbol).map_or(&[], Vec::as_slice)
+    }
+}
+
+fn symbol_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeGraphSymbol> {
+    let line_start: i64 = row.get(4)?;
+    let line_end: i64 = row.get(5)?;
+    Ok(CodeGraphSymbol {
+        source_path: row.get(0)?,
+        language_id: row.get(1)?,
+        kind: row.get(2)?,
+        name: row.get(3)?,
+        line_start: usize::try_from(line_start).unwrap_or_default(),
+        line_end: usize::try_from(line_end).unwrap_or_default(),
+        is_test: row.get(6)?,
+    })
+}
+
+fn call_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodeGraphCall> {
+    let line: i64 = row.get(4)?;
+    Ok(CodeGraphCall {
+        source_path: row.get(0)?,
+        language_id: row.get(1)?,
+        caller: row.get(2)?,
+        callee: row.get(3)?,
+        line: usize::try_from(line).unwrap_or_default(),
+    })
+}
+
+fn bounded_limit(limit: usize) -> i64 {
+    i64::try_from(limit.clamp(1, 500)).unwrap_or(500)
+}
+
+fn escape_like(query: &str) -> String {
+    let mut escaped = String::with_capacity(query.len());
+    for ch in query.chars() {
+        if matches!(ch, '%' | '_' | '\\') {
+            escaped.push('\\');
+        }
+        escaped.push(ch);
+    }
+    escaped
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1100,6 +1409,71 @@ mod tests {
         let second = index.sync_project().expect("second sync");
         assert_eq!(second.removed_files, 1);
         assert!(index.indexed_files().expect("indexed files").is_empty());
+    }
+
+    #[test]
+    fn project_index_answers_codegraph_queries() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(
+            src.join("lib.rs"),
+            r"
+                fn leaf() {}
+
+                fn middle() {
+                    leaf();
+                }
+
+                fn root() {
+                    middle();
+                }
+            ",
+        )
+        .expect("write rust source");
+
+        let index = CodeGraphIndex::open(dir.path()).expect("open index");
+        index.sync_project().expect("sync");
+
+        let search = index.search("mid", 10).expect("search");
+        assert!(search.iter().any(|symbol| symbol.name == "middle"));
+
+        let incoming = index.callers("middle", 10).expect("callers");
+        assert_eq!(incoming.len(), 1);
+        assert_eq!(incoming[0].caller, "root");
+
+        let outgoing = index.callees("middle", 10).expect("callees");
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].callee, "leaf");
+
+        let node = index.node("middle").expect("node").expect("middle node");
+        assert_eq!(node.symbol.name, "middle");
+        assert_eq!(node.callers[0].caller, "root");
+        assert_eq!(node.callees[0].callee, "leaf");
+
+        let impact = index.impact("leaf", 4).expect("impact");
+        assert!(
+            impact
+                .impacted_symbols
+                .iter()
+                .any(|symbol| symbol.name == "middle")
+        );
+        assert!(
+            impact
+                .impacted_symbols
+                .iter()
+                .any(|symbol| symbol.name == "root")
+        );
+
+        let trace = index
+            .trace("root", "leaf", 4)
+            .expect("trace")
+            .expect("root reaches leaf");
+        assert_eq!(trace.path.len(), 2);
+        assert_eq!(trace.path[0].caller, "root");
+        assert_eq!(trace.path[0].callee, "middle");
+        assert_eq!(trace.path[1].caller, "middle");
+        assert_eq!(trace.path[1].callee, "leaf");
     }
 
     fn assert_has_call(calls: &[ExtractedCodeCall], from_symbol: &str, to_symbol: &str) {
