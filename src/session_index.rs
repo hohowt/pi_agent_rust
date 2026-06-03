@@ -942,14 +942,9 @@ impl Drop for LockGuard<'_> {
 }
 
 #[cfg(test)]
-#[path = "../tests/common/mod.rs"]
-mod test_common;
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
-    use super::test_common::TestHarness;
     use crate::model::UserContent;
     use crate::session::{EntryBase, MessageEntry, SessionInfoEntry, SessionMessage};
     use pretty_assertions::assert_eq;
@@ -960,6 +955,48 @@ mod tests {
     #[cfg(unix)]
     use std::process::Command;
     use std::time::{Duration, Instant};
+
+    struct TestHarness {
+        root: tempfile::TempDir,
+    }
+
+    impl TestHarness {
+        fn new(_name: &str) -> Self {
+            Self {
+                root: tempfile::tempdir().expect("create test tempdir"),
+            }
+        }
+
+        fn temp_path(&self, path: impl AsRef<Path>) -> PathBuf {
+            self.root.path().join(path)
+        }
+
+        const fn log(&self) -> TestLog {
+            TestLog
+        }
+
+        fn record_artifact(&self, _name: &str, path: &Path) {
+            assert!(
+                path.exists(),
+                "artifact path should exist: {}",
+                path.display()
+            );
+        }
+    }
+
+    struct TestLog;
+
+    impl TestLog {
+        fn info(&self, _event: &str, _message: impl std::fmt::Display) {}
+
+        fn info_ctx<F>(&self, _event: &str, _message: &str, f: F)
+        where
+            F: FnOnce(&mut Vec<(String, String)>),
+        {
+            let mut ctx = Vec::new();
+            f(&mut ctx);
+        }
+    }
 
     fn write_session_jsonl(path: &Path, header: &SessionHeader, entries: &[SessionEntry]) {
         let mut jsonl = String::new();
