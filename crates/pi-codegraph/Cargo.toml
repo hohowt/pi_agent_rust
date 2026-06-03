@@ -1,0 +1,27 @@
+[package]
+name = "pi-codegraph"
+version = "0.1.16"
+edition = "2024"
+rust-version = "1.85"
+license-file = "../../LICENSE"
+
+[lib]
+name = "pi_codegraph"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+tree-sitter = { workspace = true }
+tree-sitter-go = { workspace = true }
+tree-sitter-rust = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

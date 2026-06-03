@@ -7,6 +7,7 @@
 #![allow(clippy::missing_const_for_fn, clippy::too_many_lines)]
 
 use chrono::{DateTime, Duration, Utc};
+use pi_codegraph::{ExtractedCodeGraph, ExtractedCodeSymbol, extract_code_graph};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -17,7 +18,6 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::time::UNIX_EPOCH;
-use tree_sitter::{Node as TreeSitterNode, Parser as TreeSitterParser};
 
 pub const SEMANTIC_WORKSPACE_GRAPH_SCHEMA: &str = "pi.semantic_workspace_graph.v1";
 pub const GRAPH_BUILDER_SCHEMA: &str = "pi.semantic_workspace_graph.builder_trace.v1";
@@ -255,8 +255,8 @@ impl SemanticWorkspaceGraphBuilder {
 
         let content = String::from_utf8_lossy(&bytes);
         match input.surface {
-            SourceSurface::RustCodeModules | SourceSurface::IntegrationAndContractTests => {
-                Self::ingest_rust_file(input, &content, &content_sha256, size_bytes, state);
+            SourceSurface::CodeModules | SourceSurface::IntegrationAndContractTests => {
+                Self::ingest_code_file(input, &content, &content_sha256, size_bytes, state);
             }
             SourceSurface::ReadmeAndDocs => {
                 Self::ingest_markdown_file(input, &content, &content_sha256, size_bytes, state);
@@ -289,7 +289,7 @@ impl SemanticWorkspaceGraphBuilder {
             .checked_add(self.options.cache_ttl_seconds.checked_mul(1_000_000_000)?)
     }
 
-    fn ingest_rust_file(
+    fn ingest_code_file(
         input: &DiscoveredInput,
         content: &str,
         content_sha256: &str,
@@ -321,9 +321,9 @@ impl SemanticWorkspaceGraphBuilder {
             state.push_node(provider_node);
         }
 
-        let extracted = code_language_extractor_for_path(&input.source_path)
-            .and_then(|extractor| extractor.extract(&input.source_path, content))
+        let extracted = extract_code_graph(&input.source_path, content)
             .unwrap_or_else(|| parse_rust_symbols_by_line(content));
+        let language_id = extracted.language_id.as_str();
         let mut symbols_by_name = BTreeMap::new();
         for symbol in &extracted.symbols {
             let symbol_node = code_symbol_node(
@@ -337,7 +337,7 @@ impl SemanticWorkspaceGraphBuilder {
 
             if input.surface == SourceSurface::IntegrationAndContractTests
                 && symbol.is_test
-                && symbol.kind == "fn"
+                && is_test_function_kind(language_id, &symbol.kind)
             {
                 let test_node = test_case_node(
                     &input.source_path,
@@ -345,12 +345,13 @@ impl SemanticWorkspaceGraphBuilder {
                     symbol.line_start,
                     content_sha256,
                 );
-                let command_node = validation_command_node(&input.source_path, &symbol.name);
+                let command_node =
+                    validation_command_node(language_id, &input.source_path, &symbol.name);
                 state.push_edge(edge(
                     SemanticEdgeType::Exercises,
                     &file_node_id,
                     &test_node.id,
-                    "rust_test_case",
+                    test_case_edge_reason(language_id),
                 ));
                 state.push_edge(edge(
                     SemanticEdgeType::SuggestsValidation,
@@ -366,7 +367,7 @@ impl SemanticWorkspaceGraphBuilder {
                 SemanticEdgeType::Defines,
                 &file_node_id,
                 &symbol_node.id,
-                "rust_symbol",
+                symbol_edge_reason(language_id),
             ));
             symbols_by_name
                 .entry(symbol.name.clone())
@@ -399,7 +400,7 @@ impl SemanticWorkspaceGraphBuilder {
                 SemanticEdgeType::Calls,
                 &source_id,
                 &target_id,
-                "tree_sitter_rust_call",
+                call_edge_reason(language_id),
                 metadata,
             ));
         }
@@ -1557,7 +1558,7 @@ struct DiscoveredInput {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SourceSurface {
-    RustCodeModules,
+    CodeModules,
     IntegrationAndContractTests,
     ReadmeAndDocs,
     EvidenceArtifacts,
@@ -1569,7 +1570,7 @@ enum SourceSurface {
 impl SourceSurface {
     fn as_str(self) -> &'static str {
         match self {
-            Self::RustCodeModules => "rust_code_modules",
+            Self::CodeModules => "code_modules",
             Self::IntegrationAndContractTests => "integration_and_contract_tests",
             Self::ReadmeAndDocs => "readme_and_docs",
             Self::EvidenceArtifacts => "dropin_and_parity_evidence",
@@ -1802,63 +1803,6 @@ fn unsafe_changed_path_exclusion(node: &SemanticGraphNode) -> ContextBundleExclu
 struct ParsedRustSymbol {
     kind: String,
     name: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExtractedCodeGraph {
-    symbols: Vec<ExtractedCodeSymbol>,
-    calls: Vec<ExtractedCodeCall>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExtractedCodeSymbol {
-    kind: String,
-    name: String,
-    line_start: usize,
-    line_end: usize,
-    is_test: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExtractedCodeCall {
-    caller: String,
-    callee: String,
-    line: usize,
-}
-
-trait CodeLanguageExtractor {
-    fn language_id(&self) -> &'static str;
-    fn supports_path(&self, source_path: &str) -> bool;
-    fn extract(&self, source_path: &str, content: &str) -> Option<ExtractedCodeGraph>;
-}
-
-static RUST_TREE_SITTER_EXTRACTOR: RustTreeSitterExtractor = RustTreeSitterExtractor;
-
-fn code_language_extractor_for_path(
-    source_path: &str,
-) -> Option<&'static dyn CodeLanguageExtractor> {
-    let extractor = &RUST_TREE_SITTER_EXTRACTOR;
-    extractor.supports_path(source_path).then_some(extractor)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RustTreeSitterExtractor;
-
-impl CodeLanguageExtractor for RustTreeSitterExtractor {
-    fn language_id(&self) -> &'static str {
-        "rust"
-    }
-
-    fn supports_path(&self, source_path: &str) -> bool {
-        has_extension(source_path, "rs")
-    }
-
-    fn extract(&self, source_path: &str, content: &str) -> Option<ExtractedCodeGraph> {
-        if !self.supports_path(source_path) {
-            return None;
-        }
-        parse_rust_ast(content)
-    }
 }
 
 pub fn classify_bead_actionability(
@@ -2125,6 +2069,34 @@ fn external_call_symbol_node(
 fn external_call_symbol_node_id(source_path: &str, name: &str, content_sha256: &str) -> String {
     let stable_key = format!("{source_path}:external_call:{name}:{content_sha256}");
     stable_id("code_symbol", &[&stable_key])
+}
+
+fn symbol_edge_reason(language_id: &str) -> &'static str {
+    match language_id {
+        "go" => "go_symbol",
+        "rust" => "rust_symbol",
+        _ => "code_symbol",
+    }
+}
+
+fn call_edge_reason(language_id: &str) -> &'static str {
+    match language_id {
+        "go" => "tree_sitter_go_call",
+        "rust" => "tree_sitter_rust_call",
+        _ => "tree_sitter_code_call",
+    }
+}
+
+fn test_case_edge_reason(language_id: &str) -> &'static str {
+    match language_id {
+        "go" => "go_test_case",
+        "rust" => "rust_test_case",
+        _ => "code_test_case",
+    }
+}
+
+fn is_test_function_kind(language_id: &str, symbol_kind: &str) -> bool {
+    symbol_kind == "fn" || language_id == "go" && symbol_kind == "func"
 }
 
 fn test_case_node(
@@ -2400,12 +2372,19 @@ fn provider_surface_node(source_path: &str, content_sha256: &str) -> SemanticGra
     }
 }
 
-fn validation_command_node(source_path: &str, test_name: &str) -> SemanticGraphNode {
+fn validation_command_node(
+    language_id: &str,
+    source_path: &str,
+    test_name: &str,
+) -> SemanticGraphNode {
     let test_target = Path::new(source_path)
         .file_stem()
         .and_then(|stem| stem.to_str())
         .unwrap_or("unknown_test");
-    let command = format!("cargo test --test {test_target} {test_name}");
+    let command = match language_id {
+        "go" => format!("go test ./... -run {test_name}"),
+        _ => format!("cargo test --test {test_target} {test_name}"),
+    };
     let stable_key = command.clone();
     let mut metadata = BTreeMap::new();
     metadata.insert("command".to_string(), json!(command));
@@ -2820,180 +2799,6 @@ fn parse_rust_symbol(line: &str) -> Option<ParsedRustSymbol> {
     None
 }
 
-fn parse_rust_ast(content: &str) -> Option<ExtractedCodeGraph> {
-    let mut parser = TreeSitterParser::new();
-    parser
-        .set_language(&tree_sitter_rust::LANGUAGE.into())
-        .ok()?;
-    let tree = parser.parse(content, None)?;
-    let root = tree.root_node();
-    if root.has_error() {
-        return None;
-    }
-
-    let bytes = content.as_bytes();
-    let mut symbols = Vec::new();
-    let mut calls = Vec::new();
-    collect_rust_ast_symbols(root, bytes, &mut symbols, &mut calls, None, false);
-    symbols.sort_by(|left, right| {
-        left.line_start
-            .cmp(&right.line_start)
-            .then_with(|| left.kind.cmp(&right.kind))
-            .then_with(|| left.name.cmp(&right.name))
-    });
-    symbols.dedup_by(|left, right| {
-        left.kind == right.kind && left.name == right.name && left.line_start == right.line_start
-    });
-    calls.sort_by(|left, right| {
-        left.caller
-            .cmp(&right.caller)
-            .then_with(|| left.callee.cmp(&right.callee))
-            .then_with(|| left.line.cmp(&right.line))
-    });
-    calls.dedup();
-    Some(ExtractedCodeGraph { symbols, calls })
-}
-
-fn collect_rust_ast_symbols(
-    node: TreeSitterNode<'_>,
-    bytes: &[u8],
-    symbols: &mut Vec<ExtractedCodeSymbol>,
-    calls: &mut Vec<ExtractedCodeCall>,
-    current_symbol: Option<&str>,
-    pending_test_attribute: bool,
-) {
-    let mut cursor = node.walk();
-    let mut next_test_attribute = pending_test_attribute;
-    for child in node.named_children(&mut cursor) {
-        if is_rust_test_attribute_node(child, bytes) {
-            next_test_attribute = true;
-            continue;
-        }
-
-        if let Some(symbol) = rust_symbol_from_node(child, bytes, next_test_attribute) {
-            let symbol_name = symbol.name.clone();
-            let scan_calls = matches!(symbol.kind.as_str(), "fn" | "trait_fn");
-            symbols.push(symbol);
-            if scan_calls {
-                collect_rust_ast_symbols(child, bytes, symbols, calls, Some(&symbol_name), false);
-            } else {
-                collect_rust_ast_symbols(child, bytes, symbols, calls, None, false);
-            }
-            next_test_attribute = false;
-            continue;
-        }
-
-        if let Some(caller) = current_symbol
-            && let Some(callee) = rust_call_name_from_node(child, bytes)
-        {
-            calls.push(ExtractedCodeCall {
-                caller: caller.to_string(),
-                callee,
-                line: one_indexed_row(child),
-            });
-        }
-
-        collect_rust_ast_symbols(child, bytes, symbols, calls, current_symbol, false);
-        next_test_attribute = false;
-    }
-}
-
-fn rust_symbol_from_node(
-    node: TreeSitterNode<'_>,
-    bytes: &[u8],
-    is_test: bool,
-) -> Option<ExtractedCodeSymbol> {
-    let kind = match node.kind() {
-        "function_item" => "fn",
-        "function_signature_item" => "trait_fn",
-        "struct_item" => "struct",
-        "enum_item" => "enum",
-        "trait_item" => "trait",
-        "impl_item" => "impl",
-        "mod_item" => "mod",
-        "type_item" => "type",
-        "const_item" => "const",
-        "static_item" => "static",
-        _ => return None,
-    };
-    let name = if node.kind() == "impl_item" {
-        rust_impl_name(node, bytes)?
-    } else {
-        node.child_by_field_name("name")
-            .and_then(|name| node_text(name, bytes))
-            .map(ToString::to_string)?
-    };
-    Some(ExtractedCodeSymbol {
-        kind: kind.to_string(),
-        name,
-        line_start: one_indexed_row(node),
-        line_end: node.end_position().row.saturating_add(1),
-        is_test: is_test || rust_node_has_test_attribute(node, bytes),
-    })
-}
-
-fn rust_node_has_test_attribute(node: TreeSitterNode<'_>, bytes: &[u8]) -> bool {
-    let mut cursor = node.walk();
-    node.named_children(&mut cursor)
-        .any(|child| is_rust_test_attribute_node(child, bytes))
-}
-
-fn rust_impl_name(node: TreeSitterNode<'_>, bytes: &[u8]) -> Option<String> {
-    node.child_by_field_name("type")
-        .and_then(|node| node_text(node, bytes))
-        .or_else(|| {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .filter_map(|child| node_text(child, bytes))
-                .find(|text| !matches!(*text, "impl" | "for"))
-        })
-        .map(|text| format!("impl {}", collapse_ws(text)))
-}
-
-fn rust_call_name_from_node(node: TreeSitterNode<'_>, bytes: &[u8]) -> Option<String> {
-    match node.kind() {
-        "call_expression" => {
-            let function = node.child_by_field_name("function")?;
-            rust_callable_name(function, bytes)
-        }
-        "macro_invocation" => node
-            .child_by_field_name("macro")
-            .and_then(|macro_node| node_text(macro_node, bytes))
-            .map(|name| format!("{name}!")),
-        _ => None,
-    }
-}
-
-fn rust_callable_name(node: TreeSitterNode<'_>, bytes: &[u8]) -> Option<String> {
-    match node.kind() {
-        "identifier" => node_text(node, bytes).map(ToString::to_string),
-        "scoped_identifier" => node_text(node, bytes)
-            .and_then(|text| text.rsplit("::").next())
-            .filter(|name| !name.is_empty())
-            .map(ToString::to_string),
-        "generic_function" => node
-            .child_by_field_name("function")
-            .and_then(|function| rust_callable_name(function, bytes)),
-        "field_expression" => node
-            .child_by_field_name("field")
-            .and_then(|field| node_text(field, bytes))
-            .map(ToString::to_string),
-        _ => node_text(node, bytes).map(collapse_ws),
-    }
-}
-
-fn is_rust_test_attribute_node(node: TreeSitterNode<'_>, bytes: &[u8]) -> bool {
-    if !matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
-        return false;
-    }
-    node_text(node, bytes).is_some_and(|text| {
-        let compact: String = text.chars().filter(|ch| !ch.is_whitespace()).collect();
-        compact == "#[test]"
-            || compact.starts_with("#[tokio::test")
-            || compact.starts_with("#[should_panic")
-    })
-}
-
 fn parse_rust_symbols_by_line(content: &str) -> ExtractedCodeGraph {
     let mut symbols = Vec::new();
     let mut pending_test_attribute = false;
@@ -3018,21 +2823,10 @@ fn parse_rust_symbols_by_line(content: &str) -> ExtractedCodeGraph {
         }
     }
     ExtractedCodeGraph {
+        language_id: "rust".to_string(),
         symbols,
         calls: Vec::new(),
     }
-}
-
-fn node_text<'a>(node: TreeSitterNode<'_>, bytes: &'a [u8]) -> Option<&'a str> {
-    node.utf8_text(bytes).ok()
-}
-
-fn one_indexed_row(node: TreeSitterNode<'_>) -> usize {
-    node.start_position().row.saturating_add(1)
-}
-
-fn collapse_ws(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn parse_markdown_heading(line: &str) -> Option<(usize, String)> {
@@ -3398,10 +3192,14 @@ fn surface_for_path(source_path: &str) -> Option<SourceSurface> {
     if source_path.starts_with("logs/") || has_extension(source_path, "log") {
         return Some(SourceSurface::RuntimeArtifacts);
     }
-    if source_path.starts_with("src/") && has_extension(source_path, "rs") {
-        return Some(SourceSurface::RustCodeModules);
+    if source_path.starts_with("src/")
+        && (has_extension(source_path, "rs") || has_extension(source_path, "go"))
+    {
+        return Some(SourceSurface::CodeModules);
     }
-    if source_path.starts_with("tests/") && has_extension(source_path, "rs") {
+    if source_path.starts_with("tests/")
+        && (has_extension(source_path, "rs") || has_extension(source_path, "go"))
+    {
         return Some(SourceSurface::IntegrationAndContractTests);
     }
     None

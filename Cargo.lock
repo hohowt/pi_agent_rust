@@ -2063,6 +2063,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pi-codegraph"
+version = "0.1.16"
+dependencies = [
+ "tree-sitter",
+ "tree-sitter-go",
+ "tree-sitter-rust",
+]
+
+[[package]]
 name = "pi-core"
 version = "0.1.16"
 dependencies = [
@@ -2154,6 +2163,7 @@ dependencies = [
  "ignore",
  "image",
  "memchr",
+ "pi-codegraph",
  "pi-core",
  "pi-http",
  "pi-observability",
@@ -2173,8 +2183,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "tree-sitter",
- "tree-sitter-rust",
  "unicode-normalization",
  "unicode-width 0.2.2",
  "url",
@@ -3401,6 +3409,16 @@ dependencies = [
  "regex-syntax",
  "serde_json",
  "streaming-iterator",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-go"
+version = "0.25.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8560a4d2f835cc0d4d2c2e03cbd0dde2f6114b43bc491164238d333e28b16ea"
+dependencies = [
+ "cc",
  "tree-sitter-language",
 ]
 

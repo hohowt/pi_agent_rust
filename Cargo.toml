@@ -67,6 +67,7 @@ path = "tests/semantic_workspace_graph_tree_sitter.rs"
 
 [dependencies]
 pi-core = { workspace = true }
+pi-codegraph = { workspace = true }
 pi-http = { workspace = true }
 pi-observability = { workspace = true }
 pi-platform = { workspace = true }
@@ -136,8 +137,6 @@ sysinfo = { workspace = true }
 
 # Image processing (optional)
 image = { workspace = true, optional = true }
-tree-sitter = { workspace = true }
-tree-sitter-rust = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 enable-ansi-support = { workspace = true }
@@ -206,6 +205,7 @@ module_name_repetitions = "allow"
 members = [
     ".",
     "crates/pi-core",
+    "crates/pi-codegraph",
     "crates/pi-http",
     "crates/pi-observability",
     "crates/pi-platform",
@@ -237,6 +237,7 @@ image = "0.25"
 lipgloss = { package = "charmed-lipgloss", version = "0.2.0" }
 memchr = "2.8.0"
 pi-core = { path = "crates/pi-core" }
+pi-codegraph = { path = "crates/pi-codegraph" }
 pi-http = { path = "crates/pi-http" }
 pi-observability = { path = "crates/pi-observability" }
 pi-platform = { path = "crates/pi-platform" }
@@ -258,6 +259,7 @@ tokio = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tree-sitter = "0.26.9"
+tree-sitter-go = "0.25.0"
 tree-sitter-rust = "0.24.2"
 unicode-normalization = "0.1"
 unicode-width = "0.2"
