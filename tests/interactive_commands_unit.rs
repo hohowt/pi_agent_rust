@@ -517,7 +517,7 @@ fn resolve_strips_thinking_suffix_with_glob() {
 
 #[test]
 fn help_text_contains_all_commands() {
-    let help = SlashCommand::help_text();
+    let help = SlashCommand::help_text(pi::config::Language::En);
     // Spot-check key commands are listed in help text
     assert!(help.contains("/help"), "help text missing /help");
     assert!(help.contains("/login"), "help text missing /login");

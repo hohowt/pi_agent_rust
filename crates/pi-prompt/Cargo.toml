@@ -1,0 +1,10 @@
+[package]
+name = "pi-prompt"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "pi_prompt"
+path = "src/lib.rs"

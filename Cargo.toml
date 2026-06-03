@@ -71,6 +71,7 @@ pi-codegraph = { workspace = true }
 pi-http = { workspace = true }
 pi-observability = { workspace = true }
 pi-platform = { workspace = true }
+pi-prompt = { workspace = true }
 pi-runtime = { workspace = true }
 pi-theme = { workspace = true }
 
@@ -115,6 +116,7 @@ fs4 = { workspace = true }
 glob = { workspace = true }
 ignore = { workspace = true }
 rusqlite = { workspace = true }
+notify = { workspace = true }
 
 # Time
 chrono = { workspace = true, features = ["serde"] }
@@ -209,6 +211,7 @@ members = [
     "crates/pi-http",
     "crates/pi-observability",
     "crates/pi-platform",
+    "crates/pi-prompt",
     "crates/pi-runtime",
     "crates/pi-theme",
 ]
@@ -241,6 +244,7 @@ pi-codegraph = { path = "crates/pi-codegraph" }
 pi-http = { path = "crates/pi-http" }
 pi-observability = { path = "crates/pi-observability" }
 pi-platform = { path = "crates/pi-platform" }
+pi-prompt = { path = "crates/pi-prompt" }
 pi-runtime = { path = "crates/pi-runtime" }
 pi-theme = { path = "crates/pi-theme" }
 proptest = "1.9.0"
@@ -248,6 +252,7 @@ regex = "1.12.3"
 reqwest = { version = "0.12", default-features = false }
 rich_rust = "0.2.0"
 rusqlite = "0.37"
+notify = "8.2.0"
 serde = "1"
 serde_json = "1"
 sha2 = "0.10"

@@ -1668,6 +1668,7 @@ pub async fn create_agent_session(options: SessionOptions) -> Result<AgentSessio
         &cwd,
         &enabled_tools,
         None,
+        config.language(),
         &global_dir,
         &package_dir,
         std::env::var_os("PI_TEST_MODE").is_some(),

@@ -228,6 +228,7 @@ fn build_vcr_system_prompt_for_args(
         workdir,
         &enabled_tools,
         None,
+        pi::config::Language::En,
         &global_dir,
         &package_dir,
         true,

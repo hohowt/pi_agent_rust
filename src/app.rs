@@ -25,6 +25,10 @@ use crate::provider_metadata::{
 };
 use crate::session::Session;
 use crate::tools::process_file_arguments;
+use pi_prompt::{
+    DefaultSystemPromptBaseInput, Language, ProjectContextItem, PromptCatalog,
+    RuntimeContextPromptInput,
+};
 
 #[derive(Debug, Clone)]
 pub struct InitialMessage {
@@ -153,13 +157,12 @@ pub fn build_system_prompt(
     cwd: &Path,
     enabled_tools: &[&str],
     skills_prompt: Option<&str>,
+    language: Language,
     global_dir: &Path,
     package_dir: &Path,
     test_mode: bool,
     include_cwd: bool,
 ) -> Result<String> {
-    use std::fmt::Write as _;
-
     let custom_prompt = resolve_prompt_input(cli.system_prompt.as_deref(), "system prompt")?;
     let append_prompt =
         resolve_prompt_input(cli.append_system_prompt.as_deref(), "append system prompt")?;
@@ -169,40 +172,50 @@ pub fn build_system_prompt(
         load_project_context_files(cwd, global_dir)
     };
 
-    let mut prompt =
-        custom_prompt.unwrap_or_else(|| default_system_prompt(enabled_tools, package_dir));
-
-    if let Some(append_prompt) = append_prompt {
-        prompt.push_str("\n\n");
-        prompt.push_str(&append_prompt);
-    }
-
-    if !context_files.is_empty() {
-        prompt.push_str("\n\n# Project Context\n\n");
-        prompt.push_str("Project-specific instructions and guidelines:\n\n");
-        for file in &context_files {
-            let _ = write!(prompt, "## {}\n\n{}\n\n", file.path, file.content);
-        }
-    }
-
-    if let Some(skills_prompt) = skills_prompt {
-        prompt.push_str(skills_prompt);
-    }
-
+    let readme_path = package_dir.join("README.md").display().to_string();
+    let docs_path = package_dir.join("docs").display().to_string();
+    let examples_path = package_dir.join("examples").display().to_string();
     let date_time = if test_mode {
         "<TIMESTAMP>".to_string()
     } else {
         format_current_datetime()
     };
-    let _ = write!(prompt, "\nCurrent date and time: {date_time}");
-    if include_cwd {
-        let cwd_display = if test_mode {
+    let cwd_display = include_cwd.then(|| {
+        if test_mode {
             "<CWD>".to_string()
         } else {
             cwd.display().to_string()
-        };
-        let _ = write!(prompt, "\nCurrent working directory: {cwd_display}");
+        }
+    });
+    let project_context = context_files
+        .iter()
+        .map(|file| ProjectContextItem {
+            path: file.path.as_str(),
+            content: file.content.as_str(),
+        })
+        .collect::<Vec<_>>();
+
+    let mut prompt = custom_prompt.unwrap_or_else(|| {
+        PromptCatalog::new(language).default_system_prompt_base(DefaultSystemPromptBaseInput {
+            enabled_tools,
+            readme_path: &readme_path,
+            docs_path: &docs_path,
+            examples_path: &examples_path,
+        })
+    });
+
+    if let Some(append_prompt) = append_prompt {
+        prompt.push_str("\n\n");
+        prompt.push_str(&append_prompt);
     }
+    prompt.push_str(&PromptCatalog::new(language).runtime_context_prompt(
+        RuntimeContextPromptInput {
+            project_context: &project_context,
+            skills_prompt,
+            date_time: &date_time,
+            cwd: cwd_display.as_deref(),
+        },
+    ));
 
     Ok(prompt)
 }
@@ -220,99 +233,6 @@ fn resolve_prompt_input(input: Option<&str>, description: &str) -> Result<Option
     } else {
         Ok(Some(value.to_string()))
     }
-}
-
-fn default_system_prompt(enabled_tools: &[&str], package_dir: &Path) -> String {
-    let tool_descriptions = [
-        ("read", "Read file contents"),
-        ("bash", "Execute bash commands (ls, grep, find, etc.)"),
-        (
-            "edit",
-            "Make surgical edits to files (find exact text and replace)",
-        ),
-        ("write", "Create or overwrite files"),
-        (
-            "grep",
-            "Search file contents for patterns (respects .gitignore, supports hashline=true for use with hashline_edit)",
-        ),
-        ("find", "Find files by glob pattern (respects .gitignore)"),
-        ("ls", "List directory contents"),
-        (
-            "hashline_edit",
-            "Apply precise file edits using LINE#HASH tags from read or grep with hashline=true",
-        ),
-    ];
-
-    let mut tools = Vec::new();
-    for tool in enabled_tools {
-        if let Some((_, description)) = tool_descriptions.iter().find(|(name, _)| name == tool) {
-            tools.push(format!("- {tool}: {description}"));
-        }
-    }
-
-    let tools_list = if tools.is_empty() {
-        "(none)".to_string()
-    } else {
-        tools.join("\n")
-    };
-
-    let has_tool = |name: &str| enabled_tools.contains(&name);
-    let has_bash = has_tool("bash");
-    let has_edit = has_tool("edit");
-    let has_write = has_tool("write");
-    let has_grep = has_tool("grep");
-    let has_find = has_tool("find");
-    let has_ls = has_tool("ls");
-    let has_read = has_tool("read");
-    let has_hashline_edit = has_tool("hashline_edit");
-
-    let mut guidelines_list = Vec::new();
-    if has_bash && !has_grep && !has_find && !has_ls {
-        guidelines_list.push("Use bash for file operations like ls, rg, find");
-    } else if has_bash && (has_grep || has_find || has_ls) {
-        guidelines_list.push(
-            "Prefer grep/find/ls tools over bash for file exploration (faster, respects .gitignore)",
-        );
-    }
-
-    if has_read && has_edit {
-        guidelines_list.push(
-            "Use read to examine files before editing. You must use this tool instead of cat or sed.",
-        );
-    }
-    if has_edit {
-        guidelines_list.push("Use edit for precise changes (old text must match exactly)");
-    }
-    if has_hashline_edit && has_read {
-        guidelines_list.push(
-            "For large files or complex multi-site edits, use read or grep with hashline=true to get LINE#HASH tags, then use hashline_edit for precise line-addressed edits",
-        );
-    }
-    if has_write {
-        guidelines_list.push("Use write only for new files or complete rewrites");
-    }
-    if has_edit || has_write {
-        guidelines_list.push(
-            "When summarizing your actions, output plain text directly - do NOT use cat or bash to display what you did",
-        );
-    }
-
-    guidelines_list.push("Be concise in your responses");
-    guidelines_list.push("Show file paths clearly when working with files");
-
-    let guidelines = guidelines_list
-        .iter()
-        .map(|g| format!("- {g}"))
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    let readme_path = package_dir.join("README.md").display().to_string();
-    let docs_path = package_dir.join("docs").display().to_string();
-    let examples_path = package_dir.join("examples").display().to_string();
-
-    format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. You help users by reading files, executing commands, editing code, and writing new files.\n\nAvailable tools:\n{tools_list}\n\nGuidelines:\n{guidelines}\n\nPi documentation (read only when the user asks about pi itself, its SDK, themes, skills, or TUI):\n- Main documentation: {readme_path}\n- Additional docs: {docs_path}\n- Examples: {examples_path} (custom tools, SDK)\n- When asked about: themes (docs/themes.md), skills (docs/skills.md), prompt templates (docs/prompt-templates.md), TUI components (docs/tui.md), keybindings (docs/keybindings.md), SDK integrations (docs/sdk.md), adding models (docs/models.md), pi packages (docs/packages.md)\n- When working on pi topics, read the docs and examples, and follow .md cross-references before implementing\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)"
-    )
 }
 
 fn load_project_context_files(cwd: &Path, global_dir: &Path) -> Vec<ContextFile> {

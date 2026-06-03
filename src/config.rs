@@ -3,6 +3,7 @@
 use crate::agent::QueueMode;
 use crate::error::{Error, Result};
 use fs4::fs_std::FileExt;
+pub use pi_prompt::Language;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs::File;
@@ -18,6 +19,9 @@ use tempfile::NamedTempFile;
 pub struct Config {
     // Appearance
     pub theme: Option<String>,
+    /// UI and default prompt language. Defaults to `zh`; set to `en` for English.
+    #[serde(alias = "locale", alias = "uiLanguage", alias = "promptLanguage")]
+    pub language: Option<String>,
     #[serde(alias = "hideThinkingBlock")]
     pub hide_thinking_block: Option<bool>,
     #[serde(alias = "showHardwareCursor")]
@@ -198,6 +202,8 @@ pub struct CodegraphSettings {
     #[serde(alias = "autoInit")]
     pub auto_init: Option<bool>,
     pub watch: Option<bool>,
+    #[serde(alias = "watchDebounceMs")]
+    pub watch_debounce_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -364,6 +370,7 @@ impl Config {
         Self {
             // Appearance
             theme: other.theme.or(base.theme),
+            language: other.language.or(base.language),
             hide_thinking_block: other.hide_thinking_block.or(base.hide_thinking_block),
             show_hardware_cursor: other.show_hardware_cursor.or(base.show_hardware_cursor),
             disable_mouse_capture: other.disable_mouse_capture.or(base.disable_mouse_capture),
@@ -431,6 +438,10 @@ impl Config {
     }
 
     // === Accessor methods with defaults ===
+
+    pub fn language(&self) -> Language {
+        Language::parse(self.language.as_deref())
+    }
 
     pub fn compaction_enabled(&self) -> bool {
         self.compaction
@@ -516,6 +527,14 @@ impl Config {
             .as_ref()
             .and_then(|settings| settings.watch)
             .unwrap_or(true)
+    }
+
+    pub fn codegraph_watch_debounce_ms(&self) -> u64 {
+        self.codegraph
+            .as_ref()
+            .and_then(|settings| settings.watch_debounce_ms)
+            .unwrap_or(2_000)
+            .clamp(100, 60_000)
     }
 
     pub fn terminal_show_images(&self) -> bool {
@@ -776,6 +795,7 @@ fn merge_codegraph(
         (Some(base), Some(other)) => Some(CodegraphSettings {
             auto_init: other.auto_init.or(base.auto_init),
             watch: other.watch.or(base.watch),
+            watch_debounce_ms: other.watch_debounce_ms.or(base.watch_debounce_ms),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

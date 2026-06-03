@@ -14,12 +14,14 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
 use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
+use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use pi::Cx;
 use pi::agent::{AbortHandle, Agent, AgentConfig, AgentEvent, AgentSession};
 use pi::app::StartupError;
@@ -693,9 +695,11 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
 
     let enabled_tools = cli.enabled_tools();
     maybe_auto_init_codegraph(&cwd, &config);
-    maybe_start_codegraph_watcher(&cwd, &config);
+    if let Err(err) = maybe_start_codegraph_watcher(&cwd, &config) {
+        eprintln!("Warning: codegraph watcher failed: {err}");
+    }
     let skills_prompt = if enabled_tools.contains(&"read") {
-        resources.format_skills_for_prompt()
+        resources.format_skills_for_prompt(config.language())
     } else {
         String::new()
     };
@@ -709,6 +713,7 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
         } else {
             Some(skills_prompt.as_str())
         },
+        config.language(),
         &global_dir,
         &package_dir,
         test_mode,
@@ -1031,27 +1036,105 @@ fn maybe_auto_init_codegraph(cwd: &Path, config: &Config) {
     }
 }
 
-fn maybe_start_codegraph_watcher(cwd: &Path, config: &Config) {
+fn maybe_start_codegraph_watcher(cwd: &Path, config: &Config) -> Result<()> {
     if !config.codegraph_watch() {
-        return;
+        return Ok(());
     }
     let root = cwd.to_path_buf();
     if pi_codegraph::CodeGraphIndex::open_existing(&root).is_err() {
-        return;
+        return Ok(());
     }
-    let _ = thread::Builder::new()
+    let debounce = Duration::from_millis(config.codegraph_watch_debounce_ms());
+    let (event_tx, event_rx) = mpsc::channel::<notify::Result<notify::Event>>();
+    let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
+        let _ = event_tx.send(event);
+    })?;
+    watcher.watch(&root, RecursiveMode::Recursive)?;
+
+    thread::Builder::new()
         .name("pi-codegraph-watch".to_string())
         .spawn(move || {
-            loop {
-                thread::sleep(Duration::from_secs(5));
-                let Ok(index) = pi_codegraph::CodeGraphIndex::open_existing(&root) else {
-                    break;
-                };
-                if let Err(err) = index.sync_project() {
-                    tracing::warn!(error = %err, "codegraph watcher sync failed");
+            let _watcher = watcher;
+            run_codegraph_watch_loop(&root, &event_rx, debounce);
+        })?;
+    Ok(())
+}
+
+fn run_codegraph_watch_loop(
+    root: &Path,
+    event_rx: &mpsc::Receiver<notify::Result<notify::Event>>,
+    debounce: Duration,
+) {
+    let mut pending_paths = BTreeSet::<PathBuf>::new();
+    let mut deadline: Option<Instant> = None;
+
+    loop {
+        let received = if let Some(next_deadline) = deadline {
+            let timeout = next_deadline.saturating_duration_since(Instant::now());
+            match event_rx.recv_timeout(timeout) {
+                Ok(event) => Some(event),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    flush_codegraph_watch_paths(root, &mut pending_paths);
+                    deadline = None;
+                    None
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        } else {
+            match event_rx.recv() {
+                Ok(event) => Some(event),
+                Err(_) => break,
+            }
+        };
+
+        let Some(event) = received else {
+            continue;
+        };
+
+        match event {
+            Ok(event) => {
+                for path in event.paths {
+                    if is_codegraph_watch_candidate(root, &path) {
+                        pending_paths.insert(path);
+                    }
+                }
+                if !pending_paths.is_empty() {
+                    deadline = Some(Instant::now() + debounce);
                 }
             }
-        });
+            Err(err) => {
+                tracing::warn!(error = %err, "codegraph watcher event failed");
+            }
+        }
+    }
+}
+
+fn flush_codegraph_watch_paths(root: &Path, pending_paths: &mut BTreeSet<PathBuf>) {
+    if pending_paths.is_empty() {
+        return;
+    }
+    let paths = pending_paths.iter().cloned().collect::<Vec<_>>();
+    pending_paths.clear();
+
+    match pi_codegraph::CodeGraphIndex::open_existing(root) {
+        Ok(index) => {
+            if let Err(err) = index.sync_paths(&paths) {
+                tracing::warn!(error = %err, "codegraph watcher sync failed");
+            }
+        }
+        Err(err) => {
+            tracing::warn!(error = %err, "codegraph watcher stopped because index disappeared");
+        }
+    }
+}
+
+fn is_codegraph_watch_candidate(root: &Path, path: &Path) -> bool {
+    if path.starts_with(root.join(pi_codegraph::PI_CODING_DIR)) {
+        return false;
+    }
+    path.extension().is_some_and(|extension| {
+        extension.eq_ignore_ascii_case("rs") || extension.eq_ignore_ascii_case("go")
+    })
 }
 
 #[derive(Debug, Serialize)]

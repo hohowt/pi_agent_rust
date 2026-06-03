@@ -9,6 +9,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::package_manager::{PackageManager, PackageScope, ResolvedResource, ResourceOrigin};
 use crate::theme::Theme;
+use pi_prompt::{Language, PromptCatalog, SkillPromptItem};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -453,8 +454,8 @@ impl ResourceLoader {
         self.enable_skill_commands
     }
 
-    pub fn format_skills_for_prompt(&self) -> String {
-        format_skills_for_prompt(&self.skills)
+    pub fn format_skills_for_prompt(&self, language: Language) -> String {
+        format_skills_for_prompt(&self.skills, language)
     }
 
     pub fn list_commands(&self) -> Vec<Value> {
@@ -1112,49 +1113,17 @@ where
     errors
 }
 
-pub fn format_skills_for_prompt(skills: &[Skill]) -> String {
-    let visible: Vec<&Skill> = skills
+pub fn format_skills_for_prompt(skills: &[Skill], language: Language) -> String {
+    let visible: Vec<SkillPromptItem<'_>> = skills
         .iter()
         .filter(|s| !s.disable_model_invocation)
+        .map(|skill| SkillPromptItem {
+            name: skill.name.as_str(),
+            description: skill.description.as_str(),
+            location: skill.file_path.to_str().unwrap_or_default(),
+        })
         .collect();
-    if visible.is_empty() {
-        return String::new();
-    }
-
-    let mut lines = vec![
-        "\n\nThe following skills provide specialized instructions for specific tasks.".to_string(),
-        "Use the read tool to load a skill's file when the task matches its description."
-            .to_string(),
-        "When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.".to_string(),
-        String::new(),
-        "<available_skills>".to_string(),
-    ];
-
-    for skill in visible {
-        lines.push("  <skill>".to_string());
-        lines.push(format!("    <name>{}</name>", escape_xml(&skill.name)));
-        lines.push(format!(
-            "    <description>{}</description>",
-            escape_xml(&skill.description)
-        ));
-        lines.push(format!(
-            "    <location>{}</location>",
-            escape_xml(&skill.file_path.display().to_string())
-        ));
-        lines.push("  </skill>".to_string());
-    }
-
-    lines.push("</available_skills>".to_string());
-    lines.join("\n")
-}
-
-fn escape_xml(input: &str) -> String {
-    input
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&apos;")
+    PromptCatalog::new(language).skills_prompt(&visible)
 }
 
 // ============================================================================
@@ -2108,7 +2077,7 @@ mod tests {
                 disable_model_invocation: true,
             },
         ];
-        let prompt = format_skills_for_prompt(&skills);
+        let prompt = format_skills_for_prompt(&skills, Language::En);
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("<name>a</name>"));
         assert!(!prompt.contains("<name>b</name>"));
@@ -2486,8 +2455,16 @@ mod tests {
 
     #[test]
     fn test_escape_xml_replaces_all_special_chars() {
-        let escaped = escape_xml("& < > \" '");
-        assert_eq!(escaped, "&amp; &lt; &gt; &quot; &apos;");
+        let skills = vec![Skill {
+            name: "& < > \" '".to_string(),
+            description: "& < > \" '".to_string(),
+            file_path: PathBuf::from("/tmp/a/SKILL.md"),
+            base_dir: PathBuf::from("/tmp/a"),
+            source: "user".to_string(),
+            disable_model_invocation: false,
+        }];
+        let prompt = format_skills_for_prompt(&skills, Language::En);
+        assert!(prompt.contains("&amp; &lt; &gt; &quot; &apos;"));
     }
 
     #[test]
@@ -3476,29 +3453,45 @@ still frontmatter",
 
             #[test]
             fn escape_xml_idempotent_on_safe_strings(s in "[a-zA-Z0-9 ]{0,50}") {
-                assert_eq!(
-                    escape_xml(&s), s,
+                let skills = vec![Skill {
+                    name: s.clone(),
+                    description: "desc".to_string(),
+                    file_path: PathBuf::from("/tmp/a/SKILL.md"),
+                    base_dir: PathBuf::from("/tmp/a"),
+                    source: "user".to_string(),
+                    disable_model_invocation: false,
+                }];
+                let prompt = format_skills_for_prompt(&skills, Language::En);
+                assert!(
+                    prompt.contains(&format!("<name>{s}</name>")),
                     "safe string should pass through unchanged"
                 );
             }
 
             #[test]
             fn escape_xml_output_never_contains_raw_special_chars(s in ".*") {
-                let escaped = escape_xml(&s);
-                // After escaping, no raw `<`, `>`, `&` (except in escape sequences),
-                // `"`, or `'` should remain unescaped.
-                // We check that re-escaping is idempotent on the escaped output.
-                // A simpler check: the escaped output, when re-escaped, should only
-                // double-encode the `&` in existing entities.
-                let double_escaped = escape_xml(&escaped);
-                // If no raw specials in escaped, then double-escape only affects `&`
-                // in entities like `&amp;` → `&amp;amp;`.
-                // We just check the output doesn't contain bare `<` or `>`.
+                let skills = vec![Skill {
+                    name: s,
+                    description: "desc".to_string(),
+                    file_path: PathBuf::from("/tmp/a/SKILL.md"),
+                    base_dir: PathBuf::from("/tmp/a"),
+                    source: "user".to_string(),
+                    disable_model_invocation: false,
+                }];
+                let prompt = format_skills_for_prompt(&skills, Language::En);
+                let name_line = prompt
+                    .lines()
+                    .find(|line| line.contains("<name>"))
+                    .unwrap_or_default();
+                let body = name_line
+                    .trim()
+                    .strip_prefix("<name>")
+                    .and_then(|line| line.strip_suffix("</name>"))
+                    .unwrap_or_default();
                 assert!(
-                    !escaped.contains('<') && !escaped.contains('>'),
-                    "escaped output should not contain raw < or >: {escaped}"
+                    !body.contains('<') && !body.contains('>'),
+                    "escaped output should not contain raw < or >: {body}"
                 );
-                let _ = double_escaped; // suppress unused warning
             }
 
             #[test]

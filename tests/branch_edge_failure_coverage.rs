@@ -869,6 +869,7 @@ fn build_system_prompt_test_mode_uses_placeholders() {
         cwd,
         &["read", "bash"],
         None,
+        pi::config::Language::En,
         global_dir,
         package_dir,
         true, // test_mode
@@ -878,6 +879,30 @@ fn build_system_prompt_test_mode_uses_placeholders() {
     assert!(prompt.contains("<TIMESTAMP>"));
     assert!(prompt.contains("<CWD>"));
     assert!(!prompt.contains("/tmp/test_cwd"));
+}
+
+#[test]
+fn build_system_prompt_can_render_default_chinese_prompt() {
+    let cli = Cli::parse_from(["pi"]);
+    let cwd = Path::new("/tmp/test_cwd");
+    let global_dir = Path::new("/tmp/nonexistent_global");
+    let package_dir = Path::new("/tmp/nonexistent_package");
+    let prompt = app::build_system_prompt(
+        &cli,
+        cwd,
+        &["read", "edit"],
+        None,
+        pi::config::Language::Zh,
+        global_dir,
+        package_dir,
+        true,
+        true,
+    )
+    .expect("build system prompt");
+    assert!(prompt.contains("你是运行在 pi 编码代理中的资深编码助手"));
+    assert!(prompt.contains("可用工具"));
+    assert!(prompt.contains("当前工作目录: <CWD>"));
+    assert!(prompt.contains("read"));
 }
 
 #[test]
@@ -891,6 +916,7 @@ fn build_system_prompt_non_test_mode_uses_real_values() {
         cwd,
         &["read"],
         None,
+        pi::config::Language::En,
         global_dir,
         package_dir,
         false,
@@ -912,6 +938,7 @@ fn build_system_prompt_with_skills_prompt() {
         cwd,
         &[],
         Some("\n# Available Skills\n- /commit: Make git commits\n"),
+        pi::config::Language::En,
         global_dir,
         package_dir,
         true,
@@ -933,6 +960,7 @@ fn build_system_prompt_includes_hashline_edit_description_and_guideline() {
         cwd,
         &["read", "bash", "edit", "write", "hashline_edit"],
         None,
+        pi::config::Language::En,
         global_dir,
         package_dir,
         true,

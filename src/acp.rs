@@ -46,6 +46,7 @@ use crate::session::Session;
 use crate::sync::Mutex;
 use crate::time::{timeout, wall_now};
 use crate::tools::ToolRegistry;
+use pi_prompt::{AcpSystemPromptInput, Language, ProjectContextItem, PromptCatalog};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -1103,52 +1104,39 @@ fn resolve_acp_thinking_level(
 }
 
 /// Build a system prompt for ACP mode without requiring a `Cli` struct.
-fn build_acp_system_prompt(cwd: &std::path::Path, enabled_tools: &[&str]) -> String {
-    use std::fmt::Write as _;
-
-    let tool_descriptions = [
-        ("read", "Read file contents"),
-        ("bash", "Execute bash commands"),
-        ("edit", "Make surgical edits to files"),
-        ("write", "Write file contents"),
-        ("grep", "Search file contents with regex"),
-        ("find", "Find files by name pattern"),
-        ("ls", "List directory contents"),
-    ];
-
-    let mut prompt = String::from(
-        "You are a helpful AI coding assistant integrated into the user's editor via ACP (Agent Client Protocol). \
-         You have access to the following tools:\n\n",
-    );
-
-    for (name, description) in &tool_descriptions {
-        if enabled_tools.contains(name) {
-            let _ = writeln!(prompt, "- **{name}**: {description}");
-        }
-    }
-
-    prompt.push_str(
-        "\nUse these tools to help the user with coding tasks. \
-         Be concise and precise. When making file changes, explain what you're doing.\n",
-    );
-
-    // Load project context files (pi.md, AGENTS.md) if they exist.
+fn build_acp_system_prompt(
+    cwd: &std::path::Path,
+    enabled_tools: &[&str],
+    language: Language,
+) -> String {
+    let mut context_contents = Vec::new();
     for filename in &["pi.md", "AGENTS.md", ".pi"] {
         let path = cwd.join(filename);
         if path.is_file() {
             if let Ok(content) = std::fs::read_to_string(&path) {
-                let _ = write!(prompt, "\n## {filename}\n\n{content}\n\n");
+                context_contents.push((*filename, content));
             }
         }
     }
+    let project_context = context_contents
+        .iter()
+        .map(|(path, content)| ProjectContextItem {
+            path,
+            content: content.as_str(),
+        })
+        .collect::<Vec<_>>();
 
     let date_time = chrono::Utc::now()
         .format("%Y-%m-%d %H:%M:%S UTC")
         .to_string();
-    let _ = write!(prompt, "\nCurrent date and time: {date_time}");
-    let _ = write!(prompt, "\nCurrent working directory: {}", cwd.display());
+    let cwd_display = cwd.display().to_string();
 
-    prompt
+    PromptCatalog::new(language).acp_system_prompt(AcpSystemPromptInput {
+        enabled_tools,
+        project_context: &project_context,
+        date_time: &date_time,
+        cwd: &cwd_display,
+    })
 }
 
 fn handle_session_new(
@@ -1179,7 +1167,7 @@ fn handle_session_new(
         .map_err(|e| Error::provider("acp", e.to_string()))?;
 
     // Build system prompt directly (avoids constructing a Cli struct).
-    let system_prompt = build_acp_system_prompt(&cwd, &enabled_tools);
+    let system_prompt = build_acp_system_prompt(&cwd, &enabled_tools, options.config.language());
 
     // Resolve API key from auth storage and model entry.
     let api_key = options

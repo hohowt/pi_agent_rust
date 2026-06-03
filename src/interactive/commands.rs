@@ -1,12 +1,14 @@
 use super::*;
 use crate::Cx;
 use crate::channel::mpsc::SendError;
+use crate::config::{Config, SettingsScope};
 
 use crate::models::{ModelEntry, model_requires_configured_credential, normalize_api_key_opt};
 use crate::provider_metadata::{
     ProviderMetadata, ProviderOnboardingMode, provider_ids_match, provider_metadata,
     split_provider_model_spec,
 };
+use pi_prompt::{CodegraphSyncReportText, Language, PromptCatalog};
 
 #[cfg(feature = "clipboard")]
 use arboard::Clipboard as ArboardClipboard;
@@ -38,6 +40,7 @@ pub enum SlashCommand {
     Compact,
     Reload,
     Template,
+    Language,
     Share,
     Codegraph,
 }
@@ -77,6 +80,7 @@ impl SlashCommand {
             "/compact" => Self::Compact,
             "/reload" => Self::Reload,
             "/template" => Self::Template,
+            "/language" | "/lang" => Self::Language,
             "/share" => Self::Share,
             "/codegraph" | "/cg" => Self::Codegraph,
             _ => return None,
@@ -86,43 +90,8 @@ impl SlashCommand {
     }
 
     /// Get help text for all commands.
-    pub const fn help_text() -> &'static str {
-        r"Available commands:
-  /help, /h, /?      - Show this help message
-  /login [provider]  - Login/setup credentials; without provider shows status table
-  /logout [provider] - Remove stored credentials
-  /clear, /cls       - Clear conversation history
-  /model, /m [id|provider/id] - Open model selector or switch directly
-  /thinking, /t [level] - Set thinking level (off/minimal/low/medium/high/xhigh)
-  /scoped-models [patterns|clear] - Show or set scoped models for cycling
-  /history, /hist    - Show input history
-  /export [path]     - Export conversation to HTML
-  /session, /info    - Show session info (path, tokens, cost)
-  /settings          - Open settings selector
-  /theme [name]      - List or switch themes (dark/light/custom)
-  /resume, /r        - Pick and resume a previous session
-  /new               - Start a new session
-  /copy, /cp         - Copy last assistant message to clipboard
-  /name <name>       - Set session display name
-  /hotkeys, /keys    - Show keyboard shortcuts
-  /changelog         - Show changelog entries
-  /tree              - Show session branch tree summary
-  /fork [id|index]   - Fork from a user message (default: last on current path)
-  /compact [notes]   - Compact older context with optional instructions
-  /reload            - Reload skills/prompts from disk
-  /template <name> [args] - Expand a prompt template by name
-  /share             - Upload session HTML to a secret GitHub gist and show URL
-  /codegraph [init|sync|status] - Manage the project codegraph index
-  /exit, /quit, /q   - Exit Pi
-
-  Tips:
-    • Use ↑/↓ arrows to navigate input history
-    • Use Ctrl+L to open model selector
-    • Use Ctrl+P to cycle scoped models
-    • Use Shift+Enter (Ctrl+Enter on Windows) to insert a newline
-    • Use PageUp/PageDown to scroll conversation history
-    • Use Escape to cancel current input
-    • Use /skill:name or /template to expand resources"
+    pub fn help_text(language: Language) -> &'static str {
+        PromptCatalog::new(language).ui_text().slash_help()
     }
 }
 
@@ -1504,13 +1473,14 @@ impl PiApp {
 
         match cmd {
             SlashCommand::Help => {
+                let ui = PromptCatalog::new(self.config.language()).ui_text();
                 self.messages.push(ConversationMessage {
                     role: MessageRole::System,
-                    content: SlashCommand::help_text().to_string(),
+                    content: ui.slash_help().to_string(),
                     thinking: None,
                     collapsed: false,
                 });
-                self.scroll_to_last_match("Available commands:");
+                self.scroll_to_last_match(ui.slash_help().lines().next().unwrap_or_default());
                 None
             }
             SlashCommand::Login => self.handle_slash_login(args),
@@ -1873,6 +1843,7 @@ impl PiApp {
             }
             SlashCommand::Reload => self.handle_slash_reload(),
             SlashCommand::Template => self.handle_slash_template(args),
+            SlashCommand::Language => self.handle_slash_language(args),
             SlashCommand::Share => self.handle_slash_share(args),
             SlashCommand::Codegraph => self.handle_slash_codegraph(args),
         }
@@ -2529,13 +2500,19 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
         });
 
-        self.status_message = Some("Reloading resources...".to_string());
+        self.status_message = Some(
+            PromptCatalog::new(self.config.language())
+                .ui_text()
+                .reloading_resources()
+                .to_string(),
+        );
         None
     }
 
     pub(super) fn handle_slash_codegraph(&mut self, args: &str) -> Option<Cmd> {
+        let ui = PromptCatalog::new(self.config.language()).ui_text();
         if self.agent_state != AgentState::Idle {
-            self.status_message = Some("Cannot index while processing".to_string());
+            self.status_message = Some(ui.cannot_index_while_processing().to_string());
             return None;
         }
 
@@ -2545,46 +2522,45 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             "init" => pi_codegraph::CodeGraphIndex::open(&self.cwd).and_then(|index| {
                 let report = index.sync_project()?;
                 let files = index.indexed_files()?.len();
-                Ok(format!(
-                    "Codegraph initialized\nDB: {}\nFiles: {}\nIndexed: {}  unchanged: {}  removed: {}  skipped: {}",
-                    index.db_path().display(),
+                let db = index.db_path().display().to_string();
+                Ok(ui.codegraph_report(CodegraphSyncReportText {
+                    title: ui.codegraph_initialized(),
+                    db: &db,
                     files,
-                    report.indexed_files,
-                    report.unchanged_files,
-                    report.removed_files,
-                    report.skipped_files
-                ))
+                    indexed: report.indexed_files,
+                    unchanged: report.unchanged_files,
+                    removed: report.removed_files,
+                    skipped: report.skipped_files,
+                }))
             }),
             "sync" => pi_codegraph::CodeGraphIndex::open(&self.cwd).and_then(|index| {
                 let report = index.sync_project()?;
                 let files = index.indexed_files()?.len();
-                Ok(format!(
-                    "Codegraph synced\nDB: {}\nFiles: {}\nIndexed: {}  unchanged: {}  removed: {}  skipped: {}",
-                    index.db_path().display(),
+                let db = index.db_path().display().to_string();
+                Ok(ui.codegraph_report(CodegraphSyncReportText {
+                    title: ui.codegraph_synced(),
+                    db: &db,
                     files,
-                    report.indexed_files,
-                    report.unchanged_files,
-                    report.removed_files,
-                    report.skipped_files
-                ))
+                    indexed: report.indexed_files,
+                    unchanged: report.unchanged_files,
+                    removed: report.removed_files,
+                    skipped: report.skipped_files,
+                }))
             }),
             "status" => match pi_codegraph::CodeGraphIndex::open_existing(&self.cwd) {
                 Ok(index) => index.indexed_files().map(|files| {
-                    format!(
-                        "Codegraph status\nInitialized: true\nDB: {}\nFiles: {}",
-                        index.db_path().display(),
-                        files.len()
+                    ui.codegraph_status_report(
+                        &index.db_path().display().to_string(),
+                        true,
+                        Some(files.len()),
                     )
                 }),
                 Err(pi_codegraph::CodeGraphError::IndexNotInitialized(path)) => {
-                    Ok(format!(
-                        "Codegraph status\nInitialized: false\nDB: {}",
-                        path.display()
-                    ))
+                    Ok(ui.codegraph_status_report(&path.display().to_string(), false, None))
                 }
                 Err(err) => Err(err),
             },
-            _ => Ok("Usage: /codegraph [init|sync|status]".to_string()),
+            _ => Ok(ui.codegraph_usage().to_string()),
         };
 
         match result {
@@ -2600,7 +2576,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 self.scroll_to_bottom();
             }
             Err(err) => {
-                self.status_message = Some(format!("Codegraph failed: {err}"));
+                self.status_message = Some(ui.codegraph_failed(&err.to_string()));
             }
         }
         None
@@ -2608,8 +2584,9 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
 
     #[allow(clippy::too_many_lines)]
     pub(super) fn handle_slash_template(&mut self, args: &str) -> Option<Cmd> {
+        let ui = PromptCatalog::new(self.config.language()).ui_text();
         if self.agent_state != AgentState::Idle {
-            self.status_message = Some("Cannot expand template while processing".to_string());
+            self.status_message = Some(ui.cannot_expand_template_while_processing().to_string());
             return None;
         }
 
@@ -2617,11 +2594,11 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         if trimmed.is_empty() {
             let templates = self.resources.prompts();
             if templates.is_empty() {
-                self.status_message = Some("No prompt templates loaded".to_string());
+                self.status_message = Some(ui.no_prompt_templates_loaded().to_string());
                 return None;
             }
 
-            let mut listing = String::from("Available prompt templates:\n");
+            let mut listing = format!("{}:\n", ui.available_prompt_templates());
             for template in templates {
                 if template.description.trim().is_empty() {
                     let _ = writeln!(listing, "  /{}", template.name);
@@ -2636,7 +2613,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
                 thinking: None,
                 collapsed: false,
             });
-            self.scroll_to_last_match("Available prompt templates");
+            self.scroll_to_last_match(ui.available_prompt_templates());
             return None;
         }
 
@@ -2647,7 +2624,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             .unwrap_or((trimmed, ""));
         let name = name.trim_start_matches('/');
         if name.is_empty() {
-            self.status_message = Some("Usage: /template <name> [args]".to_string());
+            self.status_message = Some(ui.template_usage().to_string());
             return None;
         }
 
@@ -2660,14 +2637,14 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let expanded = {
             let templates = self.resources.prompts();
             if templates.iter().all(|template| template.name != name) {
-                self.status_message = Some(format!("Template not found: {name}"));
+                self.status_message = Some(ui.template_not_found(name));
                 return None;
             }
             crate::resources::expand_prompt_template(&raw_input, templates)
         };
 
         if expanded.trim().is_empty() {
-            self.status_message = Some("Template expansion produced empty output".to_string());
+            self.status_message = Some(ui.template_empty_output().to_string());
             return None;
         }
 
@@ -2704,8 +2681,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
             }
 
             if content.is_empty() {
-                self.status_message =
-                    Some("Template expansion produced no usable content".to_string());
+                self.status_message = Some(ui.template_no_usable_content().to_string());
                 return None;
             }
 
@@ -2715,7 +2691,7 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         }
 
         if message_for_agent.is_empty() {
-            self.status_message = Some("Template expansion produced empty output".to_string());
+            self.status_message = Some(ui.template_empty_output().to_string());
             return None;
         }
 
@@ -2723,6 +2699,46 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         let content = vec![ContentBlock::Text(TextContent::new(message_for_agent))];
         let display = super::conversation::content_blocks_to_text(&content);
         self.submit_content_with_display(content, &display)
+    }
+
+    pub(super) fn handle_slash_language(&mut self, args: &str) -> Option<Cmd> {
+        let ui = PromptCatalog::new(self.config.language()).ui_text();
+        let value = args.trim();
+        if value.is_empty() {
+            self.status_message = Some(ui.language_status(self.config.language()));
+            return None;
+        }
+
+        let language = match value.to_ascii_lowercase().as_str() {
+            "zh" | "cn" | "chinese" | "中文" => Language::Zh,
+            "en" | "eng" | "english" => Language::En,
+            _ => {
+                self.status_message = Some(ui.language_invalid(value));
+                return None;
+            }
+        };
+
+        let global_dir = Config::global_dir();
+        let patch = serde_json::json!({
+            "language": match language {
+                Language::Zh => "zh",
+                Language::En => "en",
+            }
+        });
+        if let Err(err) =
+            Config::patch_settings_with_roots(SettingsScope::Project, &global_dir, &self.cwd, patch)
+        {
+            self.status_message = Some(err.to_string());
+            return None;
+        }
+
+        self.config.language = Some(match language {
+            Language::Zh => "zh".to_string(),
+            Language::En => "en".to_string(),
+        });
+        let next_ui = PromptCatalog::new(language).ui_text();
+        self.status_message = Some(next_ui.language_updated(language));
+        None
     }
 }
 
