@@ -126,7 +126,7 @@ pub mod session;
 #[doc(hidden)]
 pub mod session_index;
 #[doc(hidden)]
-pub mod session_metrics;
+pub use pi_observability as session_metrics;
 #[doc(hidden)]
 pub mod session_picker;
 #[cfg(feature = "sqlite-sessions")]

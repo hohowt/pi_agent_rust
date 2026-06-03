@@ -832,7 +832,7 @@ pub async fn save_session(
             total_json_bytes += json.len() as u64;
             entry_jsons.push(json);
         }
-        serialize_timer.finish();
+        let _ = serialize_timer.finish();
         metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
 
         map_sqlite_result(conn.execute(
@@ -908,7 +908,7 @@ pub async fn append_entries(
             total_json_bytes += json.len() as u64;
             entry_jsons.push(json);
         }
-        serialize_timer.finish();
+        let _ = serialize_timer.finish();
         metrics.record_bytes(&metrics.sqlite_bytes, total_json_bytes);
 
         let start_seq = i64::try_from(start_seq)

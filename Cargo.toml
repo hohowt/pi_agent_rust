@@ -64,6 +64,7 @@ path = "tests/root_tokio_runtime.rs"
 [dependencies]
 pi-core = { path = "crates/pi-core" }
 pi-http = { path = "crates/pi-http" }
+pi-observability = { path = "crates/pi-observability" }
 pi-platform = { path = "crates/pi-platform" }
 pi-runtime = { path = "crates/pi-runtime" }
 
@@ -197,6 +198,7 @@ members = [
     ".",
     "crates/pi-core",
     "crates/pi-http",
+    "crates/pi-observability",
     "crates/pi-platform",
     "crates/pi-runtime",
 ]

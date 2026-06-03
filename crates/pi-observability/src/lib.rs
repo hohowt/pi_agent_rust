@@ -278,7 +278,7 @@ impl std::fmt::Display for ByteSnapshot {
 /// 3. **IO / Fsync**: file write, flush, and atomic-rename time
 /// 4. **Index update**: session-index upsert time
 ///
-/// Plus additional breakdowns for SQLite paths and lock contention.
+/// Plus additional breakdowns for `SQLite` paths and lock contention.
 pub struct SessionMetrics {
     enabled: AtomicBool,
 
@@ -299,9 +299,9 @@ pub struct SessionMetrics {
     pub sqlite_save: TimingCounter,
     /// Total wall-clock time for `append_entries()` (incremental append).
     pub sqlite_append: TimingCounter,
-    /// Time spent serializing entries to JSON strings within SQLite save.
+    /// Time spent serializing entries to JSON strings within `SQLite` save.
     pub sqlite_serialize: TimingCounter,
-    /// Total JSON bytes produced during SQLite save serialization.
+    /// Total JSON bytes produced during `SQLite` save serialization.
     pub sqlite_bytes: ByteCounter,
 
     // -- SQLite load path (session_sqlite.rs) --
@@ -335,7 +335,7 @@ pub struct SessionMetrics {
     pub tui_content_build: TimingCounter,
     /// Conversation viewport sync latency.
     pub tui_viewport_sync: TimingCounter,
-    /// Bubbletea update() latency.
+    /// Bubbletea `update()` latency.
     pub tui_update: TimingCounter,
 }
 
@@ -530,6 +530,7 @@ impl SessionMetrics {
 
     /// Produce a redaction-safe JSON-serializable tail-latency report for
     /// operator handoff tools. The report contains timing counters only.
+    #[must_use]
     pub fn operator_tail_latency_report(&self) -> OperatorTailLatencyReport {
         self.snapshot().operator_tail_latency_report()
     }
@@ -592,6 +593,7 @@ pub struct OperatorTailLatencyReport {
 }
 
 impl MetricsSnapshot {
+    #[must_use]
     pub fn operator_tail_latency_report(&self) -> OperatorTailLatencyReport {
         OperatorTailLatencyReport {
             schema: OPERATOR_TAIL_LATENCY_SCHEMA_V1,
@@ -670,6 +672,7 @@ impl ScopedTimer<'_> {
     /// Manually finish the timer and return elapsed microseconds.
     /// Consumes self so drop won't double-record.
     #[allow(clippy::cast_possible_truncation)]
+    #[must_use]
     pub fn finish(mut self) -> u64 {
         let elapsed_us = self.start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64;
         if let Some(counter) = self.counter {
