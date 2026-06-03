@@ -92,7 +92,7 @@ pi --list-models
 
 ### 内置工具
 
-Pi 向模型暴露 8 个 Rust 原生工具：
+Pi 向模型暴露 Rust 原生工具：
 
 | 工具 | 作用 |
 |---|---|
@@ -104,8 +104,14 @@ Pi 向模型暴露 8 个 Rust 原生工具：
 | `find` | 按路径或 glob 查找文件。 |
 | `ls` | 列出目录内容。 |
 | `hashline_edit` | 使用 `read`/`grep` 输出中的 line/hash 标记进行精确编辑。 |
+| `codegraph_search` | 搜索项目索引中的代码符号。 |
+| `codegraph_callers` | 查询调用某个符号的位置。 |
+| `codegraph_callees` | 查询某个符号调用的位置。 |
+| `codegraph_impact` | 从反向调用图估算修改影响面。 |
+| `codegraph_node` | 查看一个符号及其 callers/callees。 |
+| `codegraph_trace` | 查找两个符号之间的调用路径。 |
 
-这些工具都在 Rust 中实现，并通过 `ToolRegistry` 注册。Agent loop 会把 JSON Schema 工具定义发送给 provider，并把工具结果写回会话。
+这些工具都在 Rust 中实现，并通过 `ToolRegistry` 注册。Agent loop 会把 JSON Schema 工具定义发送给 provider，并把工具结果写回会话。Codegraph 查询工具只读取已初始化的项目内 `.pi-coding/db.sqlite` 索引。
 
 ### Provider 支持
 
@@ -226,7 +232,7 @@ AgentSession + Agent loop
         |
         +--> ToolRegistry
         |        |
-        |        +--> read/write/edit/bash/grep/find/ls/hashline_edit
+        |        +--> read/write/edit/bash/grep/find/ls/hashline_edit/codegraph_*
         |
         +--> Session persistence
                  |

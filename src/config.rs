@@ -118,6 +118,9 @@ pub struct Config {
     // Terminal Display
     pub terminal: Option<TerminalSettings>,
 
+    // Codegraph indexing
+    pub codegraph: Option<CodegraphSettings>,
+
     // Thinking Budgets
     #[serde(alias = "thinkingBudgets")]
     pub thinking_budgets: Option<ThinkingBudgets>,
@@ -187,6 +190,14 @@ pub struct TerminalSettings {
     pub show_images: Option<bool>,
     #[serde(alias = "clearOnShrink")]
     pub clear_on_shrink: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CodegraphSettings {
+    #[serde(alias = "autoInit")]
+    pub auto_init: Option<bool>,
+    pub watch: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -404,6 +415,9 @@ impl Config {
             // Terminal Display
             terminal: merge_terminal(base.terminal, other.terminal),
 
+            // Codegraph indexing
+            codegraph: merge_codegraph(base.codegraph, other.codegraph),
+
             // Thinking Budgets
             thinking_budgets: merge_thinking_budgets(base.thinking_budgets, other.thinking_budgets),
 
@@ -488,6 +502,20 @@ impl Config {
             .as_ref()
             .and_then(|i| i.block_images)
             .unwrap_or(false)
+    }
+
+    pub fn codegraph_auto_init(&self) -> bool {
+        self.codegraph
+            .as_ref()
+            .and_then(|settings| settings.auto_init)
+            .unwrap_or(true)
+    }
+
+    pub fn codegraph_watch(&self) -> bool {
+        self.codegraph
+            .as_ref()
+            .and_then(|settings| settings.watch)
+            .unwrap_or(true)
     }
 
     pub fn terminal_show_images(&self) -> bool {
@@ -733,6 +761,21 @@ fn merge_terminal(
         (Some(base), Some(other)) => Some(TerminalSettings {
             show_images: other.show_images.or(base.show_images),
             clear_on_shrink: other.clear_on_shrink.or(base.clear_on_shrink),
+        }),
+        (None, Some(other)) => Some(other),
+        (Some(base), None) => Some(base),
+        (None, None) => None,
+    }
+}
+
+fn merge_codegraph(
+    base: Option<CodegraphSettings>,
+    other: Option<CodegraphSettings>,
+) -> Option<CodegraphSettings> {
+    match (base, other) {
+        (Some(base), Some(other)) => Some(CodegraphSettings {
+            auto_init: other.auto_init.or(base.auto_init),
+            watch: other.watch.or(base.watch),
         }),
         (None, Some(other)) => Some(other),
         (Some(base), None) => Some(base),

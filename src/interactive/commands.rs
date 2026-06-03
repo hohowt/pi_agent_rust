@@ -39,6 +39,7 @@ pub enum SlashCommand {
     Reload,
     Template,
     Share,
+    Codegraph,
 }
 
 impl SlashCommand {
@@ -77,6 +78,7 @@ impl SlashCommand {
             "/reload" => Self::Reload,
             "/template" => Self::Template,
             "/share" => Self::Share,
+            "/codegraph" | "/cg" => Self::Codegraph,
             _ => return None,
         };
 
@@ -110,6 +112,7 @@ impl SlashCommand {
   /reload            - Reload skills/prompts from disk
   /template <name> [args] - Expand a prompt template by name
   /share             - Upload session HTML to a secret GitHub gist and show URL
+  /codegraph [init|sync|status] - Manage the project codegraph index
   /exit, /quit, /q   - Exit Pi
 
   Tips:
@@ -1871,6 +1874,7 @@ impl PiApp {
             SlashCommand::Reload => self.handle_slash_reload(),
             SlashCommand::Template => self.handle_slash_template(args),
             SlashCommand::Share => self.handle_slash_share(args),
+            SlashCommand::Codegraph => self.handle_slash_codegraph(args),
         }
     }
 
@@ -2526,6 +2530,79 @@ result in account suspension/ban. Prefer using an Anthropic API key (ANTHROPIC_A
         });
 
         self.status_message = Some("Reloading resources...".to_string());
+        None
+    }
+
+    pub(super) fn handle_slash_codegraph(&mut self, args: &str) -> Option<Cmd> {
+        if self.agent_state != AgentState::Idle {
+            self.status_message = Some("Cannot index while processing".to_string());
+            return None;
+        }
+
+        let action = args.trim();
+        let action = if action.is_empty() { "status" } else { action };
+        let result = match action {
+            "init" => pi_codegraph::CodeGraphIndex::open(&self.cwd).and_then(|index| {
+                let report = index.sync_project()?;
+                let files = index.indexed_files()?.len();
+                Ok(format!(
+                    "Codegraph initialized\nDB: {}\nFiles: {}\nIndexed: {}  unchanged: {}  removed: {}  skipped: {}",
+                    index.db_path().display(),
+                    files,
+                    report.indexed_files,
+                    report.unchanged_files,
+                    report.removed_files,
+                    report.skipped_files
+                ))
+            }),
+            "sync" => pi_codegraph::CodeGraphIndex::open(&self.cwd).and_then(|index| {
+                let report = index.sync_project()?;
+                let files = index.indexed_files()?.len();
+                Ok(format!(
+                    "Codegraph synced\nDB: {}\nFiles: {}\nIndexed: {}  unchanged: {}  removed: {}  skipped: {}",
+                    index.db_path().display(),
+                    files,
+                    report.indexed_files,
+                    report.unchanged_files,
+                    report.removed_files,
+                    report.skipped_files
+                ))
+            }),
+            "status" => match pi_codegraph::CodeGraphIndex::open_existing(&self.cwd) {
+                Ok(index) => index.indexed_files().map(|files| {
+                    format!(
+                        "Codegraph status\nInitialized: true\nDB: {}\nFiles: {}",
+                        index.db_path().display(),
+                        files.len()
+                    )
+                }),
+                Err(pi_codegraph::CodeGraphError::IndexNotInitialized(path)) => {
+                    Ok(format!(
+                        "Codegraph status\nInitialized: false\nDB: {}",
+                        path.display()
+                    ))
+                }
+                Err(err) => Err(err),
+            },
+            _ => Ok("Usage: /codegraph [init|sync|status]".to_string()),
+        };
+
+        match result {
+            Ok(content) => {
+                self.messages.push(ConversationMessage {
+                    role: MessageRole::System,
+                    content: content.clone(),
+                    thinking: None,
+                    collapsed: false,
+                });
+                self.status_message =
+                    Some(content.lines().next().unwrap_or("Codegraph").to_string());
+                self.scroll_to_bottom();
+            }
+            Err(err) => {
+                self.status_message = Some(format!("Codegraph failed: {err}"));
+            }
+        }
         None
     }
 

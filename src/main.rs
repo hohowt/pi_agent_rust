@@ -14,6 +14,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::thread;
 use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
@@ -262,6 +263,10 @@ fn main_impl() -> Result<()> {
                     *max_bytes,
                     query,
                 )?;
+                return Ok(());
+            }
+            cli::Commands::Codegraph { command } => {
+                handle_codegraph_command(&cwd, command.clone())?;
                 return Ok(());
             }
             cli::Commands::List => {
@@ -687,6 +692,8 @@ async fn run(mut cli: cli::Cli, runtime_handle: RuntimeHandle) -> Result<()> {
     };
 
     let enabled_tools = cli.enabled_tools();
+    maybe_auto_init_codegraph(&cwd, &config);
+    maybe_start_codegraph_watcher(&cwd, &config);
     let skills_prompt = if enabled_tools.contains(&"read") {
         resources.format_skills_for_prompt()
     } else {
@@ -881,6 +888,9 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
                 &query,
             )?;
         }
+        cli::Commands::Codegraph { command } => {
+            handle_codegraph_command(cwd, command)?;
+        }
         cli::Commands::List => {
             handle_package_list(&manager).await?;
         }
@@ -893,6 +903,155 @@ async fn handle_subcommand(command: cli::Commands, cwd: &Path) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct CodegraphCommandReport {
+    schema: &'static str,
+    command: &'static str,
+    db_path: String,
+    initialized: bool,
+    files: usize,
+    indexed_files: usize,
+    unchanged_files: usize,
+    removed_files: usize,
+    skipped_files: usize,
+}
+
+fn handle_codegraph_command(cwd: &Path, command: cli::CodegraphCommand) -> Result<()> {
+    match command {
+        cli::CodegraphCommand::Init { format } => {
+            let index = pi_codegraph::CodeGraphIndex::open(cwd)?;
+            let sync = index.sync_project()?;
+            let files = index.indexed_files()?.len();
+            let report = CodegraphCommandReport {
+                schema: "pi.codegraph.command.v1",
+                command: "init",
+                db_path: index.db_path().display().to_string(),
+                initialized: true,
+                files,
+                indexed_files: sync.indexed_files,
+                unchanged_files: sync.unchanged_files,
+                removed_files: sync.removed_files,
+                skipped_files: sync.skipped_files,
+            };
+            print_codegraph_command_report(&format, &report)?;
+        }
+        cli::CodegraphCommand::Sync { format } => {
+            let index = pi_codegraph::CodeGraphIndex::open(cwd)?;
+            let sync = index.sync_project()?;
+            let files = index.indexed_files()?.len();
+            let report = CodegraphCommandReport {
+                schema: "pi.codegraph.command.v1",
+                command: "sync",
+                db_path: index.db_path().display().to_string(),
+                initialized: true,
+                files,
+                indexed_files: sync.indexed_files,
+                unchanged_files: sync.unchanged_files,
+                removed_files: sync.removed_files,
+                skipped_files: sync.skipped_files,
+            };
+            print_codegraph_command_report(&format, &report)?;
+        }
+        cli::CodegraphCommand::Status { format } => {
+            let db_path = pi_codegraph::project_db_path(cwd);
+            let report = match pi_codegraph::CodeGraphIndex::open_existing(cwd) {
+                Ok(index) => CodegraphCommandReport {
+                    schema: "pi.codegraph.command.v1",
+                    command: "status",
+                    db_path: index.db_path().display().to_string(),
+                    initialized: true,
+                    files: index.indexed_files()?.len(),
+                    indexed_files: 0,
+                    unchanged_files: 0,
+                    removed_files: 0,
+                    skipped_files: 0,
+                },
+                Err(pi_codegraph::CodeGraphError::IndexNotInitialized(_)) => {
+                    CodegraphCommandReport {
+                        schema: "pi.codegraph.command.v1",
+                        command: "status",
+                        db_path: db_path.display().to_string(),
+                        initialized: false,
+                        files: 0,
+                        indexed_files: 0,
+                        unchanged_files: 0,
+                        removed_files: 0,
+                        skipped_files: 0,
+                    }
+                }
+                Err(err) => return Err(err.into()),
+            };
+            print_codegraph_command_report(&format, &report)?;
+        }
+    }
+    Ok(())
+}
+
+fn print_codegraph_command_report(format: &str, report: &CodegraphCommandReport) -> Result<()> {
+    match format {
+        "json" => println!("{}", serde_json::to_string_pretty(report)?),
+        "text" => {
+            println!("Codegraph {}", report.command);
+            println!("initialized: {}", report.initialized);
+            println!("db: {}", report.db_path);
+            println!("files: {}", report.files);
+            println!(
+                "sync: indexed={} unchanged={} removed={} skipped={}",
+                report.indexed_files,
+                report.unchanged_files,
+                report.removed_files,
+                report.skipped_files
+            );
+        }
+        other => bail!("unsupported codegraph format: {other}"),
+    }
+    Ok(())
+}
+
+fn maybe_auto_init_codegraph(cwd: &Path, config: &Config) {
+    if !config.codegraph_auto_init() {
+        return;
+    }
+    match pi_codegraph::CodeGraphIndex::open(cwd).and_then(|index| index.sync_project()) {
+        Ok(report) => {
+            tracing::debug!(
+                db_path = %report.db_path.display(),
+                indexed = report.indexed_files,
+                unchanged = report.unchanged_files,
+                removed = report.removed_files,
+                skipped = report.skipped_files,
+                "codegraph auto init/sync completed"
+            );
+        }
+        Err(err) => {
+            eprintln!("Warning: codegraph auto init failed: {err}");
+        }
+    }
+}
+
+fn maybe_start_codegraph_watcher(cwd: &Path, config: &Config) {
+    if !config.codegraph_watch() {
+        return;
+    }
+    let root = cwd.to_path_buf();
+    if pi_codegraph::CodeGraphIndex::open_existing(&root).is_err() {
+        return;
+    }
+    let _ = thread::Builder::new()
+        .name("pi-codegraph-watch".to_string())
+        .spawn(move || {
+            loop {
+                thread::sleep(Duration::from_secs(5));
+                let Ok(index) = pi_codegraph::CodeGraphIndex::open_existing(&root) else {
+                    break;
+                };
+                if let Err(err) = index.sync_project() {
+                    tracing::warn!(error = %err, "codegraph watcher sync failed");
+                }
+            }
+        });
 }
 
 #[derive(Debug, Serialize)]

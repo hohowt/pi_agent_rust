@@ -114,6 +114,7 @@ pub enum CodeGraphError {
     Sqlite(rusqlite::Error),
     RootNotDirectory(PathBuf),
     InvalidProjectPath(PathBuf),
+    IndexNotInitialized(PathBuf),
 }
 
 impl fmt::Display for CodeGraphError {
@@ -131,6 +132,13 @@ impl fmt::Display for CodeGraphError {
             Self::InvalidProjectPath(path) => {
                 write!(formatter, "invalid project path: {}", path.display())
             }
+            Self::IndexNotInitialized(path) => {
+                write!(
+                    formatter,
+                    "codegraph index is not initialized: {}",
+                    path.display()
+                )
+            }
         }
     }
 }
@@ -140,7 +148,9 @@ impl StdError for CodeGraphError {
         match self {
             Self::Io(error) => Some(error),
             Self::Sqlite(error) => Some(error),
-            Self::RootNotDirectory(_) | Self::InvalidProjectPath(_) => None,
+            Self::RootNotDirectory(_)
+            | Self::InvalidProjectPath(_)
+            | Self::IndexNotInitialized(_) => None,
         }
     }
 }
@@ -175,6 +185,18 @@ impl CodeGraphIndex {
         let index = Self { root, db_path };
         index.ensure_database()?;
         Ok(index)
+    }
+
+    pub fn open_existing(project_root: impl Into<PathBuf>) -> CodeGraphResult<Self> {
+        let root = project_root.into();
+        if !root.is_dir() {
+            return Err(CodeGraphError::RootNotDirectory(root));
+        }
+        let db_path = project_db_path(&root);
+        if !db_path.exists() {
+            return Err(CodeGraphError::IndexNotInitialized(db_path));
+        }
+        Ok(Self { root, db_path })
     }
 
     #[must_use]
@@ -370,7 +392,7 @@ impl CodeGraphIndex {
     ) -> CodeGraphResult<SyncReport> {
         absolute_paths.sort_by_key(|path| normalize_path(path));
         absolute_paths.dedup();
-        let mut conn = self.open_connection()?;
+        let mut conn = self.open_or_create_connection()?;
         let tx = conn.transaction()?;
         let mut report = SyncReport {
             db_path: self.db_path.clone(),
@@ -406,7 +428,7 @@ impl CodeGraphIndex {
         } else {
             normalize_path(path)
         };
-        let conn = self.open_connection()?;
+        let conn = self.open_or_create_connection()?;
         conn.execute(
             "DELETE FROM files WHERE source_path = ?1",
             params![source_path],
@@ -420,12 +442,19 @@ impl CodeGraphIndex {
             .parent()
             .ok_or_else(|| CodeGraphError::InvalidProjectPath(self.db_path.clone()))?;
         fs::create_dir_all(parent)?;
-        let conn = self.open_connection()?;
+        let conn = self.open_or_create_connection()?;
         initialize_schema(&conn)?;
         Ok(())
     }
 
     fn open_connection(&self) -> CodeGraphResult<Connection> {
+        Ok(Connection::open_with_flags(
+            &self.db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?)
+    }
+
+    fn open_or_create_connection(&self) -> CodeGraphResult<Connection> {
         Ok(Connection::open_with_flags(
             &self.db_path,
             OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -1391,6 +1420,15 @@ mod tests {
         let second = index.sync_project().expect("second sync");
         assert_eq!(second.indexed_files, 0);
         assert_eq!(second.unchanged_files, 1);
+    }
+
+    #[test]
+    fn open_existing_does_not_create_uninitialized_index() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = super::project_db_path(dir.path());
+        let err = CodeGraphIndex::open_existing(dir.path()).expect_err("missing index");
+        assert!(matches!(err, super::CodeGraphError::IndexNotInitialized(_)));
+        assert!(!db_path.exists());
     }
 
     #[test]

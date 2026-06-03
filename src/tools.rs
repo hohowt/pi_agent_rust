@@ -1,6 +1,6 @@
 //! Built-in tool implementations.
 //!
-//! Pi provides 8 built-in tools: read, bash, edit, write, grep, find, ls, hashline_edit.
+//! Pi provides built-in tools for file operations, shell commands, search, and codegraph queries.
 //!
 //! Tools are exposed to the model via JSON Schema (see [`crate::provider::ToolDef`]) and executed
 //! locally by the agent loop. Each tool returns structured [`ContentBlock`] output suitable for
@@ -16,6 +16,7 @@ use crate::model::{ContentBlock, ImageContent, TextContent};
 use crate::runtime;
 use crate::time::{sleep, wall_now};
 use async_trait::async_trait;
+use pi_codegraph::CodeGraphIndex;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use std::cmp::Ordering;
@@ -2724,6 +2725,12 @@ impl ToolRegistry {
                 "find" => tools.push(Box::new(FindTool::new(cwd))),
                 "ls" => tools.push(Box::new(LsTool::new(cwd))),
                 "hashline_edit" => tools.push(Box::new(HashlineEditTool::new(cwd))),
+                "codegraph_search" => tools.push(Box::new(CodegraphSearchTool::new(cwd))),
+                "codegraph_callers" => tools.push(Box::new(CodegraphCallersTool::new(cwd))),
+                "codegraph_callees" => tools.push(Box::new(CodegraphCalleesTool::new(cwd))),
+                "codegraph_impact" => tools.push(Box::new(CodegraphImpactTool::new(cwd))),
+                "codegraph_node" => tools.push(Box::new(CodegraphNodeTool::new(cwd))),
+                "codegraph_trace" => tools.push(Box::new(CodegraphTraceTool::new(cwd))),
                 _ => {}
             }
         }
@@ -5569,6 +5576,304 @@ impl Tool for GrepTool {
 }
 
 // ============================================================================
+// Codegraph Tools
+// ============================================================================
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodegraphSymbolInput {
+    symbol: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodegraphSearchInput {
+    query: String,
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodegraphImpactInput {
+    symbol: String,
+    depth: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CodegraphTraceInput {
+    from: String,
+    to: String,
+    max_depth: Option<usize>,
+}
+
+fn open_existing_codegraph(cwd: &Path) -> Result<CodeGraphIndex> {
+    CodeGraphIndex::open_existing(cwd).map_err(|err| {
+        Error::tool(
+            "codegraph",
+            format!("{err}. Run `pi codegraph init` or trigger codegraph indexing in the TUI."),
+        )
+    })
+}
+
+fn codegraph_output<T: Serialize>(summary: String, result_key: &str, value: T) -> ToolOutput {
+    let details = serde_json::json!({
+        "schema": "pi.tool.codegraph.result.v1",
+        result_key: value,
+    });
+    ToolOutput {
+        content: vec![ContentBlock::Text(TextContent::new(summary))],
+        details: Some(details),
+        is_error: false,
+    }
+}
+
+macro_rules! codegraph_tool_boilerplate {
+    ($tool:ident, $name:literal, $label:literal, $description:literal, $params:expr) => {
+        pub struct $tool {
+            cwd: PathBuf,
+        }
+
+        impl $tool {
+            pub fn new(cwd: &Path) -> Self {
+                Self {
+                    cwd: cwd.to_path_buf(),
+                }
+            }
+        }
+
+        impl $tool {
+            fn parameters_value() -> serde_json::Value {
+                $params
+            }
+        }
+
+        #[async_trait]
+        impl Tool for $tool {
+            fn name(&self) -> &str {
+                $name
+            }
+
+            fn label(&self) -> &str {
+                $label
+            }
+
+            fn description(&self) -> &str {
+                $description
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                Self::parameters_value()
+            }
+
+            fn effects(&self) -> ToolEffects {
+                ToolEffects::read()
+            }
+
+            async fn execute(
+                &self,
+                _tool_call_id: &str,
+                input: serde_json::Value,
+                _on_update: Option<Box<dyn Fn(ToolUpdate) + Send + Sync>>,
+            ) -> Result<ToolOutput> {
+                self.execute_codegraph(input)
+            }
+        }
+    };
+}
+
+codegraph_tool_boilerplate!(
+    CodegraphSearchTool,
+    "codegraph_search",
+    "codegraph search",
+    "Search indexed code symbols by name, kind, or source path.",
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Symbol, kind, or path search text."},
+            "limit": {"type": "integer", "description": "Maximum results, default 20."}
+        },
+        "required": ["query"]
+    })
+);
+
+impl CodegraphSearchTool {
+    fn execute_codegraph(&self, input: serde_json::Value) -> Result<ToolOutput> {
+        let input: CodegraphSearchInput =
+            serde_json::from_value(input).map_err(|err| Error::validation(err.to_string()))?;
+        let index = open_existing_codegraph(&self.cwd)?;
+        let results = index
+            .search(&input.query, input.limit.unwrap_or(20))
+            .map_err(|err| Error::tool("codegraph_search", err.to_string()))?;
+        Ok(codegraph_output(
+            format!("codegraph_search: {} result(s)", results.len()),
+            "symbols",
+            results,
+        ))
+    }
+}
+
+codegraph_tool_boilerplate!(
+    CodegraphCallersTool,
+    "codegraph_callers",
+    "codegraph callers",
+    "List indexed calls that target a symbol.",
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string", "description": "Callee symbol name."},
+            "limit": {"type": "integer", "description": "Maximum results, default 50."}
+        },
+        "required": ["symbol"]
+    })
+);
+
+impl CodegraphCallersTool {
+    fn execute_codegraph(&self, input: serde_json::Value) -> Result<ToolOutput> {
+        let input: CodegraphSymbolInput =
+            serde_json::from_value(input).map_err(|err| Error::validation(err.to_string()))?;
+        let index = open_existing_codegraph(&self.cwd)?;
+        let results = index
+            .callers(&input.symbol, input.limit.unwrap_or(50))
+            .map_err(|err| Error::tool("codegraph_callers", err.to_string()))?;
+        Ok(codegraph_output(
+            format!("codegraph_callers: {} caller(s)", results.len()),
+            "calls",
+            results,
+        ))
+    }
+}
+
+codegraph_tool_boilerplate!(
+    CodegraphCalleesTool,
+    "codegraph_callees",
+    "codegraph callees",
+    "List indexed calls made by a symbol.",
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string", "description": "Caller symbol name."},
+            "limit": {"type": "integer", "description": "Maximum results, default 50."}
+        },
+        "required": ["symbol"]
+    })
+);
+
+impl CodegraphCalleesTool {
+    fn execute_codegraph(&self, input: serde_json::Value) -> Result<ToolOutput> {
+        let input: CodegraphSymbolInput =
+            serde_json::from_value(input).map_err(|err| Error::validation(err.to_string()))?;
+        let index = open_existing_codegraph(&self.cwd)?;
+        let results = index
+            .callees(&input.symbol, input.limit.unwrap_or(50))
+            .map_err(|err| Error::tool("codegraph_callees", err.to_string()))?;
+        Ok(codegraph_output(
+            format!("codegraph_callees: {} callee(s)", results.len()),
+            "calls",
+            results,
+        ))
+    }
+}
+
+codegraph_tool_boilerplate!(
+    CodegraphImpactTool,
+    "codegraph_impact",
+    "codegraph impact",
+    "List symbols that can be affected by changing a symbol.",
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string", "description": "Changed symbol name."},
+            "depth": {"type": "integer", "description": "Reverse-call depth, default 2."}
+        },
+        "required": ["symbol"]
+    })
+);
+
+impl CodegraphImpactTool {
+    fn execute_codegraph(&self, input: serde_json::Value) -> Result<ToolOutput> {
+        let input: CodegraphImpactInput =
+            serde_json::from_value(input).map_err(|err| Error::validation(err.to_string()))?;
+        let index = open_existing_codegraph(&self.cwd)?;
+        let result = index
+            .impact(&input.symbol, input.depth.unwrap_or(2))
+            .map_err(|err| Error::tool("codegraph_impact", err.to_string()))?;
+        Ok(codegraph_output(
+            format!(
+                "codegraph_impact: {} impacted symbol(s)",
+                result.impacted_symbols.len()
+            ),
+            "impact",
+            result,
+        ))
+    }
+}
+
+codegraph_tool_boilerplate!(
+    CodegraphNodeTool,
+    "codegraph_node",
+    "codegraph node",
+    "Return one indexed symbol with its callers and callees.",
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "symbol": {"type": "string", "description": "Symbol name."}
+        },
+        "required": ["symbol"]
+    })
+);
+
+impl CodegraphNodeTool {
+    fn execute_codegraph(&self, input: serde_json::Value) -> Result<ToolOutput> {
+        let input: CodegraphSymbolInput =
+            serde_json::from_value(input).map_err(|err| Error::validation(err.to_string()))?;
+        let index = open_existing_codegraph(&self.cwd)?;
+        let result = index
+            .node(&input.symbol)
+            .map_err(|err| Error::tool("codegraph_node", err.to_string()))?;
+        let summary = if result.is_some() {
+            "codegraph_node: found".to_string()
+        } else {
+            "codegraph_node: not found".to_string()
+        };
+        Ok(codegraph_output(summary, "node", result))
+    }
+}
+
+codegraph_tool_boilerplate!(
+    CodegraphTraceTool,
+    "codegraph_trace",
+    "codegraph trace",
+    "Find an indexed call path from one symbol to another.",
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "from": {"type": "string", "description": "Starting symbol name."},
+            "to": {"type": "string", "description": "Destination symbol name."},
+            "maxDepth": {"type": "integer", "description": "Maximum call depth, default 8."}
+        },
+        "required": ["from", "to"]
+    })
+);
+
+impl CodegraphTraceTool {
+    fn execute_codegraph(&self, input: serde_json::Value) -> Result<ToolOutput> {
+        let input: CodegraphTraceInput =
+            serde_json::from_value(input).map_err(|err| Error::validation(err.to_string()))?;
+        let index = open_existing_codegraph(&self.cwd)?;
+        let result = index
+            .trace(&input.from, &input.to, input.max_depth.unwrap_or(8))
+            .map_err(|err| Error::tool("codegraph_trace", err.to_string()))?;
+        let summary = result.as_ref().map_or_else(
+            || "codegraph_trace: no path".to_string(),
+            |trace| format!("codegraph_trace: {} hop(s)", trace.path.len()),
+        );
+        Ok(codegraph_output(summary, "trace", result))
+    }
+}
+
+// ============================================================================
 // Find Tool
 // ============================================================================
 
@@ -7807,6 +8112,49 @@ mod tests {
         );
         assert_eq!(actual.max_lines, expected.max_lines);
         assert_eq!(actual.max_bytes, expected.max_bytes);
+    }
+
+    #[test]
+    fn codegraph_search_requires_initialized_index() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+            std::fs::write(dir.path().join("src/lib.rs"), "fn target() {}\n")
+                .expect("write source");
+            let tool = CodegraphSearchTool::new(dir.path());
+            let output = tool
+                .execute("call", serde_json::json!({"query": "target"}), None)
+                .await;
+            assert!(output.is_err());
+            assert!(!pi_codegraph::project_db_path(dir.path()).exists());
+        });
+    }
+
+    #[test]
+    fn codegraph_search_reads_initialized_index() {
+        asupersync::test_utils::run_test(|| async {
+            let dir = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir_all(dir.path().join("src")).expect("create src");
+            std::fs::write(dir.path().join("src/lib.rs"), "fn target() {}\n")
+                .expect("write source");
+            let index = pi_codegraph::CodeGraphIndex::open(dir.path()).expect("open index");
+            index.sync_project().expect("sync");
+
+            let tool = CodegraphSearchTool::new(dir.path());
+            let output = tool
+                .execute("call", serde_json::json!({"query": "target"}), None)
+                .await
+                .expect("search output");
+            assert!(!output.is_error);
+            let symbols = output
+                .details
+                .as_ref()
+                .and_then(|details| details.get("symbols"))
+                .and_then(serde_json::Value::as_array)
+                .expect("symbols array");
+            assert_eq!(symbols.len(), 1);
+            assert_eq!(symbols[0]["name"], "target");
+        });
     }
 
     fn write_lines_with_builder(lines: &[&str], max_bytes: usize) -> TruncationResult {

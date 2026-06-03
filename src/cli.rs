@@ -163,10 +163,10 @@ pub struct Cli {
     #[arg(long)]
     pub no_tools: bool,
 
-    /// Specific tools to enable (comma-separated: read,write,edit,bash,grep,find,ls,hashline_edit)
+    /// Specific tools to enable (comma-separated).
     #[arg(
         long,
-        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit"
+        default_value = "read,bash,edit,write,grep,find,ls,hashline_edit,codegraph_search,codegraph_callers,codegraph_callees,codegraph_impact,codegraph_node,codegraph_trace"
     )]
     pub tools: String,
 
@@ -313,6 +313,12 @@ pub enum Commands {
         query: Vec<String>,
     },
 
+    /// Manage the project-local codegraph index
+    Codegraph {
+        #[command(subcommand)]
+        command: CodegraphCommand,
+    },
+
     /// List installed packages
     List,
 
@@ -336,6 +342,28 @@ pub enum Commands {
         /// Dry-run: validate migration without persisting changes
         #[arg(long)]
         dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub enum CodegraphCommand {
+    /// Create or rebuild the project-local codegraph index
+    Init {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
+    /// Sync changed supported source files into the existing index
+    Sync {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
+    },
+    /// Show index status without creating it
+    Status {
+        /// Output format: text (default) or json
+        #[arg(long, default_value = "text", value_parser = ["text", "json"])]
+        format: String,
     },
 }
 
