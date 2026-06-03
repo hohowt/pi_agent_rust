@@ -2094,6 +2094,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-platform"
+version = "0.1.16"
+
+[[package]]
 name = "pi-runtime"
 version = "0.1.16"
 dependencies = [
@@ -2127,6 +2131,7 @@ dependencies = [
  "memchr",
  "pi-core",
  "pi-http",
+ "pi-platform",
  "pi-runtime",
  "regex",
  "rich_rust",

@@ -18,6 +18,7 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 ///   - `"macos"` → `"darwin"`
 ///   - everything else passed through (`"linux"`, `"windows"`, …)
 #[inline]
+#[must_use]
 pub fn os_name() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
@@ -36,6 +37,7 @@ pub fn os_name() -> &'static str {
 ///   - `"x86_64"`  → `"amd64"`
 ///   - everything else passed through
 #[inline]
+#[must_use]
 pub fn arch_name() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -49,17 +51,20 @@ pub fn arch_name() -> &'static str {
 // ---------------------------------------------------------------------------
 
 /// `"{os}/{arch}"` — e.g. `"linux/amd64"`, `"darwin/arm64"`.
+#[must_use]
 pub fn platform_tag() -> String {
     format!("{}/{}", os_name(), arch_name())
 }
 
 /// Canonical Pi User-Agent: `"pi_agent_rust/{version}"`.
+#[must_use]
 pub fn pi_user_agent() -> String {
     format!("pi_agent_rust/{VERSION}")
 }
 
 /// Canonical Pi User-Agent with an additional component:
 /// `"pi_agent_rust/{version} {extra}"`.
+#[must_use]
 pub fn pi_user_agent_with(extra: &str) -> String {
     format!("pi_agent_rust/{VERSION} {extra}")
 }

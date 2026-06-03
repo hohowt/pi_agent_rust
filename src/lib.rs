@@ -105,11 +105,11 @@ pub mod models;
 #[doc(hidden)]
 pub mod package_manager;
 #[doc(hidden)]
-pub mod platform;
-#[doc(hidden)]
 pub use pi_core::provider;
 #[doc(hidden)]
 pub use pi_core::provider_metadata;
+#[doc(hidden)]
+pub use pi_platform as platform;
 #[doc(hidden)]
 pub mod providers;
 #[doc(hidden)]

@@ -64,6 +64,7 @@ path = "tests/root_tokio_runtime.rs"
 [dependencies]
 pi-core = { path = "crates/pi-core" }
 pi-http = { path = "crates/pi-http" }
+pi-platform = { path = "crates/pi-platform" }
 pi-runtime = { path = "crates/pi-runtime" }
 
 # CLI
@@ -196,6 +197,7 @@ members = [
     ".",
     "crates/pi-core",
     "crates/pi-http",
+    "crates/pi-platform",
     "crates/pi-runtime",
 ]
 resolver = "3"
