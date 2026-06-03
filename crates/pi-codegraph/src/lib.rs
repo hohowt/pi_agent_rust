@@ -6,8 +6,21 @@
 #![forbid(unsafe_code)]
 #![allow(clippy::missing_const_for_fn)]
 
-use std::path::Path;
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
+use std::error::Error as StdError;
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 use tree_sitter::{Language, Node as TreeSitterNode, Parser as TreeSitterParser};
+
+pub const PI_CODING_DIR: &str = ".pi-coding";
+pub const CODEGRAPH_DB_FILE: &str = "db.sqlite";
+pub const CODEGRAPH_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExtractedCodeGraph {
@@ -30,6 +43,505 @@ pub struct ExtractedCodeCall {
     pub caller: String,
     pub callee: String,
     pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexedFile {
+    pub source_path: String,
+    pub language_id: String,
+    pub sha256: String,
+    pub size_bytes: u64,
+    pub mtime_unix_ns: Option<u64>,
+    pub symbol_count: usize,
+    pub call_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SyncReport {
+    pub db_path: PathBuf,
+    pub scanned_files: usize,
+    pub indexed_files: usize,
+    pub unchanged_files: usize,
+    pub removed_files: usize,
+    pub skipped_files: usize,
+}
+
+#[derive(Debug)]
+pub enum CodeGraphError {
+    Io(io::Error),
+    Sqlite(rusqlite::Error),
+    RootNotDirectory(PathBuf),
+    InvalidProjectPath(PathBuf),
+}
+
+impl fmt::Display for CodeGraphError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Io(error) => write!(formatter, "I/O error: {error}"),
+            Self::Sqlite(error) => write!(formatter, "SQLite error: {error}"),
+            Self::RootNotDirectory(path) => {
+                write!(
+                    formatter,
+                    "project root is not a directory: {}",
+                    path.display()
+                )
+            }
+            Self::InvalidProjectPath(path) => {
+                write!(formatter, "invalid project path: {}", path.display())
+            }
+        }
+    }
+}
+
+impl StdError for CodeGraphError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        match self {
+            Self::Io(error) => Some(error),
+            Self::Sqlite(error) => Some(error),
+            Self::RootNotDirectory(_) | Self::InvalidProjectPath(_) => None,
+        }
+    }
+}
+
+impl From<io::Error> for CodeGraphError {
+    fn from(value: io::Error) -> Self {
+        Self::Io(value)
+    }
+}
+
+impl From<rusqlite::Error> for CodeGraphError {
+    fn from(value: rusqlite::Error) -> Self {
+        Self::Sqlite(value)
+    }
+}
+
+pub type CodeGraphResult<T> = Result<T, CodeGraphError>;
+
+#[derive(Debug, Clone)]
+pub struct CodeGraphIndex {
+    root: PathBuf,
+    db_path: PathBuf,
+}
+
+impl CodeGraphIndex {
+    pub fn open(project_root: impl Into<PathBuf>) -> CodeGraphResult<Self> {
+        let root = project_root.into();
+        if !root.is_dir() {
+            return Err(CodeGraphError::RootNotDirectory(root));
+        }
+        let db_path = project_db_path(&root);
+        let index = Self { root, db_path };
+        index.ensure_database()?;
+        Ok(index)
+    }
+
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    #[must_use]
+    pub fn db_path(&self) -> &Path {
+        &self.db_path
+    }
+
+    pub fn sync_project(&self) -> CodeGraphResult<SyncReport> {
+        let files = discover_supported_files(&self.root)?;
+        self.sync_discovered_files(files, true)
+    }
+
+    pub fn sync_paths(&self, paths: &[PathBuf]) -> CodeGraphResult<SyncReport> {
+        let mut files = Vec::new();
+        for path in paths {
+            let absolute = if path.is_absolute() {
+                path.clone()
+            } else {
+                self.root.join(path)
+            };
+            if absolute.is_file() {
+                if supported_source_path(&normalize_relative_path(&self.root, &absolute)) {
+                    files.push(absolute);
+                }
+            } else if absolute.is_dir() {
+                files.extend(discover_supported_files(&absolute)?);
+            } else {
+                self.remove_path(path)?;
+            }
+        }
+        self.sync_discovered_files(files, false)
+    }
+
+    pub fn indexed_files(&self) -> CodeGraphResult<Vec<IndexedFile>> {
+        let conn = self.open_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT source_path, language_id, sha256, size_bytes, mtime_unix_ns,
+                    symbol_count, call_count
+             FROM files
+             ORDER BY source_path",
+        )?;
+        let files = stmt
+            .query_map([], indexed_file_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(files)
+    }
+
+    fn sync_discovered_files(
+        &self,
+        mut absolute_paths: Vec<PathBuf>,
+        prune_missing: bool,
+    ) -> CodeGraphResult<SyncReport> {
+        absolute_paths.sort_by_key(|path| normalize_path(path));
+        absolute_paths.dedup();
+        let mut conn = self.open_connection()?;
+        let tx = conn.transaction()?;
+        let mut report = SyncReport {
+            db_path: self.db_path.clone(),
+            scanned_files: absolute_paths.len(),
+            indexed_files: 0,
+            unchanged_files: 0,
+            removed_files: 0,
+            skipped_files: 0,
+        };
+        let mut seen_paths = BTreeSet::new();
+
+        for absolute_path in absolute_paths {
+            let source_path = normalize_relative_path(&self.root, &absolute_path);
+            seen_paths.insert(source_path.clone());
+            match index_file(&tx, &absolute_path, &source_path)? {
+                FileIndexOutcome::Indexed => report.indexed_files += 1,
+                FileIndexOutcome::Unchanged => report.unchanged_files += 1,
+                FileIndexOutcome::Skipped => report.skipped_files += 1,
+            }
+        }
+
+        if prune_missing {
+            report.removed_files = prune_deleted_files(&tx, &seen_paths)?;
+        }
+        set_meta(&tx, "schema_version", &CODEGRAPH_SCHEMA_VERSION.to_string())?;
+        tx.commit()?;
+        Ok(report)
+    }
+
+    fn remove_path(&self, path: &Path) -> CodeGraphResult<()> {
+        let source_path = if path.is_absolute() {
+            normalize_relative_path(&self.root, path)
+        } else {
+            normalize_path(path)
+        };
+        let conn = self.open_connection()?;
+        conn.execute(
+            "DELETE FROM files WHERE source_path = ?1",
+            params![source_path],
+        )?;
+        Ok(())
+    }
+
+    fn ensure_database(&self) -> CodeGraphResult<()> {
+        let parent = self
+            .db_path
+            .parent()
+            .ok_or_else(|| CodeGraphError::InvalidProjectPath(self.db_path.clone()))?;
+        fs::create_dir_all(parent)?;
+        let conn = self.open_connection()?;
+        initialize_schema(&conn)?;
+        Ok(())
+    }
+
+    fn open_connection(&self) -> CodeGraphResult<Connection> {
+        Ok(Connection::open_with_flags(
+            &self.db_path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?)
+    }
+}
+
+#[must_use]
+pub fn project_db_path(project_root: &Path) -> PathBuf {
+    project_root.join(PI_CODING_DIR).join(CODEGRAPH_DB_FILE)
+}
+
+fn initialize_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+        CREATE TABLE IF NOT EXISTS meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS files (
+            source_path TEXT PRIMARY KEY,
+            language_id TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            size_bytes INTEGER NOT NULL,
+            mtime_unix_ns INTEGER,
+            symbol_count INTEGER NOT NULL,
+            call_count INTEGER NOT NULL,
+            indexed_at_unix_ms INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS symbols (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path TEXT NOT NULL REFERENCES files(source_path) ON DELETE CASCADE,
+            language_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            line_start INTEGER NOT NULL,
+            line_end INTEGER NOT NULL,
+            is_test INTEGER NOT NULL,
+            UNIQUE(source_path, kind, name, line_start)
+        );
+        CREATE INDEX IF NOT EXISTS idx_symbols_name ON symbols(name);
+        CREATE INDEX IF NOT EXISTS idx_symbols_path ON symbols(source_path);
+        CREATE TABLE IF NOT EXISTS calls (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_path TEXT NOT NULL REFERENCES files(source_path) ON DELETE CASCADE,
+            language_id TEXT NOT NULL,
+            caller TEXT NOT NULL,
+            callee TEXT NOT NULL,
+            line INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_calls_callee ON calls(callee);
+        CREATE INDEX IF NOT EXISTS idx_calls_caller ON calls(caller);
+        CREATE INDEX IF NOT EXISTS idx_calls_path ON calls(source_path);
+        ",
+    )?;
+    set_meta(
+        conn,
+        "schema_version",
+        &CODEGRAPH_SCHEMA_VERSION.to_string(),
+    )?;
+    Ok(())
+}
+
+fn set_meta(conn: &Connection, key: &str, value: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO meta(key, value) VALUES(?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
+fn discover_supported_files(root: &Path) -> CodeGraphResult<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    collect_supported_files(root, root, &mut files)?;
+    Ok(files)
+}
+
+fn collect_supported_files(
+    root: &Path,
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+) -> CodeGraphResult<()> {
+    let entries = fs::read_dir(dir)?;
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            if should_skip_dir(&path) {
+                continue;
+            }
+            collect_supported_files(root, &path, files)?;
+        } else if path.is_file() && supported_source_path(&normalize_relative_path(root, &path)) {
+            files.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn should_skip_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, ".git" | "target" | PI_CODING_DIR))
+}
+
+fn supported_source_path(source_path: &str) -> bool {
+    extractor_for_path(source_path).is_some()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileIndexOutcome {
+    Indexed,
+    Unchanged,
+    Skipped,
+}
+
+fn index_file(
+    conn: &Connection,
+    absolute_path: &Path,
+    source_path: &str,
+) -> CodeGraphResult<FileIndexOutcome> {
+    let bytes = fs::read(absolute_path)?;
+    let sha256 = sha256_hex(&bytes);
+    let size_bytes = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let mtime_unix_ns = file_mtime_unix_ns(absolute_path)?;
+    if existing_file_sha(conn, source_path)?.is_some_and(|existing| existing == sha256) {
+        return Ok(FileIndexOutcome::Unchanged);
+    }
+
+    let content = String::from_utf8_lossy(&bytes);
+    let Some(graph) = extract_code_graph(source_path, &content) else {
+        return Ok(FileIndexOutcome::Skipped);
+    };
+    conn.execute(
+        "INSERT INTO files(
+            source_path, language_id, sha256, size_bytes, mtime_unix_ns,
+            symbol_count, call_count, indexed_at_unix_ms
+         ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT(source_path) DO UPDATE SET
+            language_id = excluded.language_id,
+            sha256 = excluded.sha256,
+            size_bytes = excluded.size_bytes,
+            mtime_unix_ns = excluded.mtime_unix_ns,
+            symbol_count = excluded.symbol_count,
+            call_count = excluded.call_count,
+            indexed_at_unix_ms = excluded.indexed_at_unix_ms",
+        params![
+            source_path,
+            graph.language_id.as_str(),
+            sha256,
+            i64::try_from(size_bytes).unwrap_or(i64::MAX),
+            mtime_unix_ns.and_then(|value| i64::try_from(value).ok()),
+            i64::try_from(graph.symbols.len()).unwrap_or(i64::MAX),
+            i64::try_from(graph.calls.len()).unwrap_or(i64::MAX),
+            current_unix_ms(),
+        ],
+    )?;
+    conn.execute(
+        "DELETE FROM symbols WHERE source_path = ?1",
+        params![source_path],
+    )?;
+    conn.execute(
+        "DELETE FROM calls WHERE source_path = ?1",
+        params![source_path],
+    )?;
+    for symbol in &graph.symbols {
+        conn.execute(
+            "INSERT OR REPLACE INTO symbols(
+                source_path, language_id, kind, name, line_start, line_end, is_test
+             ) VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                source_path,
+                graph.language_id.as_str(),
+                symbol.kind.as_str(),
+                symbol.name.as_str(),
+                i64::try_from(symbol.line_start).unwrap_or(i64::MAX),
+                i64::try_from(symbol.line_end).unwrap_or(i64::MAX),
+                symbol.is_test,
+            ],
+        )?;
+    }
+    for call in &graph.calls {
+        conn.execute(
+            "INSERT INTO calls(source_path, language_id, caller, callee, line)
+             VALUES(?1, ?2, ?3, ?4, ?5)",
+            params![
+                source_path,
+                graph.language_id.as_str(),
+                call.caller.as_str(),
+                call.callee.as_str(),
+                i64::try_from(call.line).unwrap_or(i64::MAX),
+            ],
+        )?;
+    }
+    Ok(FileIndexOutcome::Indexed)
+}
+
+fn existing_file_sha(conn: &Connection, source_path: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT sha256 FROM files WHERE source_path = ?1",
+        params![source_path],
+        |row| row.get(0),
+    )
+    .optional()
+}
+
+fn prune_deleted_files(conn: &Connection, seen_paths: &BTreeSet<String>) -> CodeGraphResult<usize> {
+    let mut stmt = conn.prepare("SELECT source_path FROM files ORDER BY source_path")?;
+    let indexed_paths = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut removed = 0;
+    for source_path in indexed_paths {
+        if !seen_paths.contains(&source_path) {
+            conn.execute(
+                "DELETE FROM files WHERE source_path = ?1",
+                params![source_path],
+            )?;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+fn indexed_file_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<IndexedFile> {
+    let size_bytes: i64 = row.get(3)?;
+    let mtime_unix_ns: Option<i64> = row.get(4)?;
+    let symbol_count: i64 = row.get(5)?;
+    let call_count: i64 = row.get(6)?;
+    Ok(IndexedFile {
+        source_path: row.get(0)?,
+        language_id: row.get(1)?,
+        sha256: row.get(2)?,
+        size_bytes: u64::try_from(size_bytes).unwrap_or_default(),
+        mtime_unix_ns: mtime_unix_ns.and_then(|value| u64::try_from(value).ok()),
+        symbol_count: usize::try_from(symbol_count).unwrap_or_default(),
+        call_count: usize::try_from(call_count).unwrap_or_default(),
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
+fn file_mtime_unix_ns(path: &Path) -> CodeGraphResult<Option<u64>> {
+    let metadata = fs::metadata(path)?;
+    let Ok(modified) = metadata.modified() else {
+        return Ok(None);
+    };
+    let Ok(duration) = modified.duration_since(UNIX_EPOCH) else {
+        return Ok(None);
+    };
+    Ok(duration
+        .as_secs()
+        .checked_mul(1_000_000_000)
+        .and_then(|seconds| seconds.checked_add(u64::from(duration.subsec_nanos()))))
+}
+
+fn current_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_millis()).ok())
+        .unwrap_or_default()
+}
+
+fn normalize_relative_path(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    normalize_path(relative)
+}
+
+fn normalize_path(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(value) => value.to_str().map(ToString::to_string),
+            std::path::Component::CurDir => None,
+            std::path::Component::ParentDir => Some("..".to_string()),
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                Some(component.as_os_str().to_string_lossy().to_string())
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 pub trait CodeLanguageExtractor: Sync {
@@ -458,7 +970,7 @@ fn has_extension(source_path: &str, extension: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExtractedCodeCall, extract_code_graph};
+    use super::{CodeGraphIndex, ExtractedCodeCall, extract_code_graph};
 
     #[test]
     fn rust_extractor_indexes_symbols_and_calls() {
@@ -534,12 +1046,68 @@ mod tests {
         assert_has_call(&graph.calls, "Agent.Run", "helper");
     }
 
-    fn assert_has_call(calls: &[ExtractedCodeCall], caller_name: &str, callee_name: &str) {
+    #[test]
+    fn project_index_persists_supported_files_and_skips_unchanged_syncs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("create src");
+        std::fs::write(
+            src.join("lib.rs"),
+            r"
+                fn helper() {}
+
+                fn caller() {
+                    helper();
+                }
+            ",
+        )
+        .expect("write rust source");
+
+        let index = CodeGraphIndex::open(dir.path()).expect("open index");
+        assert!(index.db_path().ends_with(".pi-coding/db.sqlite"));
+
+        let first = index.sync_project().expect("first sync");
+        assert_eq!(first.scanned_files, 1);
+        assert_eq!(first.indexed_files, 1);
+        assert_eq!(first.unchanged_files, 0);
+        assert!(index.db_path().exists());
+
+        let files = index.indexed_files().expect("indexed files");
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].source_path, "src/lib.rs");
+        assert_eq!(files[0].language_id, "rust");
+        assert_eq!(files[0].symbol_count, 2);
+        assert_eq!(files[0].call_count, 1);
+
+        let second = index.sync_project().expect("second sync");
+        assert_eq!(second.indexed_files, 0);
+        assert_eq!(second.unchanged_files, 1);
+    }
+
+    #[test]
+    fn project_index_prunes_deleted_files_on_full_sync() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).expect("create src");
+        let file = src.join("main.go");
+        std::fs::write(&file, "package main\nfunc main() {}\n").expect("write go source");
+
+        let index = CodeGraphIndex::open(dir.path()).expect("open index");
+        let first = index.sync_project().expect("first sync");
+        assert_eq!(first.indexed_files, 1);
+
+        std::fs::remove_file(&file).expect("remove test file");
+        let second = index.sync_project().expect("second sync");
+        assert_eq!(second.removed_files, 1);
+        assert!(index.indexed_files().expect("indexed files").is_empty());
+    }
+
+    fn assert_has_call(calls: &[ExtractedCodeCall], from_symbol: &str, to_symbol: &str) {
         assert!(
             calls
                 .iter()
-                .any(|call| call.caller == caller_name && call.callee == callee_name),
-            "missing {caller_name} -> {callee_name}"
+                .any(|call| call.caller == from_symbol && call.callee == to_symbol),
+            "missing {from_symbol} -> {to_symbol}"
         );
     }
 }
