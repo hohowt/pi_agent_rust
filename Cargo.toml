@@ -94,7 +94,6 @@ thiserror = { workspace = true }
 # Terminal output (rich_rust for beautiful TUI)
 rich_rust = { workspace = true, features = ["markdown"] }
 crossterm = { workspace = true }
-enable-ansi-support = { workspace = true }
 
 # Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour)
 bubbletea = { workspace = true }
@@ -133,6 +132,9 @@ sysinfo = { workspace = true }
 
 # Image processing (optional)
 image = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+enable-ansi-support = { workspace = true }
 
 [features]
 default = ["sqlite-sessions"]
