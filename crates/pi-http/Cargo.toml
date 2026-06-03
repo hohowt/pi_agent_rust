@@ -12,20 +12,20 @@ test = false
 doctest = false
 
 [dependencies]
-base64 = "0.22"
-chrono = "0.4"
-futures = "0.3"
-memchr = "2.8.0"
-pi-core = { path = "../pi-core" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["raw_value"] }
-sha2 = "0.10"
-tracing = "0.1"
-url = "2"
+base64 = { workspace = true }
+chrono = { workspace = true }
+futures = { workspace = true }
+memchr = { workspace = true }
+pi-core = { workspace = true }
+reqwest = { workspace = true, features = ["rustls-tls", "stream"] }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true, features = ["raw_value"] }
+sha2 = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }
 
 [lints.rust]
 unsafe_code = "forbid"

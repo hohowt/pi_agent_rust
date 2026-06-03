@@ -62,77 +62,77 @@ name = "root_tokio_runtime"
 path = "tests/root_tokio_runtime.rs"
 
 [dependencies]
-pi-core = { path = "crates/pi-core" }
-pi-http = { path = "crates/pi-http" }
-pi-observability = { path = "crates/pi-observability" }
-pi-platform = { path = "crates/pi-platform" }
-pi-runtime = { path = "crates/pi-runtime" }
-pi-theme = { path = "crates/pi-theme" }
+pi-core = { workspace = true }
+pi-http = { workspace = true }
+pi-observability = { workspace = true }
+pi-platform = { workspace = true }
+pi-runtime = { workspace = true }
+pi-theme = { workspace = true }
 
 # CLI
-clap = { version = "4.5.60", features = ["derive", "env", "string"] }
+clap = { workspace = true, features = ["derive", "env", "string"] }
 
 # Async runtime
-futures = "0.3"
-async-trait = "0.1"
-tokio = { version = "1", features = ["fs", "io-util", "process", "rt-multi-thread", "sync", "time"] }
+futures = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "process", "rt-multi-thread", "sync", "time"] }
 
 # URL parsing/building
-url = "2"
+url = { workspace = true }
 
 # Signals
-ctrlc = "3.5.2"
+ctrlc = { workspace = true }
 
 # Serialization
-serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde = { workspace = true, features = ["derive", "rc"] }
+serde_json = { workspace = true, features = ["raw_value"] }
 
 # Error handling
-anyhow = "1.0.102"
-thiserror = "2"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
 
 # Terminal output (rich_rust for beautiful TUI)
-rich_rust = { version = "0.2.0", features = ["markdown"] }
-crossterm = "0.29"
-enable-ansi-support = "0.2"
+rich_rust = { workspace = true, features = ["markdown"] }
+crossterm = { workspace = true }
+enable-ansi-support = { workspace = true }
 
 # Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour)
-bubbletea = { package = "charmed-bubbletea", version = "0.2.0" }
-lipgloss = { package = "charmed-lipgloss", version = "0.2.0" }
-bubbles = { package = "charmed-bubbles", version = "0.2.0" }
-glamour = { package = "charmed-glamour", version = "0.2.0" }
-unicode-width = "0.2"
-arboard = { version = "3.6.1", optional = true }
+bubbletea = { workspace = true }
+lipgloss = { workspace = true }
+bubbles = { workspace = true }
+glamour = { workspace = true }
+unicode-width = { workspace = true }
+arboard = { workspace = true, optional = true }
 
 # Filesystem
-dirs = "6"
-tempfile = "3.25.0"
-fs4 = "0.13"
-glob = "0.3"
-ignore = "0.4"
-rusqlite = "0.37"
+dirs = { workspace = true }
+tempfile = { workspace = true }
+fs4 = { workspace = true }
+glob = { workspace = true }
+ignore = { workspace = true }
+rusqlite = { workspace = true }
 
 # Time
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { workspace = true, features = ["serde"] }
 
 # Logging
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
 
 # Utilities
-uuid = { version = "1.21.0", features = ["v4"] }
-memchr = "2.8.0"
-base64 = "0.22"
-sha2 = "0.10"
-regex = "1.12.3"
-crc32c = "0.6"
-unicode-normalization = "0.1"
-xxhash-rust = { version = "0.8", features = ["xxh32"] }
-similar = "2"
-sysinfo = "0.38.2"
+uuid = { workspace = true, features = ["v4"] }
+memchr = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+regex = { workspace = true }
+crc32c = { workspace = true }
+unicode-normalization = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh32"] }
+similar = { workspace = true }
+sysinfo = { workspace = true }
 
 # Image processing (optional)
-image = { version = "0.25", optional = true }
+image = { workspace = true, optional = true }
 
 [features]
 default = ["sqlite-sessions"]
@@ -205,3 +205,52 @@ members = [
     "crates/pi-theme",
 ]
 resolver = "3"
+
+[workspace.dependencies]
+anyhow = "1.0.102"
+arboard = "3.6.1"
+async-trait = "0.1"
+base64 = "0.22"
+bubbles = { package = "charmed-bubbles", version = "0.2.0" }
+bubbletea = { package = "charmed-bubbletea", version = "0.2.0" }
+chrono = "0.4"
+clap = "4.5.60"
+crc32c = "0.6"
+crossterm = "0.29"
+ctrlc = "3.5.2"
+dirs = "6"
+enable-ansi-support = "0.2"
+fs4 = "0.13"
+futures = "0.3"
+glamour = { package = "charmed-glamour", version = "0.2.0" }
+glob = "0.3"
+ignore = "0.4"
+image = "0.25"
+lipgloss = { package = "charmed-lipgloss", version = "0.2.0" }
+memchr = "2.8.0"
+pi-core = { path = "crates/pi-core" }
+pi-http = { path = "crates/pi-http" }
+pi-observability = { path = "crates/pi-observability" }
+pi-platform = { path = "crates/pi-platform" }
+pi-runtime = { path = "crates/pi-runtime" }
+pi-theme = { path = "crates/pi-theme" }
+proptest = "1.9.0"
+regex = "1.12.3"
+reqwest = { version = "0.12", default-features = false }
+rich_rust = "0.2.0"
+rusqlite = "0.37"
+serde = "1"
+serde_json = "1"
+sha2 = "0.10"
+similar = "2"
+sysinfo = "0.38.2"
+tempfile = "3.25.0"
+thiserror = "2"
+tokio = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+unicode-normalization = "0.1"
+unicode-width = "0.2"
+url = "2"
+uuid = "1.21.0"
+xxhash-rust = "0.8"

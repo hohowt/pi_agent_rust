@@ -12,17 +12,17 @@ test = false
 doctest = false
 
 [dependencies]
-dirs = "6"
-glamour = { package = "charmed-glamour", version = "0.2.0" }
-lipgloss = { package = "charmed-lipgloss", version = "0.2.0" }
-pi-core = { path = "../pi-core" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-tracing = "0.1"
+dirs = { workspace = true }
+glamour = { workspace = true }
+lipgloss = { workspace = true }
+pi-core = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
-proptest = "1.9.0"
-tempfile = "3.25.0"
+proptest = { workspace = true }
+tempfile = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"
