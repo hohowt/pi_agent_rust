@@ -6,11 +6,9 @@ use crate::provider::{Api, InputType, Model, ModelCost};
 use crate::provider_metadata::{
     ProviderRoutingDefaults, canonical_provider_id, provider_routing_defaults,
 };
-use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -177,8 +175,7 @@ struct LegacyGeneratedModel {
     compat: Option<CompatConfig>,
 }
 
-const LEGACY_MODELS_GENERATED_TS: &str =
-    include_str!("../legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts");
+const LEGACY_PROVIDER_MODELS_JSON: &str = include_str!("../docs/provider-legacy-models.json");
 const UPSTREAM_PROVIDER_MODEL_IDS_JSON: &str =
     include_str!("../docs/provider-upstream-model-ids-snapshot.json");
 const CODEX_RESPONSES_API_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
@@ -189,7 +186,6 @@ static LEGACY_GENERATED_MODELS_CACHE: OnceLock<Vec<LegacyGeneratedModel>> = Once
 static UPSTREAM_PROVIDER_MODEL_IDS_CACHE: OnceLock<HashMap<String, Vec<String>>> = OnceLock::new();
 static MODEL_AUTOCOMPLETE_CACHE: OnceLock<Vec<ModelAutocompleteCandidate>> = OnceLock::new();
 static MODEL_CATALOG_CACHE_FINGERPRINT: OnceLock<u64> = OnceLock::new();
-static SATISFIES_RE: OnceLock<Regex> = OnceLock::new();
 const INPUT_TEXT_ONLY: [InputType; 1] = [InputType::Text];
 const INPUT_TEXT_AND_IMAGE: [InputType; 2] = [InputType::Text, InputType::Image];
 
@@ -252,82 +248,9 @@ fn parse_input_types(input: &[String]) -> Vec<InputType> {
         .collect()
 }
 
-fn legacy_generated_models_cache_path() -> Option<PathBuf> {
-    let checksum = crc32c::crc32c(LEGACY_MODELS_GENERATED_TS.as_bytes());
-    dirs::cache_dir().map(|dir| {
-        dir.join("pi")
-            .join("models-cache")
-            .join(format!("legacy-generated-models-{checksum:08x}.json"))
-    })
-}
-
-fn load_legacy_generated_models_cache() -> Option<Vec<LegacyGeneratedModel>> {
-    let path = legacy_generated_models_cache_path()?;
-    let cache = fs::read_to_string(path).ok()?;
-    serde_json::from_str::<Vec<LegacyGeneratedModel>>(&cache).ok()
-}
-
-fn persist_legacy_generated_models_cache(models: &[LegacyGeneratedModel]) {
-    let Some(path) = legacy_generated_models_cache_path() else {
-        return;
-    };
-    if path.exists() {
-        return;
-    }
-    let Some(parent) = path.parent() else {
-        return;
-    };
-    if fs::create_dir_all(parent).is_err() {
-        return;
-    }
-
-    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
-    let Ok(file) = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&temp_path)
-    else {
-        return;
-    };
-    let mut writer = std::io::BufWriter::new(file);
-    if serde_json::to_writer(&mut writer, models).is_ok() && writer.flush().is_ok() {
-        let _ = fs::rename(&temp_path, path);
-    } else {
-        let _ = fs::remove_file(&temp_path);
-    }
-}
-
 fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
-    if let Some(cached) = load_legacy_generated_models_cache() {
-        return cached;
-    }
-
-    let Some(models_decl_start) = LEGACY_MODELS_GENERATED_TS.find("export const MODELS =") else {
-        tracing::warn!("Legacy model catalog missing MODELS declaration");
-        return Vec::new();
-    };
-    let Some(object_start_rel) = LEGACY_MODELS_GENERATED_TS[models_decl_start..].find('{') else {
-        tracing::warn!("Legacy model catalog missing object start after MODELS declaration");
-        return Vec::new();
-    };
-    let object_start = models_decl_start + object_start_rel;
-    let Some(end_marker_rel) = LEGACY_MODELS_GENERATED_TS[object_start..].rfind("} as const;")
-    else {
-        tracing::warn!("Legacy model catalog missing end marker");
-        return Vec::new();
-    };
-    let end_marker = object_start + end_marker_rel;
-
-    let mut object_source = LEGACY_MODELS_GENERATED_TS[object_start..=end_marker]
-        .trim_end_matches(" as const;")
-        .to_string();
-    let satisfies_re = SATISFIES_RE.get_or_init(|| {
-        Regex::new(r#"\s+satisfies\s+Model<"[^"]+">"#).expect("valid satisfies regex")
-    });
-    object_source = satisfies_re.replace_all(&object_source, "").into_owned();
-
     let parsed: HashMap<String, HashMap<String, LegacyGeneratedModel>> =
-        match json5::from_str(&object_source) {
+        match serde_json::from_str(LEGACY_PROVIDER_MODELS_JSON) {
             Ok(value) => value,
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to parse legacy model catalog");
@@ -345,7 +268,6 @@ fn parse_legacy_generated_models() -> Vec<LegacyGeneratedModel> {
             .then_with(|| a.id.cmp(&b.id))
             .then_with(|| a.api.cmp(&b.api))
     });
-    persist_legacy_generated_models_cache(&models);
     models
 }
 
@@ -550,7 +472,7 @@ pub fn model_autocomplete_candidates() -> &'static [ModelAutocompleteCandidate] 
 
 pub fn model_catalog_cache_fingerprint() -> u64 {
     *MODEL_CATALOG_CACHE_FINGERPRINT.get_or_init(|| {
-        let legacy = u64::from(crc32c::crc32c(LEGACY_MODELS_GENERATED_TS.as_bytes()));
+        let legacy = u64::from(crc32c::crc32c(LEGACY_PROVIDER_MODELS_JSON.as_bytes()));
         let upstream = u64::from(crc32c::crc32c(UPSTREAM_PROVIDER_MODEL_IDS_JSON.as_bytes()));
         let user_override = u64::from(user_model_overrides_fingerprint());
         // Mix the override CRC into both halves so any change forces cache
@@ -2279,16 +2201,9 @@ mod tests {
     #[test]
     fn parse_legacy_generated_models_extracts_known_legacy_only_providers() {
         let parsed = parse_legacy_generated_models();
-        if LEGACY_MODELS_GENERATED_TS.contains("export const MODELS = {} as const;") {
-            assert!(
-                parsed.is_empty(),
-                "published stub catalog should not parse into legacy entries"
-            );
-            return;
-        }
         assert!(
             !parsed.is_empty(),
-            "legacy generated model catalog should parse into entries"
+            "legacy provider model catalog should parse into entries"
         );
 
         assert!(

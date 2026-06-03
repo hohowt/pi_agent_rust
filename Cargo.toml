@@ -22,8 +22,8 @@ autotests = false
 # - RETIRABLE: src/bin/pi_legacy_capture.rs (pending RULE 1 approval)
 # - DEV-ONLY: moved to examples/ (21 files: ext_*, test_*, debug utilities)
 include = [
+    "docs/provider-legacy-models.json",
     "docs/provider-upstream-model-ids-snapshot.json",
-    "legacy_pi_mono_code/pi-mono/packages/ai/src/models.generated.ts",
     "Cargo.toml",
     "LICENSE",
     "README.md",
@@ -82,7 +82,6 @@ ctrlc = "3.5.2"
 # Serialization
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["raw_value"] }
-json5 = "1.3.1"
 
 # Error handling
 anyhow = "1.0.102"
