@@ -2115,6 +2115,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "pi-theme"
+version = "0.1.16"
+dependencies = [
+ "charmed-glamour",
+ "charmed-lipgloss",
+ "dirs",
+ "pi-core",
+ "proptest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "pi_agent_rust"
 version = "0.1.16"
 dependencies = [
@@ -2144,6 +2159,7 @@ dependencies = [
  "pi-observability",
  "pi-platform",
  "pi-runtime",
+ "pi-theme",
  "regex",
  "rich_rust",
  "rusqlite",

@@ -540,6 +540,12 @@ impl Config {
     }
 }
 
+impl pi_theme::ThemeConfig for Config {
+    fn theme_spec(&self) -> Option<&str> {
+        self.theme.as_deref()
+    }
+}
+
 fn env_lookup(var: &str) -> Option<String> {
     std::env::var(var).ok()
 }

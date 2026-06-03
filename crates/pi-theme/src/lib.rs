@@ -4,13 +4,29 @@
 //! - Global themes: `~/.pi/agent/themes/*.json`
 //! - Project themes: `<cwd>/.pi/themes/*.json`
 
-use crate::config::Config;
-use crate::error::{Error, Result};
 use glamour::{Style as GlamourStyle, StyleConfig as GlamourStyleConfig};
 use lipgloss::Style as LipglossStyle;
+use pi_core::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
+
+/// Minimal configuration surface required for theme resolution.
+pub trait ThemeConfig {
+    fn theme_spec(&self) -> Option<&str>;
+}
+
+impl ThemeConfig for Option<String> {
+    fn theme_spec(&self) -> Option<&str> {
+        self.as_deref()
+    }
+}
+
+impl ThemeConfig for Option<&str> {
+    fn theme_spec(&self) -> Option<&str> {
+        *self
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct TuiStyles {
@@ -75,8 +91,8 @@ impl ThemeRoots {
     #[must_use]
     pub fn from_cwd(cwd: &Path) -> Self {
         Self {
-            global_dir: Config::global_dir(),
-            project_dir: cwd.join(Config::project_dir()),
+            global_dir: global_dir(),
+            project_dir: cwd.join(project_dir()),
         }
     }
 }
@@ -92,8 +108,8 @@ impl Theme {
     ///
     /// Falls back to dark on error.
     #[must_use]
-    pub fn resolve(config: &Config, cwd: &Path) -> Self {
-        let Some(spec) = config.theme.as_deref() else {
+    pub fn resolve(config: &impl ThemeConfig, cwd: &Path) -> Self {
+        let Some(spec) = config.theme_spec() else {
             return Self::dark();
         };
         let spec = spec.trim();
@@ -525,6 +541,20 @@ fn resolve_theme_path(spec: &str, cwd: &Path) -> PathBuf {
     }
 }
 
+fn global_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("PI_AGENT_HOME") {
+        return PathBuf::from(path);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".pi")
+        .join("agent")
+}
+
+fn project_dir() -> PathBuf {
+    PathBuf::from(".pi")
+}
+
 fn parse_hex_color(value: &str) -> Option<(u8, u8, u8)> {
     let value = value.trim();
     let hex = value.strip_prefix('#')?;
@@ -767,10 +797,7 @@ mod tests {
 
     #[test]
     fn resolve_falls_back_to_dark_for_invalid_spec() {
-        let cfg = Config {
-            theme: Some("does-not-exist".to_string()),
-            ..Default::default()
-        };
+        let cfg = Some("does-not-exist".to_string());
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
         assert_eq!(resolved.name, "dark");
@@ -780,10 +807,7 @@ mod tests {
 
     #[test]
     fn resolve_defaults_to_dark_when_no_theme_set() {
-        let cfg = Config {
-            theme: None,
-            ..Default::default()
-        };
+        let cfg: Option<String> = None;
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
         assert_eq!(resolved.name, "dark");
@@ -791,10 +815,7 @@ mod tests {
 
     #[test]
     fn resolve_defaults_to_dark_when_theme_is_empty() {
-        let cfg = Config {
-            theme: Some(String::new()),
-            ..Default::default()
-        };
+        let cfg = Some(String::new());
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
         assert_eq!(resolved.name, "dark");
@@ -802,10 +823,7 @@ mod tests {
 
     #[test]
     fn resolve_defaults_to_dark_when_theme_is_whitespace() {
-        let cfg = Config {
-            theme: Some("   ".to_string()),
-            ..Default::default()
-        };
+        let cfg = Some("   ".to_string());
         let cwd = tempfile::tempdir().expect("tempdir");
         let resolved = Theme::resolve(&cfg, cwd.path());
         assert_eq!(resolved.name, "dark");

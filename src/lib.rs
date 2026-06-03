@@ -141,7 +141,7 @@ pub mod swarm_activity_ledger;
 #[doc(hidden)]
 pub mod terminal_images;
 #[doc(hidden)]
-pub mod theme;
+pub use pi_theme as theme;
 #[doc(hidden)]
 pub mod tools;
 #[doc(hidden)]

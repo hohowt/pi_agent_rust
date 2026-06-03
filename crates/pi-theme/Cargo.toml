@@ -1,0 +1,35 @@
+[package]
+name = "pi-theme"
+version = "0.1.16"
+edition = "2024"
+rust-version = "1.85"
+license-file = "../../LICENSE"
+
+[lib]
+name = "pi_theme"
+path = "src/lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+dirs = "6"
+glamour = { package = "charmed-glamour", version = "0.2.0" }
+lipgloss = { package = "charmed-lipgloss", version = "0.2.0" }
+pi-core = { path = "../pi-core" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1.9.0"
+tempfile = "3.25.0"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"

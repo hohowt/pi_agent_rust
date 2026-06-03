@@ -67,6 +67,7 @@ pi-http = { path = "crates/pi-http" }
 pi-observability = { path = "crates/pi-observability" }
 pi-platform = { path = "crates/pi-platform" }
 pi-runtime = { path = "crates/pi-runtime" }
+pi-theme = { path = "crates/pi-theme" }
 
 # CLI
 clap = { version = "4.5.60", features = ["derive", "env", "string"] }
@@ -201,5 +202,6 @@ members = [
     "crates/pi-observability",
     "crates/pi-platform",
     "crates/pi-runtime",
+    "crates/pi-theme",
 ]
 resolver = "3"
