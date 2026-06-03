@@ -671,6 +671,7 @@ struct BuiltinSlashCommand {
     description: &'static str,
 }
 
+#[allow(clippy::too_many_lines)]
 const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
     &[
         BuiltinSlashCommand {
@@ -764,6 +765,10 @@ const fn builtin_slash_commands() -> &'static [BuiltinSlashCommand] {
         BuiltinSlashCommand {
             name: "reload",
             description: "Reload resources from disk",
+        },
+        BuiltinSlashCommand {
+            name: "language",
+            description: "Show or switch UI and default prompt language",
         },
         BuiltinSlashCommand {
             name: "share",
@@ -1853,6 +1858,12 @@ mod tests {
     fn builtin_slash_commands_contains_exit() {
         let cmds = builtin_slash_commands();
         assert!(cmds.iter().any(|c| c.name == "exit"));
+    }
+
+    #[test]
+    fn builtin_slash_commands_contains_language() {
+        let cmds = builtin_slash_commands();
+        assert!(cmds.iter().any(|c| c.name == "language"));
     }
 
     #[test]

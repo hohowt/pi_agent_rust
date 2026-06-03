@@ -7,15 +7,19 @@ impl PiApp {
     /// Groups actions by category and shows their key bindings.
     pub(super) fn format_hotkeys(&self) -> String {
         use crate::keybindings::ActionCategory;
+        use pi_prompt::PromptCatalog;
         use std::fmt::Write;
 
+        let ui = PromptCatalog::new(self.config.language()).ui_text();
         let mut output = String::new();
-        let _ = writeln!(output, "Keyboard Shortcuts");
-        let _ = writeln!(output, "==================");
+        let title = ui.hotkeys_title();
+        let _ = writeln!(output, "{title}");
+        let _ = writeln!(output, "{}", "=".repeat(title.chars().count()));
         let _ = writeln!(output);
         let _ = writeln!(
             output,
-            "Config: {}",
+            "{}: {}",
+            ui.hotkeys_config_label(),
             KeyBindings::user_config_path().display()
         );
         let _ = writeln!(output);

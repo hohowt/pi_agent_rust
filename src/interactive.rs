@@ -51,6 +51,7 @@ use crate::resources::{DiagnosticKind, ResourceCliOptions, ResourceDiagnostic, R
 use crate::session::{Session, SessionEntry, SessionMessage, bash_execution_to_text};
 use crate::theme::{Theme, TuiStyles};
 use crate::tools::{process_file_arguments, resolve_read_path};
+use pi_prompt::PromptCatalog;
 
 #[cfg(all(feature = "clipboard", feature = "image-resize"))]
 use arboard::Clipboard as ArboardClipboard;
@@ -1731,8 +1732,10 @@ fn build_startup_welcome_message(config: &Config, available_models: &[ModelEntry
         return String::new();
     }
 
-    let mut message = String::from("  Welcome to Pi!\n");
-    message.push_str("  Type a message to begin, or /help for commands.\n");
+    let mut message = PromptCatalog::new(config.language())
+        .ui_text()
+        .welcome_message()
+        .to_string();
 
     if available_models
         .iter()
@@ -2147,7 +2150,10 @@ impl PiApp {
 
         // Configure text area for input
         let mut input = TextArea::new();
-        input.placeholder = "Type a message... (/help, /exit)".to_string();
+        input.placeholder = PromptCatalog::new(config.language())
+            .ui_text()
+            .input_placeholder()
+            .to_string();
         input.show_line_numbers = false;
         input.prompt = "> ".to_string();
         input.set_height(3); // Start with 3 lines
@@ -2681,8 +2687,12 @@ impl PiApp {
                     }
                     KeyType::CtrlD => {
                         picker.confirm_delete = true;
-                        picker.status_message =
-                            Some("Delete session? Press y/n to confirm.".to_string());
+                        picker.status_message = Some(
+                            PromptCatalog::new(self.config.language())
+                                .ui_text()
+                                .session_delete_confirm()
+                                .to_string(),
+                        );
                         return None;
                     }
                     KeyType::Esc => {

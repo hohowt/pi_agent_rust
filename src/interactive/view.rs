@@ -1217,19 +1217,22 @@ impl PiApp {
             let _ = writeln!(
                 output,
                 "  {}",
-                self.styles.warning_bold.render(
-                    picker
-                        .status_message
-                        .as_deref()
-                        .unwrap_or("Delete session? Press y/n to confirm."),
-                )
+                self.styles
+                    .warning_bold
+                    .render(picker.status_message.as_deref().unwrap_or_else(|| {
+                        pi_prompt::PromptCatalog::new(self.config.language())
+                            .ui_text()
+                            .session_delete_confirm()
+                    }),)
             );
         } else {
             let _ = writeln!(
                 output,
                 "  {}",
                 self.styles.muted_italic.render(
-                    "Type: filter  Backspace: clear  ↑/↓/j/k/PgUp/PgDn: navigate  Enter: select  Ctrl+D: delete  Esc/q: cancel",
+                    pi_prompt::PromptCatalog::new(self.config.language())
+                        .ui_text()
+                        .session_picker_hint(),
                 )
             );
             if let Some(message) = &picker.status_message {
@@ -1243,13 +1246,18 @@ impl PiApp {
     pub(super) fn render_settings_ui(&self, settings_ui: &SettingsUiState) -> String {
         let mut output = String::new();
 
-        let _ = writeln!(output, "\n  {}\n", self.styles.title.render("Settings"));
+        let ui = pi_prompt::PromptCatalog::new(self.config.language()).ui_text();
+        let _ = writeln!(
+            output,
+            "\n  {}\n",
+            self.styles.title.render(ui.settings_title())
+        );
 
         if settings_ui.entries.is_empty() {
             let _ = writeln!(
                 output,
                 "  {}",
-                self.styles.muted.render("No settings available.")
+                self.styles.muted.render(ui.no_settings_available())
             );
         } else {
             let offset = settings_ui.scroll_offset();

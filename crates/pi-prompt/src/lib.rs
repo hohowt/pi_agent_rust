@@ -328,6 +328,78 @@ impl UiText {
             format!("不支持的语言: {value}。请使用 zh 或 en。")
         }
     }
+
+    #[must_use]
+    pub fn welcome_message(&self) -> &'static str {
+        if self.language.is_english() {
+            "  Welcome to Pi!\n  Type a message to begin, or /help for commands.\n"
+        } else {
+            "  欢迎使用 Pi!\n  输入消息开始，或输入 /help 查看命令。\n"
+        }
+    }
+
+    #[must_use]
+    pub fn input_placeholder(&self) -> &'static str {
+        if self.language.is_english() {
+            "Type a message... (/help, /exit)"
+        } else {
+            "输入消息...（/help, /exit）"
+        }
+    }
+
+    #[must_use]
+    pub fn hotkeys_title(&self) -> &'static str {
+        if self.language.is_english() {
+            "Keyboard Shortcuts"
+        } else {
+            "键盘快捷键"
+        }
+    }
+
+    #[must_use]
+    pub fn hotkeys_config_label(&self) -> &'static str {
+        if self.language.is_english() {
+            "Config"
+        } else {
+            "配置"
+        }
+    }
+
+    #[must_use]
+    pub fn settings_title(&self) -> &'static str {
+        if self.language.is_english() {
+            "Settings"
+        } else {
+            "设置"
+        }
+    }
+
+    #[must_use]
+    pub fn no_settings_available(&self) -> &'static str {
+        if self.language.is_english() {
+            "No settings available."
+        } else {
+            "没有可用设置。"
+        }
+    }
+
+    #[must_use]
+    pub fn session_delete_confirm(&self) -> &'static str {
+        if self.language.is_english() {
+            "Delete session? Press y/n to confirm."
+        } else {
+            "删除 session？按 y/n 确认。"
+        }
+    }
+
+    #[must_use]
+    pub fn session_picker_hint(&self) -> &'static str {
+        if self.language.is_english() {
+            "Type: filter  Backspace: clear  ↑/↓/j/k/PgUp/PgDn: navigate  Enter: select  Ctrl+D: delete  Esc/q: cancel"
+        } else {
+            "输入: 过滤  Backspace: 清空  ↑/↓/j/k/PgUp/PgDn: 导航  Enter: 选择  Ctrl+D: 删除  Esc/q: 取消"
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
