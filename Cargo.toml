@@ -64,6 +64,7 @@ path = "tests/root_tokio_runtime.rs"
 [dependencies]
 pi-core = { path = "crates/pi-core" }
 pi-http = { path = "crates/pi-http" }
+pi-runtime = { path = "crates/pi-runtime" }
 
 # CLI
 clap = { version = "4.5.60", features = ["derive", "env", "string"] }
@@ -106,7 +107,6 @@ tempfile = "3.25.0"
 fs4 = "0.13"
 glob = "0.3"
 ignore = "0.4"
-crossbeam-queue = "0.3"
 rusqlite = "0.37"
 
 # Time
@@ -196,5 +196,6 @@ members = [
     ".",
     "crates/pi-core",
     "crates/pi-http",
+    "crates/pi-runtime",
 ]
 resolver = "3"

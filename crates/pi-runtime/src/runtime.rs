@@ -33,6 +33,7 @@ pub struct JoinHandle<T> {
 }
 
 impl RuntimeBuilder {
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             kind: RuntimeKind::MultiThread,
@@ -41,6 +42,7 @@ impl RuntimeBuilder {
         }
     }
 
+    #[must_use]
     pub const fn current_thread() -> Self {
         Self {
             kind: RuntimeKind::CurrentThread,
@@ -49,6 +51,7 @@ impl RuntimeBuilder {
         }
     }
 
+    #[must_use]
     pub const fn multi_thread() -> Self {
         Self::new()
     }
@@ -146,6 +149,7 @@ impl<T> JoinHandle<T> {
         self.inner.abort();
     }
 
+    #[must_use]
     pub fn is_finished(&self) -> bool {
         self.inner.is_finished()
     }

@@ -4,6 +4,7 @@ pub mod oneshot {
     pub struct Sender<T>(Option<tokio::sync::oneshot::Sender<T>>);
     pub struct Receiver<T>(tokio::sync::oneshot::Receiver<T>);
 
+    #[must_use]
     pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Sender(Some(tx)), Receiver(rx))
@@ -46,6 +47,7 @@ pub mod mpsc {
         Full(T),
     }
 
+    #[must_use]
     pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
         let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         (Sender { inner: tx }, Receiver { inner: rx })

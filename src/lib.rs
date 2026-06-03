@@ -63,7 +63,7 @@ pub mod auth;
 #[doc(hidden)]
 pub mod autocomplete;
 #[doc(hidden)]
-pub mod channel;
+pub use pi_runtime::channel;
 #[doc(hidden)]
 pub mod cli;
 #[doc(hidden)]
@@ -73,17 +73,17 @@ pub mod compaction_worker;
 #[doc(hidden)]
 pub mod config;
 #[doc(hidden)]
-pub mod fs;
-#[doc(hidden)]
-pub mod io;
-#[doc(hidden)]
-pub mod runtime;
-#[doc(hidden)]
-pub mod sync;
-#[doc(hidden)]
-pub mod time;
-#[doc(hidden)]
 pub use pi_core::error;
+#[doc(hidden)]
+pub use pi_runtime::fs;
+#[doc(hidden)]
+pub use pi_runtime::io;
+#[doc(hidden)]
+pub use pi_runtime::runtime;
+#[doc(hidden)]
+pub use pi_runtime::sync;
+#[doc(hidden)]
+pub use pi_runtime::time;
 #[doc(hidden)]
 pub mod error_hints;
 #[doc(hidden)]
@@ -149,8 +149,8 @@ pub mod tui;
 #[doc(hidden)]
 pub use pi_http::vcr;
 
-#[doc(hidden)]
-pub use agent_cx::{Budget, Cx};
 pub use error::{Error, Result as PiResult};
 #[doc(hidden)]
-pub use time::Time;
+pub use pi_runtime::Time;
+#[doc(hidden)]
+pub use pi_runtime::{Budget, Cx};

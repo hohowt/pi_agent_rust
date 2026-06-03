@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 pub struct Time(Instant);
 
 impl Time {
+    #[must_use]
     pub fn duration_since(self, earlier: Self) -> u64 {
         u64::try_from(self.0.duration_since(earlier.0).as_nanos()).unwrap_or(u64::MAX)
     }
@@ -17,6 +18,7 @@ impl std::ops::Add<Duration> for Time {
     }
 }
 
+#[must_use]
 pub fn wall_now() -> Time {
     Time(Instant::now())
 }

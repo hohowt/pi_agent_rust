@@ -869,15 +869,13 @@ impl From<std::io::Error> for Error {
     }
 }
 
-impl From<asupersync::sync::LockError> for Error {
-    fn from(value: asupersync::sync::LockError) -> Self {
+impl From<pi_runtime::sync::LockError> for Error {
+    fn from(value: pi_runtime::sync::LockError) -> Self {
         match value {
-            asupersync::sync::LockError::Cancelled => Self::Aborted,
-            asupersync::sync::LockError::Poisoned
-            | asupersync::sync::LockError::PolledAfterCompletion
-            // asupersync 0.3.2 added LockError::TimedOut(Time) (lock-acquire deadline
-            // elapsed); surface it as a session error — its Display carries the detail.
-            | asupersync::sync::LockError::TimedOut(_) => {
+            pi_runtime::sync::LockError::Cancelled => Self::Aborted,
+            pi_runtime::sync::LockError::Poisoned
+            | pi_runtime::sync::LockError::PolledAfterCompletion
+            | pi_runtime::sync::LockError::TimedOut(_) => {
                 Self::session(value.to_string())
             }
         }

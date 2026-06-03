@@ -7,101 +7,11 @@
 //! `AgentCx` is a thin, explicit wrapper used at API boundaries (agent loop ↔ tools ↔ sessions ↔
 //! RPC). It is intentionally small and centralizes how Pi threads context through async code.
 
-use std::cell::RefCell;
 use std::ops::Deref;
 use std::path::Path;
 use std::time::Duration;
 
-#[derive(Debug, Clone, Copy)]
-pub struct Budget {
-    pub deadline: Option<crate::Time>,
-}
-
-impl Budget {
-    pub const INFINITE: Self = Self { deadline: None };
-
-    #[must_use]
-    pub const fn with_deadline(mut self, deadline: crate::Time) -> Self {
-        self.deadline = Some(deadline);
-        self
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct Cx {
-    budget: Budget,
-}
-
-thread_local! {
-    static CURRENT_CX: RefCell<Option<Cx>> = const { RefCell::new(None) };
-}
-
-pub struct CurrentCxGuard {
-    previous: Option<Cx>,
-}
-
-impl Drop for CurrentCxGuard {
-    fn drop(&mut self) {
-        let previous = self.previous.take();
-        CURRENT_CX.with(|slot| {
-            *slot.borrow_mut() = previous;
-        });
-    }
-}
-
-impl Cx {
-    pub fn current() -> Option<Self> {
-        CURRENT_CX.with(|slot| slot.borrow().clone())
-    }
-
-    pub fn set_current(cx: Option<Self>) -> CurrentCxGuard {
-        let previous = CURRENT_CX.with(|slot| slot.replace(cx));
-        CurrentCxGuard { previous }
-    }
-
-    pub const fn for_request() -> Self {
-        Self {
-            budget: Budget::INFINITE,
-        }
-    }
-
-    pub const fn for_request_with_budget(budget: Budget) -> Self {
-        Self { budget }
-    }
-
-    pub const fn for_testing() -> Self {
-        Self::for_request()
-    }
-
-    pub const fn for_testing_with_io() -> Self {
-        Self::for_request()
-    }
-
-    pub const fn for_testing_with_budget(budget: Budget) -> Self {
-        Self { budget }
-    }
-
-    pub const fn budget(&self) -> Budget {
-        self.budget
-    }
-
-    pub const fn timer_driver(&self) -> Option<TimerDriver> {
-        None
-    }
-
-    pub const fn checkpoint(&self) -> Result<(), std::convert::Infallible> {
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct TimerDriver;
-
-impl TimerDriver {
-    pub fn now(&self) -> crate::Time {
-        crate::time::wall_now()
-    }
-}
+pub use pi_runtime::{Budget, CurrentCxGuard, Cx, TimerDriver};
 
 /// A capability-scoped context for agent operations.
 ///
@@ -116,7 +26,7 @@ pub struct AgentCx {
 }
 
 impl AgentCx {
-    /// Wrap an existing `asupersync::Cx`.
+    /// Wrap an existing `pi_runtime::Cx`.
     #[must_use]
     pub const fn from_cx(cx: Cx) -> Self {
         Self { cx }
@@ -166,7 +76,7 @@ impl AgentCx {
         }
     }
 
-    /// Borrow the underlying `asupersync` context.
+    /// Borrow the underlying runtime context.
     #[must_use]
     pub const fn cx(&self) -> &Cx {
         &self.cx
