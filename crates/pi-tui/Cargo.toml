@@ -20,7 +20,7 @@ ratatui = { workspace = true, features = [
     "unstable-rendered-line-info",
     "unstable-widget-ref",
 ] }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
 unicode-width = { workspace = true }
 

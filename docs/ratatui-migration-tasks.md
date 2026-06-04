@@ -17,7 +17,7 @@
 - [x] Add a minimal ratatui app state and renderer.
 - [x] Render header, conversation area, input area, and footer placeholders.
 - [x] Wire interactive mode to the ratatui skeleton.
-- [ ] Verify raw mode restore on panic/error path.
+- [x] Verify raw mode restore on panic/error path.
 
 ## 3. Interactive Chat Port
 
