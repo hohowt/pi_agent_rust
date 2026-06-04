@@ -15,6 +15,7 @@ use crate::Cx;
 use crate::channel::mpsc;
 use crate::runtime::RuntimeHandle;
 use crate::sync::Mutex;
+use bubbles::cursor::Mode as CursorMode;
 use bubbles::spinner::{SpinnerModel, TickMsg as SpinnerTickMsg, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
@@ -640,6 +641,15 @@ impl PiApp {
         })
     }
 
+    fn apply_input_cursor_mode(&mut self) {
+        let mode = if self.effective_show_hardware_cursor() {
+            CursorMode::Static
+        } else {
+            CursorMode::Blink
+        };
+        let _ = self.input.cursor.set_mode(mode);
+    }
+
     fn apply_hardware_cursor(show: bool) {
         let mut stdout = std::io::stdout();
         if show {
@@ -698,6 +708,7 @@ impl PiApp {
                     json!({ "show_hardware_cursor": next }),
                 ) {
                     self.config.show_hardware_cursor = Some(next);
+                    self.apply_input_cursor_mode();
                     Self::apply_hardware_cursor(next);
                     self.status_message =
                         Some(format!("Updated showHardwareCursor: {}", bool_label(next)));
@@ -2154,6 +2165,14 @@ impl PiApp {
         input.set_width(term_width.saturating_sub(5 + editor_padding_x));
         input.max_height = 10; // Allow expansion up to 10 lines
         input.focus();
+        let show_hardware_cursor = config.show_hardware_cursor.unwrap_or_else(|| {
+            std::env::var("PI_HARDWARE_CURSOR")
+                .ok()
+                .is_none_or(|val| val != "0")
+        });
+        if show_hardware_cursor {
+            let _ = input.cursor.set_mode(CursorMode::Static);
+        }
 
         let spinner = SpinnerModel::with_spinner(spinners::dot()).style(styles.accent.clone());
 
@@ -2360,7 +2379,7 @@ impl PiApp {
         // Start text input cursor blink.
         // Spinner ticks are started lazily when we transition idle -> busy.
         let test_mode = std::env::var_os("PI_TEST_MODE").is_some();
-        let input_cmd = if test_mode {
+        let input_cmd = if test_mode || self.effective_show_hardware_cursor() {
             None
         } else {
             BubbleteaModel::init(&self.input)
