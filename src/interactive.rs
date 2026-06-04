@@ -10,6 +10,7 @@ use crate::package_manager::ResolvedResource;
 use crate::resources::{ResourceCliOptions, ResourceLoader};
 use crate::runtime::RuntimeHandle;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub enum PendingInput {
@@ -174,18 +175,44 @@ pub fn model_entry_resource_origin(_entry: &ModelEntry) -> Option<&ResolvedResou
 pub async fn run_interactive(
     mut agent: AgentSession,
     _session: std::sync::Arc<crate::sync::Mutex<crate::session::Session>>,
-    _config: Config,
+    config: Config,
     model_entry: ModelEntry,
     _model_scope: Vec<ModelEntry>,
     _available_models: Vec<ModelEntry>,
     pending_inputs: Vec<PendingInput>,
     _save_enabled: bool,
-    _resources: ResourceLoader,
+    resources: ResourceLoader,
     _resource_cli: ResourceCliOptions,
     _cwd: PathBuf,
     _runtime_handle: RuntimeHandle,
 ) -> Result<()> {
     let model_label = format!("{}/{}", model_entry.model.provider, model_entry.model.id);
+    let mut options = pi_tui::ChatOptions::new(model_label);
+    options.status = "就绪".to_string();
+    options.resource_summary = format!(
+        "资源: {} 技能, {} 提示, {} 主题",
+        resources.skills().len(),
+        resources.prompts().len(),
+        resources.themes().len()
+    );
+    options.command_hints = vec![
+        "/help".to_string(),
+        "/model".to_string(),
+        "/thinking".to_string(),
+        "/session".to_string(),
+        "/tree".to_string(),
+        "/codegraph status".to_string(),
+        "/exit".to_string(),
+    ];
+    options.key_hints = vec![
+        "Enter: 发送".to_string(),
+        "Ctrl+L: 模型".to_string(),
+        "Ctrl+O: 工具".to_string(),
+        "Shift+Tab: 思考".to_string(),
+        "Shift+Enter: newline".to_string(),
+        "Ctrl+C/Esc: quit".to_string(),
+        "/help".to_string(),
+    ];
     let mut initial_lines = Vec::new();
     for pending in pending_inputs {
         let input = match pending {
@@ -212,7 +239,72 @@ pub async fn run_interactive(
         initial_lines.push(pi_tui::ChatLine::assistant(answer));
     }
 
-    pi_tui::run_minimal_chat_loop(model_label, initial_lines).await
+    let agent = Arc::new(tokio::sync::Mutex::new(agent));
+    let language = config.language();
+
+    pi_tui::run_minimal_chat_loop(options, initial_lines, move |input| {
+        let agent = Arc::clone(&agent);
+        Box::pin(async move {
+            let mut agent = agent.lock().await;
+            handle_submitted_input(&mut agent, language, input).await
+        })
+    })
+    .await
+}
+
+async fn handle_submitted_input(
+    agent: &mut AgentSession,
+    language: Language,
+    input: String,
+) -> Result<pi_tui::ChatLine> {
+    if let Some((command, args)) = SlashCommand::parse(&input) {
+        return Ok(handle_slash_command(command, args, language));
+    }
+
+    let assistant = agent
+        .run_with_content(
+            vec![ContentBlock::Text(TextContent::new(input))],
+            |_event: AgentEvent| {},
+        )
+        .await?;
+    let answer = assistant
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            crate::model::ContentBlock::Text(text) => Some(text.text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(pi_tui::ChatLine::assistant(answer))
+}
+
+fn handle_slash_command(command: SlashCommand, args: &str, language: Language) -> pi_tui::ChatLine {
+    let text = match command {
+        SlashCommand::Help => SlashCommand::help_text(language).to_string(),
+        SlashCommand::Exit => "使用 Esc 或 Ctrl+C 退出。".to_string(),
+        SlashCommand::Model => {
+            if args.is_empty() {
+                "/model UI 正在迁移到 ratatui，模型列表会在下一步恢复。".to_string()
+            } else {
+                format!("/model {args} 正在迁移到 ratatui。")
+            }
+        }
+        SlashCommand::Thinking => {
+            if args.is_empty() {
+                "/thinking 用法: /thinking [off|low|medium|high|auto]".to_string()
+            } else {
+                format!("/thinking {args} 正在迁移到 ratatui。")
+            }
+        }
+        SlashCommand::Session => "当前会话详情 UI 正在迁移到 ratatui。".to_string(),
+        SlashCommand::Tree => "对话树 UI 正在迁移到 ratatui。".to_string(),
+        SlashCommand::Codegraph => "用法: /codegraph [init|sync|status]".to_string(),
+        SlashCommand::Clear => "清屏 UI 正在迁移到 ratatui。".to_string(),
+        SlashCommand::Reload => "资源重载 UI 正在迁移到 ratatui。".to_string(),
+        _ => format!("/{command:?} 正在迁移到 ratatui。"),
+    };
+    pi_tui::ChatLine::status(text)
 }
 
 fn content_blocks_to_text(content: &[ContentBlock]) -> String {

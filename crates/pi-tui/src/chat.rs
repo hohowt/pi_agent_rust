@@ -1,9 +1,11 @@
+use std::future::Future;
 use std::io;
+use std::pin::Pin;
 
 use crossterm::event::{KeyCode, KeyModifiers};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Position};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
@@ -46,20 +48,51 @@ impl ChatLine {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct ChatOptions {
+    pub title: String,
+    pub model_label: String,
+    pub status: String,
+    pub resource_summary: String,
+    pub command_hints: Vec<String>,
+    pub key_hints: Vec<String>,
+}
+
+impl ChatOptions {
+    #[must_use]
+    pub fn new(model_label: impl Into<String>) -> Self {
+        Self {
+            title: "Pi".to_string(),
+            model_label: model_label.into(),
+            status: "就绪".to_string(),
+            resource_summary: "资源: 0 技能, 0 提示, 0 主题".to_string(),
+            command_hints: Vec::new(),
+            key_hints: vec![
+                "Enter: 发送".to_string(),
+                "Shift+Enter: newline".to_string(),
+                "Ctrl+C/Esc: 退出".to_string(),
+                "/help".to_string(),
+            ],
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ChatApp {
-    model_label: String,
+    options: ChatOptions,
     input: String,
     lines: Vec<ChatLine>,
+    busy: bool,
     should_quit: bool,
 }
 
 impl ChatApp {
-    fn new(model_label: impl Into<String>) -> Self {
+    const fn new(options: ChatOptions) -> Self {
         Self {
-            model_label: model_label.into(),
+            options,
             input: String::new(),
             lines: Vec::new(),
+            busy: false,
             should_quit: false,
         }
     }
@@ -105,9 +138,12 @@ impl ChatApp {
     }
 }
 
+pub type SubmitFuture = Pin<Box<dyn Future<Output = anyhow::Result<ChatLine>> + Send>>;
+
 pub async fn run_minimal_chat_loop(
-    model_label: String,
+    options: ChatOptions,
     initial_lines: Vec<ChatLine>,
+    mut on_submit: impl FnMut(String) -> SubmitFuture + Send,
 ) -> anyhow::Result<()> {
     let _terminal_guard = TerminalModeGuard::enter()?;
     let _alternate_scroll = AlternateScrollGuard::enable()?;
@@ -115,7 +151,7 @@ pub async fn run_minimal_chat_loop(
     let (draw_tx, draw_rx) = broadcast::channel(32);
     let frame_requester = FrameRequester::new(draw_tx);
     let mut events = RatatuiEventStream::new(draw_rx);
-    let mut app = ChatApp::new(model_label);
+    let mut app = ChatApp::new(options);
 
     for line in initial_lines {
         app.push_line(line);
@@ -142,10 +178,14 @@ pub async fn run_minimal_chat_loop(
         app.handle_event(event);
         if submit {
             if let Some(input) = app.take_submitted_input() {
+                app.busy = true;
                 frame_requester.schedule_frame();
-                app.push_line(ChatLine::status(format!(
-                    "Interactive submit is pending full ratatui chat port: {input}"
-                )));
+                terminal.draw(|frame| render(frame, &app))?;
+                match on_submit(input).await {
+                    Ok(line) => app.push_line(line),
+                    Err(err) => app.push_line(ChatLine::status(format!("Error: {err}"))),
+                }
+                app.busy = false;
             }
         }
         frame_requester.schedule_frame();
@@ -158,8 +198,7 @@ pub async fn run_minimal_chat_loop(
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &ChatApp) {
     let area = frame.area();
-    let [header, body, input, footer] = Layout::vertical([
-        Constraint::Length(1),
+    let [body, input, footer] = Layout::vertical([
         Constraint::Min(3),
         Constraint::Length(3),
         Constraint::Length(1),
@@ -168,16 +207,6 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &ChatApp) {
 
     let dim = Style::default().fg(Color::DarkGray);
     let accent = Style::default().fg(Color::Cyan);
-    let title = Style::default().add_modifier(Modifier::BOLD);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(vec![
-            Span::styled("Pi", title),
-            Span::raw("  "),
-            Span::styled(app.model_label.as_str(), dim),
-        ])),
-        header,
-    );
 
     let mut body_lines = Vec::new();
     for line in &app.lines {
@@ -215,9 +244,44 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &ChatApp) {
         ),
         input,
     );
+    let input_cursor_x = input
+        .x
+        .saturating_add(1)
+        .saturating_add(u16::try_from(app.input.chars().count()).unwrap_or(u16::MAX))
+        .min(input.right().saturating_sub(1));
+    frame.set_cursor_position(Position::new(input_cursor_x, input.y.saturating_add(1)));
 
-    frame.render_widget(
-        Paragraph::new("Enter: 发送  Esc/Ctrl+C: 退出").style(dim),
-        footer,
-    );
+    let status = if app.busy {
+        "运行中"
+    } else {
+        app.options.status.as_str()
+    };
+    frame.render_widget(Paragraph::new(footer_line(app, status)).style(dim), footer);
+}
+
+fn footer_line(app: &ChatApp, status: &str) -> String {
+    if app.input.trim_start().starts_with('/') {
+        let hints = if app.options.command_hints.is_empty() {
+            vec![
+                "/help".to_string(),
+                "/model".to_string(),
+                "/thinking".to_string(),
+                "/session".to_string(),
+                "/tree".to_string(),
+                "/codegraph status".to_string(),
+            ]
+        } else {
+            app.options.command_hints.clone()
+        };
+        return format!("commands: {}", hints.join("  "));
+    }
+    let hints = if app.options.key_hints.is_empty() {
+        String::new()
+    } else {
+        format!("  |  {}", app.options.key_hints.join("  |  "))
+    };
+    format!(
+        "{}  |  {}  |  模型: {}  |  {}{}",
+        app.options.title, status, app.options.model_label, app.options.resource_summary, hints
+    )
 }
