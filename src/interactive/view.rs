@@ -390,7 +390,7 @@ impl PiApp {
         if let Some(tree_ui) = &self.tree_ui {
             output.push_str(&view_tree_ui(tree_ui, &self.styles));
             self.render_footer_into(&mut output);
-            return output;
+            return normalize_raw_terminal_newlines(output);
         }
 
         // Build conversation content for viewport.
