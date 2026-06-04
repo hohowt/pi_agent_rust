@@ -107,8 +107,10 @@ use self::tree::{
 
 /// RAII guard that overrides tmux WheelUp/WheelDown bindings for the current
 /// pane so that mouse wheel events are forwarded to the application instead of
-/// triggering tmux copy-mode.  When dropped (including on panic), the original
-/// bindings are restored.
+/// triggering tmux copy-mode. This is only installed when mouse capture is
+/// enabled; when Pi leaves mouse capture disabled for terminal-native selection,
+/// tmux wheel bindings must also be left alone. When dropped (including on
+/// panic), the original bindings are restored.
 ///
 /// The override is pane-scoped: other panes in the same tmux session are not
 /// affected.  If `PI_TMUX_WHEEL_OVERRIDE=0` is set, no override is installed.
@@ -2278,6 +2280,11 @@ impl PiApp {
             VERSION,
             include_str!("../CHANGELOG.md"),
         );
+        let disable_mouse_capture = config.disable_mouse_capture.unwrap_or_else(|| {
+            std::env::var("PI_NO_MOUSE_CAPTURE")
+                .ok()
+                .is_none_or(|val| val != "0")
+        });
 
         let mut app = Self {
             input,
@@ -2336,7 +2343,11 @@ impl PiApp {
             vcs_info,
             startup_welcome,
             startup_changelog,
-            tmux_wheel_guard: TmuxWheelGuard::install(),
+            tmux_wheel_guard: if disable_mouse_capture {
+                None
+            } else {
+                TmuxWheelGuard::install()
+            },
         };
 
         app.scroll_to_bottom();
