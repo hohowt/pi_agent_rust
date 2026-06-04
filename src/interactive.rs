@@ -205,9 +205,11 @@ impl InteractiveContext {
             "Ctrl+O: 工具".to_string(),
             "Shift+Tab: 思考".to_string(),
             "Shift+Enter: newline".to_string(),
-            "Ctrl+C/Esc: quit".to_string(),
+            "Ctrl+C: quit".to_string(),
+            "Esc Esc: 会话".to_string(),
             "/help".to_string(),
         ];
+        options.slash_commands = slash_command_items(config.language());
         Self {
             config,
             current_model,
@@ -227,6 +229,50 @@ impl InteractiveContext {
         self.options.resource_summary = resource_summary(&self.resources);
         pi_tui::ChatAction::SetOptions(self.options.clone())
     }
+}
+
+fn slash_command_items(language: Language) -> Vec<pi_tui::SlashCommandItem> {
+    let rows = match language {
+        Language::Zh => vec![
+            ("/help", "帮助"),
+            ("/model", "选择/切换模型"),
+            ("/thinking", "设置 thinking level"),
+            ("/session", "显示会话信息"),
+            ("/settings", "显示设置"),
+            ("/theme", "选择主题"),
+            ("/resume", "选择历史会话"),
+            ("/history", "打开会话列表"),
+            ("/tree", "显示对话树信息"),
+            ("/compact", "压缩上下文"),
+            ("/clear", "清屏"),
+            ("/reload", "显示资源加载状态"),
+            ("/template", "选择 prompt template"),
+            ("/language", "切换语言"),
+            ("/codegraph", "管理 codegraph 索引"),
+            ("/exit", "退出"),
+        ],
+        Language::En => vec![
+            ("/help", "Show help"),
+            ("/model", "Pick or switch model"),
+            ("/thinking", "Set thinking level"),
+            ("/session", "Show session info"),
+            ("/settings", "Show settings"),
+            ("/theme", "Pick theme"),
+            ("/resume", "Pick previous session"),
+            ("/history", "Open session list"),
+            ("/tree", "Show conversation tree info"),
+            ("/compact", "Compact context"),
+            ("/clear", "Clear screen"),
+            ("/reload", "Show resource status"),
+            ("/template", "Pick prompt template"),
+            ("/language", "Switch language"),
+            ("/codegraph", "Manage codegraph index"),
+            ("/exit", "Quit"),
+        ],
+    };
+    rows.into_iter()
+        .map(|(command, description)| pi_tui::SlashCommandItem::new(command, description))
+        .collect()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -358,11 +404,9 @@ async fn handle_slash_command(
             pi_tui::ChatAction::Clear,
             status_action("已清空当前屏幕。要创建新的持久会话，请退出后使用 pi --new。"),
         ]),
-        SlashCommand::Resume | SlashCommand::History => {
-            status_action("会话选择器尚未接入当前简化 TUI。当前可退出后使用 pi resume。")
-        }
-        SlashCommand::Theme => status_action(format_theme_status(context)),
-        SlashCommand::Template => status_action(format_template_status(context)),
+        SlashCommand::Resume | SlashCommand::History => handle_history_command(context, args),
+        SlashCommand::Theme => handle_theme_command(context, args),
+        SlashCommand::Template => handle_template_command(context, args),
         SlashCommand::Compact => handle_compact_command(agent).await?,
         SlashCommand::Name => handle_name_command(agent, args).await?,
         SlashCommand::Language => handle_language_command(context, args),
@@ -411,7 +455,11 @@ async fn handle_model_command(
     args: &str,
 ) -> Result<pi_tui::ChatAction> {
     if args.trim().is_empty() {
-        return Ok(status_action(format_model_listing(context)));
+        return Ok(pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
+            "模型",
+            "/model",
+            model_picker_items(context),
+        )));
     }
 
     let Some(entry) = find_model_entry(&context.available_models, args) else {
@@ -428,6 +476,22 @@ async fn handle_model_command(
         )),
         context.sync_footer_model(),
     ]))
+}
+
+fn model_picker_items(context: &InteractiveContext) -> Vec<pi_tui::PickerItem> {
+    context
+        .available_models
+        .iter()
+        .map(|entry| {
+            let label = model_label(entry);
+            let reasoning = if entry.model.reasoning {
+                "thinking"
+            } else {
+                "no-thinking"
+            };
+            pi_tui::PickerItem::new(label.clone(), label, reasoning)
+        })
+        .collect()
 }
 
 async fn handle_thinking_command(
@@ -657,6 +721,24 @@ fn format_theme_status(context: &InteractiveContext) -> String {
     out
 }
 
+fn handle_theme_command(context: &InteractiveContext, args: &str) -> pi_tui::ChatAction {
+    if !args.trim().is_empty() {
+        return status_action(format!("主题切换待接入: {}", args.trim()));
+    }
+    let items = context
+        .resources
+        .themes()
+        .iter()
+        .map(|theme| {
+            pi_tui::PickerItem::new(theme.name.clone(), theme.name.clone(), theme.source.clone())
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return status_action("未加载主题。");
+    }
+    pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new("主题", "/theme", items))
+}
+
 fn format_template_status(context: &InteractiveContext) -> String {
     let mut out = String::from("Prompt templates:\n");
     for prompt in context.resources.prompts().iter().take(50) {
@@ -666,6 +748,32 @@ fn format_template_status(context: &InteractiveContext) -> String {
         out.push_str("未加载 prompt template。");
     }
     out
+}
+
+fn handle_template_command(context: &InteractiveContext, args: &str) -> pi_tui::ChatAction {
+    if !args.trim().is_empty() {
+        return status_action(format!("Prompt template 待插入: {}", args.trim()));
+    }
+    let items = context
+        .resources
+        .prompts()
+        .iter()
+        .map(|prompt| {
+            pi_tui::PickerItem::new(
+                prompt.name.clone(),
+                prompt.name.clone(),
+                prompt.description.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return status_action("未加载 prompt template。");
+    }
+    pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
+        "Prompt templates",
+        "/template",
+        items,
+    ))
 }
 
 async fn handle_compact_command(agent: &mut AgentSession) -> Result<pi_tui::ChatAction> {
@@ -694,9 +802,13 @@ async fn handle_name_command(agent: &mut AgentSession, args: &str) -> Result<pi_
 fn handle_language_command(context: &mut InteractiveContext, args: &str) -> pi_tui::ChatAction {
     let trimmed = args.trim();
     if trimmed.is_empty() {
-        return status_action(format!(
-            "当前语言: {:?}\n用法: /language [zh|en]",
-            context.language()
+        return pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
+            "语言",
+            "/language",
+            vec![
+                pi_tui::PickerItem::new("中文", "zh", "中文 UI 和 prompt"),
+                pi_tui::PickerItem::new("English", "en", "English UI and prompts"),
+            ],
         ));
     }
 
@@ -713,6 +825,7 @@ fn handle_language_command(context: &mut InteractiveContext, args: &str) -> pi_t
         Language::En => "Ready".to_string(),
     };
     context.options.resource_summary = resource_summary(&context.resources);
+    context.options.slash_commands = slash_command_items(language);
     pi_tui::ChatAction::Many(vec![
         status_action(
             PromptCatalog::new(language)
@@ -721,6 +834,35 @@ fn handle_language_command(context: &mut InteractiveContext, args: &str) -> pi_t
         ),
         pi_tui::ChatAction::SetOptions(context.options.clone()),
     ])
+}
+
+fn handle_history_command(context: &InteractiveContext, args: &str) -> pi_tui::ChatAction {
+    if !args.trim().is_empty() {
+        return status_action(format!(
+            "已选择会话: {}\n会话加载将在 ratatui session switch 接入后执行。",
+            args.trim()
+        ));
+    }
+    let index = crate::session_index::SessionIndex::new();
+    let cwd = context.cwd.display().to_string();
+    let sessions = index.list_sessions(Some(&cwd)).unwrap_or_default();
+    if sessions.is_empty() {
+        return status_action("当前项目没有可恢复会话。");
+    }
+    let items = sessions
+        .into_iter()
+        .take(100)
+        .map(|session| {
+            let label = session
+                .name
+                .clone()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or_else(|| session.id.clone());
+            let description = format!("{} messages  {}", session.message_count, session.timestamp);
+            pi_tui::PickerItem::new(label, session.path, description)
+        })
+        .collect::<Vec<_>>();
+    pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new("会话列表", "/resume", items))
 }
 
 fn parse_language_arg(value: &str) -> Option<Language> {
