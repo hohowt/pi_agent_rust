@@ -7997,7 +7997,7 @@ fn semantic_context_bundle_revision(bundle: &SemanticContextBundle) -> String {
         )
         .into_bytes()
     });
-    format!("{:x}", Sha256::digest(bytes))
+    crate::hex::encode_lower(Sha256::digest(bytes))
 }
 
 fn render_semantic_context_prompt(

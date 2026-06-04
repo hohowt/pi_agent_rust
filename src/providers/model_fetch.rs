@@ -53,7 +53,7 @@ use crate::provider_metadata::{
 
 /// TTL applied to every cache entry.  Five minutes balances staleness against
 /// rate-limit pressure on provider model catalogs.
-pub const MODEL_CACHE_TTL: Duration = Duration::from_secs(5 * 60);
+pub const MODEL_CACHE_TTL: Duration = Duration::from_mins(5);
 
 /// Environment variable that disables the cache entirely.  Useful for
 /// debugging and for ad-hoc verification of provider catalog changes without

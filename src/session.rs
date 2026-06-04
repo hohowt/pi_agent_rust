@@ -19,7 +19,7 @@ use crate::session_index::{
 use crate::session_store_v2::{self, SessionStoreV2};
 use crate::tui::PiConsole;
 use crate::{fs, runtime};
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -195,7 +195,7 @@ fn lock_session_persistence(path: &Path) -> Result<SessionPersistenceLockGuard> 
         .truncate(false)
         .open(&lock_path)
         .map_err(|e| crate::Error::Io(Box::new(e)))?;
-    file.lock_exclusive()?;
+    file.lock()?;
     Ok(SessionPersistenceLockGuard { file })
 }
 
@@ -967,7 +967,7 @@ fn elapsed_us_since(start: Instant) -> u64 {
 }
 
 fn cold_start_hash_path(path: &Path) -> String {
-    let mut digest = format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes()));
+    let mut digest = crate::hex::encode_lower(Sha256::digest(path.to_string_lossy().as_bytes()));
     digest.truncate(16);
     digest
 }
@@ -5074,11 +5074,11 @@ fn is_v2_sidecar_stale(jsonl_path: &Path, v2_root: &Path) -> bool {
 
 fn session_entry_chain_hash_step(prev_chain: &str, entry: &SessionEntry) -> Result<String> {
     let (_, _, _, payload) = session_store_v2::session_entry_to_frame_args(entry)?;
-    let payload_sha256 = format!("{:x}", Sha256::digest(serde_json::to_vec(&payload)?));
+    let payload_sha256 = crate::hex::encode_lower(Sha256::digest(serde_json::to_vec(&payload)?));
     let mut hasher = Sha256::new();
     hasher.update(prev_chain.as_bytes());
     hasher.update(payload_sha256.as_bytes());
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(crate::hex::encode_lower(hasher.finalize()))
 }
 
 /// Remove a V2 sidecar, reverting to JSONL-only storage.

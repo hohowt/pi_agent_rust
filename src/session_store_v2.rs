@@ -1674,12 +1674,12 @@ fn chain_hash_step(prev_chain: &str, payload_sha256: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prev_chain.as_bytes());
     hasher.update(payload_sha256.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::hex::encode_lower(hasher.finalize())
 }
 
 fn manifest_hash_hex(manifest: &Manifest) -> Result<String> {
     let encoded = serde_json::to_vec(manifest)?;
-    Ok(format!("{:x}", Sha256::digest(&encoded)))
+    Ok(crate::hex::encode_lower(Sha256::digest(&encoded)))
 }
 
 /// Derive the V2 sidecar store root from a JSONL session file path.
@@ -1825,7 +1825,7 @@ fn payload_hash_and_size(payload: &RawValue) -> Result<(String, u64)> {
     let bytes = payload.get().as_bytes();
     let payload_bytes = u64::try_from(bytes.len())
         .map_err(|_| Error::session(format!("payload is too large: {} bytes", bytes.len())))?;
-    let hash = format!("{:x}", Sha256::digest(bytes));
+    let hash = crate::hex::encode_lower(Sha256::digest(bytes));
     Ok((hash, payload_bytes))
 }
 

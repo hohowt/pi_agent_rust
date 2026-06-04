@@ -60,7 +60,7 @@ impl FrameScheduler {
     }
 
     async fn run(mut self) {
-        const PARK_DURATION: Duration = Duration::from_secs(60 * 60 * 24 * 365);
+        const PARK_DURATION: Duration = Duration::from_hours(24 * 365);
         let mut next_deadline: Option<Instant> = None;
         loop {
             let target = next_deadline.unwrap_or_else(|| Instant::now() + PARK_DURATION);

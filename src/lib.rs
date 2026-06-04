@@ -41,6 +41,7 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::module_name_repetitions,
+    clippy::collapsible_if,
     clippy::significant_drop_tightening,
     clippy::similar_names,
     clippy::wildcard_imports
@@ -86,6 +87,8 @@ pub use pi_runtime::sync;
 pub use pi_runtime::time;
 #[doc(hidden)]
 pub mod error_hints;
+#[doc(hidden)]
+pub mod hex;
 #[doc(hidden)]
 pub use pi_http::http;
 #[doc(hidden)]

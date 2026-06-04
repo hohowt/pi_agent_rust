@@ -6,7 +6,7 @@ use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::provider_metadata::{canonical_provider_id, provider_auth_env_keys, provider_metadata};
 use base64::Engine as _;
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 use std::collections::HashMap;
@@ -4539,9 +4539,9 @@ fn lock_file(file: File, timeout: Duration) -> Result<LockedFile> {
     let start = Instant::now();
     let mut attempt: u32 = 0;
     loop {
-        match FileExt::try_lock_exclusive(&file) {
-            Ok(true) => return Ok(LockedFile { file }),
-            Ok(false) => {} // Lock held by another process, retry
+        match FileExt::try_lock(&file) {
+            Ok(()) => return Ok(LockedFile { file }),
+            Err(fs4::TryLockError::WouldBlock) => {} // Lock held by another process, retry
             Err(e) => {
                 return Err(Error::auth(format!("Failed to lock auth file: {e}")));
             }
@@ -4569,8 +4569,8 @@ fn lock_file_shared(file: File, timeout: Duration) -> Result<LockedFile> {
     let mut attempt: u32 = 0;
     loop {
         match FileExt::try_lock_shared(&file) {
-            Ok(true) => return Ok(LockedFile { file }),
-            Ok(false) => {} // Lock held by another process exclusively, retry
+            Ok(()) => return Ok(LockedFile { file }),
+            Err(fs4::TryLockError::WouldBlock) => {} // Lock held by another process exclusively, retry
             Err(e) => {
                 return Err(Error::auth(format!("Failed to shared-lock auth file: {e}")));
             }

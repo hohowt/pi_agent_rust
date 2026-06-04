@@ -2,7 +2,7 @@
 
 use crate::agent::QueueMode;
 use crate::error::{Error, Result};
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 pub use pi_prompt::Language;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -960,9 +960,9 @@ fn open_settings_lock_file(path: &Path) -> Result<File> {
 fn lock_settings_file(file: File, timeout: Duration) -> Result<SettingsLockGuard> {
     let start = Instant::now();
     loop {
-        match FileExt::try_lock_exclusive(&file) {
-            Ok(true) => return Ok(SettingsLockGuard { file }),
-            Ok(false) => {}
+        match FileExt::try_lock(&file) {
+            Ok(()) => return Ok(SettingsLockGuard { file }),
+            Err(fs4::TryLockError::WouldBlock) => {}
             Err(err) => {
                 return Err(Error::config(format!(
                     "Failed to lock settings file: {err}"

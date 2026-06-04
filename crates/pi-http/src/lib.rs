@@ -7,6 +7,7 @@
     clippy::missing_errors_doc,
     clippy::missing_panics_doc,
     clippy::module_name_repetitions,
+    clippy::collapsible_if,
     clippy::similar_names,
     clippy::wildcard_imports
 )]

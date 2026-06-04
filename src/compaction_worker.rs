@@ -31,8 +31,8 @@ pub struct CompactionQuota {
 impl Default for CompactionQuota {
     fn default() -> Self {
         Self {
-            cooldown: Duration::from_secs(60),
-            timeout: Duration::from_secs(120),
+            cooldown: Duration::from_mins(1),
+            timeout: Duration::from_mins(2),
             max_attempts_per_session: 100,
         }
     }

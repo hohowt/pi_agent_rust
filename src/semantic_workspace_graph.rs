@@ -2711,7 +2711,7 @@ fn graph_input_fingerprint_digest(graph: &SemanticWorkspaceGraph) -> String {
             hasher.update(mtime_unix_ns.to_string().as_bytes());
         }
     }
-    format!("{:x}", hasher.finalize())
+    crate::hex::encode_lower(hasher.finalize())
 }
 
 fn build_redaction_summary(
@@ -3242,7 +3242,7 @@ fn datetime_unix_ns(timestamp: DateTime<Utc>) -> Option<u64> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::hex::encode_lower(Sha256::digest(bytes))
 }
 
 fn cache_key_sha256(
@@ -3260,7 +3260,7 @@ fn cache_key_sha256(
     hasher.update(normalized_source_path.as_bytes());
     hasher.update(b"\0");
     hasher.update(content_sha256.as_bytes());
-    format!("{:x}", hasher.finalize())
+    crate::hex::encode_lower(hasher.finalize())
 }
 
 fn stable_id(kind: &str, parts: &[&str]) -> String {
@@ -3270,7 +3270,7 @@ fn stable_id(kind: &str, parts: &[&str]) -> String {
         hasher.update(b"\0");
         hasher.update(part.as_bytes());
     }
-    let digest = format!("{:x}", hasher.finalize());
+    let digest = crate::hex::encode_lower(hasher.finalize());
     format!("swg:{kind}:{}", &digest[..16])
 }
 

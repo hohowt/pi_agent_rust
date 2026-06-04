@@ -3,7 +3,7 @@
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::session::{Session, SessionEntry, SessionHeader};
-use fs4::fs_std::FileExt;
+use fs4::FileExt;
 use rusqlite::{Connection, OpenFlags, params};
 use serde::Deserialize;
 use std::borrow::Borrow;
@@ -910,9 +910,9 @@ fn load_last_sync_epoch_ms(conn: &Connection) -> Result<Option<i64>> {
 fn lock_file_guard(file: &File, timeout: Duration) -> Result<LockGuard<'_>> {
     let start = Instant::now();
     loop {
-        match FileExt::try_lock_exclusive(file) {
-            Ok(true) => return Ok(LockGuard { file }),
-            Ok(false) => {}
+        match FileExt::try_lock(file) {
+            Ok(()) => return Ok(LockGuard { file }),
+            Err(fs4::TryLockError::WouldBlock) => {}
             Err(err) => {
                 return Err(Error::session(format!(
                     "Failed to acquire session index lock: {err}"

@@ -38,9 +38,7 @@ impl PiConsole {
     /// Get the current terminal width.
     #[must_use]
     pub fn width(&self) -> usize {
-        crossterm::terminal::size()
-            .map(|(width, _)| usize::from(width))
-            .unwrap_or(80)
+        crossterm::terminal::size().map_or(80, |(width, _)| usize::from(width))
     }
 
     /// Print plain text without styling.

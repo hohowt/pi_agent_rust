@@ -917,10 +917,10 @@ pub fn is_context_overflow(
     context_window: Option<u32>,
 ) -> bool {
     // Silent overflow: usage exceeds context window.
-    if let (Some(input_tokens), Some(window)) = (usage_input_tokens, context_window) {
-        if input_tokens > u64::from(window) {
-            return true;
-        }
+    if let (Some(input_tokens), Some(window)) = (usage_input_tokens, context_window)
+        && input_tokens > u64::from(window)
+    {
+        return true;
     }
 
     let lower = error_message.to_lowercase();

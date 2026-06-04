@@ -1423,7 +1423,7 @@ fn normalize_display_path(path: &Path) -> String {
 }
 
 fn spawn_session_index_maintenance() {
-    const MAX_INDEX_AGE: Duration = Duration::from_secs(60 * 30);
+    const MAX_INDEX_AGE: Duration = Duration::from_mins(30);
     let index = SessionIndex::new();
 
     // Always spawn the background thread to handle cleanup, regardless of reindexing needs.
@@ -2623,7 +2623,7 @@ fn list_models_cache_path(models_path: &Path) -> Option<PathBuf> {
         hasher.update([0x00]);
     }
 
-    let key = format!("{:x}", hasher.finalize());
+    let key = pi::hex::encode_lower(hasher.finalize());
     dirs::cache_dir().map(|dir| {
         dir.join("pi")
             .join("list-models-cache")
