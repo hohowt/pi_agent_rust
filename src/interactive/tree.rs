@@ -690,6 +690,52 @@ fn build_tree_selector_rows(
         }]
     }
 
+    fn build_user_display_nodes(
+        id: &str,
+        session: &Session,
+        entry_index_by_id: &HashMap<String, usize>,
+        user_children_by_parent: &HashMap<Option<String>, Vec<String>>,
+        labels_by_target: &HashMap<String, String>,
+    ) -> Vec<DisplayNode> {
+        let Some(&idx) = entry_index_by_id.get(id) else {
+            return Vec::new();
+        };
+        let Some(entry) = session.entries.get(idx) else {
+            return Vec::new();
+        };
+        if !entry_is_user_message(entry) {
+            return Vec::new();
+        }
+
+        let mut children = Vec::new();
+        for child_id in user_children_by_parent
+            .get(&Some(id.to_string()))
+            .cloned()
+            .unwrap_or_default()
+        {
+            children.extend(build_user_display_nodes(
+                &child_id,
+                session,
+                entry_index_by_id,
+                user_children_by_parent,
+                labels_by_target,
+            ));
+        }
+
+        let (mut text, resubmit_text) = describe_entry(entry);
+        if let Some(label) = labels_by_target.get(id) {
+            let _ = write!(text, " [{label}]");
+        }
+
+        vec![DisplayNode {
+            id: id.to_string(),
+            parent_id: entry.base().parent_id.clone(),
+            text,
+            resubmit_text,
+            children,
+        }]
+    }
+
     fn flatten_display_nodes(
         nodes: &[DisplayNode],
         prefix: &mut Vec<bool>,
@@ -772,18 +818,75 @@ fn build_tree_selector_rows(
         });
     }
 
-    let roots = children_by_parent.get(&None).cloned().unwrap_or_default();
     let mut display_roots = Vec::new();
-    for root_id in roots {
-        display_roots.extend(build_display_nodes(
-            &root_id,
-            session,
-            &entry_index_by_id,
-            &children_by_parent,
-            &labels_by_target,
-            user_only,
-            show_all,
-        ));
+    if user_only {
+        let mut user_children_by_parent: HashMap<Option<String>, Vec<String>> = HashMap::new();
+        for entry in &session.entries {
+            let Some(id) = entry.base_id().cloned() else {
+                continue;
+            };
+            if !entry_is_user_message(entry) {
+                continue;
+            }
+
+            let display_parent = entry
+                .base()
+                .parent_id
+                .as_ref()
+                .filter(|parent_id| {
+                    entry_index_by_id
+                        .get(*parent_id)
+                        .and_then(|&idx| session.entries.get(idx))
+                        .is_some_and(entry_is_user_message)
+                })
+                .cloned();
+
+            user_children_by_parent
+                .entry(display_parent)
+                .or_default()
+                .push(id);
+        }
+
+        for children in user_children_by_parent.values_mut() {
+            children.sort_by(|a, b| {
+                let ta = timestamp_by_id
+                    .get(a)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                let tb = timestamp_by_id
+                    .get(b)
+                    .map(String::as_str)
+                    .unwrap_or_default();
+                ta.cmp(tb)
+            });
+        }
+
+        for root_id in user_children_by_parent
+            .get(&None)
+            .cloned()
+            .unwrap_or_default()
+        {
+            display_roots.extend(build_user_display_nodes(
+                &root_id,
+                session,
+                &entry_index_by_id,
+                &user_children_by_parent,
+                &labels_by_target,
+            ));
+        }
+    } else {
+        let roots = children_by_parent.get(&None).cloned().unwrap_or_default();
+        for root_id in roots {
+            display_roots.extend(build_display_nodes(
+                &root_id,
+                session,
+                &entry_index_by_id,
+                &children_by_parent,
+                &labels_by_target,
+                user_only,
+                show_all,
+            ));
+        }
     }
 
     let mut rows = Vec::new();
