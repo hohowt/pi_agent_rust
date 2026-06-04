@@ -160,6 +160,7 @@ struct ChatApp {
     should_quit: bool,
     picker: Option<PickerState>,
     last_escape: Option<Instant>,
+    scroll: ConversationScroll,
 }
 
 impl ChatApp {
@@ -172,6 +173,7 @@ impl ChatApp {
             should_quit: false,
             picker: None,
             last_escape: None,
+            scroll: ConversationScroll::new(),
         }
     }
 
@@ -182,17 +184,22 @@ impl ChatApp {
         }
         self.input.clear();
         self.lines.push(ChatLine::user(input.clone()));
+        self.scroll.mark_content_changed();
         Some(input)
     }
 
     fn push_line(&mut self, line: ChatLine) {
         self.lines.push(line);
+        self.scroll.mark_content_changed();
     }
 
     fn apply_action(&mut self, action: ChatAction) {
         match action {
             ChatAction::PushLine(line) => self.push_line(line),
-            ChatAction::Clear => self.lines.clear(),
+            ChatAction::Clear => {
+                self.lines.clear();
+                self.scroll.scroll_to_bottom();
+            }
             ChatAction::Quit => self.should_quit = true,
             ChatAction::SetOptions(options) => self.options = options,
             ChatAction::OpenPicker(picker) => self.picker = Some(PickerState::new(picker)),
@@ -209,6 +216,14 @@ impl ChatApp {
             RatatuiEvent::Key(key) => self.handle_key(key),
             RatatuiEvent::Paste(text) => {
                 self.input.push_str(&text);
+                EventOutcome::None
+            }
+            RatatuiEvent::MouseScrollUp => {
+                self.scroll.scroll_up(3);
+                EventOutcome::None
+            }
+            RatatuiEvent::MouseScrollDown => {
+                self.scroll.scroll_down(3);
                 EventOutcome::None
             }
             RatatuiEvent::Resize | RatatuiEvent::Draw | RatatuiEvent::FocusGained => {
@@ -268,6 +283,10 @@ impl ChatApp {
                 self.last_escape = None;
                 self.input.pop();
             }
+            KeyCode::PageUp => self.scroll.scroll_up(10),
+            KeyCode::PageDown => self.scroll.scroll_down(10),
+            KeyCode::Home => self.scroll.scroll_to_top(),
+            KeyCode::End => self.scroll.scroll_to_bottom(),
             _ => {}
         }
         EventOutcome::None
@@ -328,6 +347,65 @@ impl ChatApp {
 
     const fn should_quit(&self) -> bool {
         self.should_quit
+    }
+}
+
+#[derive(Debug)]
+struct ConversationScroll {
+    offset: u16,
+    pinned_to_bottom: bool,
+    content_changed: bool,
+}
+
+impl Default for ConversationScroll {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ConversationScroll {
+    const fn new() -> Self {
+        Self {
+            offset: 0,
+            pinned_to_bottom: true,
+            content_changed: false,
+        }
+    }
+
+    fn scroll_up(&mut self, amount: u16) {
+        self.offset = self.offset.saturating_sub(amount);
+        self.pinned_to_bottom = false;
+    }
+
+    fn scroll_down(&mut self, amount: u16) {
+        self.offset = self.offset.saturating_add(amount);
+        self.pinned_to_bottom = false;
+    }
+
+    const fn scroll_to_top(&mut self) {
+        self.offset = 0;
+        self.pinned_to_bottom = false;
+    }
+
+    const fn scroll_to_bottom(&mut self) {
+        self.offset = u16::MAX;
+        self.pinned_to_bottom = true;
+    }
+
+    const fn mark_content_changed(&mut self) {
+        self.content_changed = true;
+    }
+
+    fn resolve(&mut self, total_lines: usize, viewport_height: u16) -> u16 {
+        let visible = usize::from(viewport_height);
+        let max_offset = u16::try_from(total_lines.saturating_sub(visible)).unwrap_or(u16::MAX);
+        if self.content_changed && self.pinned_to_bottom {
+            self.offset = max_offset;
+        }
+        self.content_changed = false;
+        self.offset = self.offset.min(max_offset);
+        self.pinned_to_bottom = self.offset == max_offset;
+        self.offset
     }
 }
 
@@ -417,7 +495,7 @@ pub async fn run_minimal_chat_loop(
     }
     frame_requester.schedule_frame();
 
-    terminal.draw(|frame| render(frame, &app))?;
+    terminal.draw(|frame| render(frame, &mut app))?;
     loop {
         if app.should_quit() {
             break;
@@ -431,7 +509,7 @@ pub async fn run_minimal_chat_loop(
         if let EventOutcome::Submit(input) = outcome {
             app.busy = true;
             frame_requester.schedule_frame();
-            terminal.draw(|frame| render(frame, &app))?;
+            terminal.draw(|frame| render(frame, &mut app))?;
             match on_submit(input).await {
                 Ok(action) => app.apply_action(action),
                 Err(err) => app.push_line(ChatLine::status(format!("Error: {err}"))),
@@ -440,13 +518,13 @@ pub async fn run_minimal_chat_loop(
         }
         frame_requester.schedule_frame();
 
-        terminal.draw(|frame| render(frame, &app))?;
+        terminal.draw(|frame| render(frame, &mut app))?;
     }
 
     Ok(())
 }
 
-fn render(frame: &mut ratatui::Frame<'_>, app: &ChatApp) {
+fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
     let area = frame.area();
     let [body, input, footer] = Layout::vertical([
         Constraint::Min(3),
@@ -458,21 +536,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &ChatApp) {
     let dim = Style::default().fg(Color::DarkGray);
     let accent = Style::default().fg(Color::Cyan);
 
-    let mut body_lines = Vec::new();
-    for line in &app.lines {
-        body_lines.push(Line::from(vec![
-            Span::styled(
-                format!("{}: ", line.role),
-                match line.role {
-                    "Assistant" => Style::default().fg(Color::Green),
-                    "Status" => dim,
-                    _ => accent,
-                }
-                .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(line.text.as_str()),
-        ]));
-    }
+    let body_lines = conversation_lines(&app.lines);
+    let conversation_height = body.height.saturating_sub(1);
+    let scroll_offset = app.scroll.resolve(body_lines.len(), conversation_height);
     frame.render_widget(
         Paragraph::new(body_lines)
             .block(
@@ -481,6 +547,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &ChatApp) {
                     .border_style(dim)
                     .border_type(BorderType::Plain),
             )
+            .scroll((scroll_offset, 0))
             .wrap(Wrap { trim: false }),
         body,
     );
@@ -512,6 +579,28 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &ChatApp) {
     } else if app.input.trim_start().starts_with('/') {
         render_slash_completion(frame, app, input);
     }
+}
+
+fn conversation_lines(lines: &[ChatLine]) -> Vec<Line<'_>> {
+    let dim = Style::default().fg(Color::DarkGray);
+    let accent = Style::default().fg(Color::Cyan);
+    lines
+        .iter()
+        .map(|line| {
+            Line::from(vec![
+                Span::styled(
+                    format!("{}: ", line.role),
+                    match line.role {
+                        "Assistant" => Style::default().fg(Color::Green),
+                        "Status" => dim,
+                        _ => accent,
+                    }
+                    .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(line.text.as_str()),
+            ])
+        })
+        .collect()
 }
 
 fn footer_line(app: &ChatApp, status: &str) -> String {
@@ -656,4 +745,49 @@ fn default_slash_commands() -> Vec<SlashCommandItem> {
     .into_iter()
     .map(|(command, description)| SlashCommandItem::new(command, description))
     .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ConversationScroll;
+
+    #[test]
+    fn conversation_scroll_pins_to_bottom_on_new_output() {
+        let mut scroll = ConversationScroll::default();
+
+        scroll.mark_content_changed();
+        let offset = scroll.resolve(40, 10);
+
+        assert_eq!(offset, 30);
+        assert!(scroll.pinned_to_bottom);
+    }
+
+    #[test]
+    fn conversation_scroll_preserves_position_after_user_scrolls_up() {
+        let mut scroll = ConversationScroll::default();
+        scroll.mark_content_changed();
+        assert_eq!(scroll.resolve(40, 10), 30);
+
+        scroll.scroll_up(5);
+        assert_eq!(scroll.resolve(40, 10), 25);
+        scroll.mark_content_changed();
+        assert_eq!(scroll.resolve(41, 10), 25);
+
+        assert!(!scroll.pinned_to_bottom);
+    }
+
+    #[test]
+    fn conversation_scroll_home_and_end_jump_to_edges() {
+        let mut scroll = ConversationScroll::default();
+        scroll.mark_content_changed();
+        assert_eq!(scroll.resolve(40, 10), 30);
+
+        scroll.scroll_to_top();
+        assert_eq!(scroll.resolve(40, 10), 0);
+        assert!(!scroll.pinned_to_bottom);
+
+        scroll.scroll_to_bottom();
+        assert_eq!(scroll.resolve(40, 10), 30);
+        assert!(scroll.pinned_to_bottom);
+    }
 }

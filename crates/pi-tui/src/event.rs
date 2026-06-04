@@ -1,7 +1,7 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use crossterm::event::{Event, EventStream, KeyEvent};
+use crossterm::event::{Event, EventStream, KeyEvent, MouseEventKind};
 use tokio::sync::broadcast;
 use tokio_stream::Stream;
 use tokio_stream::wrappers::BroadcastStream;
@@ -14,6 +14,8 @@ pub enum RatatuiEvent {
     Resize,
     Draw,
     FocusGained,
+    MouseScrollUp,
+    MouseScrollDown,
 }
 
 pub struct RatatuiEventStream {
@@ -90,6 +92,11 @@ fn map_crossterm_event(event: Event) -> Option<RatatuiEvent> {
         Event::Resize(_, _) => Some(RatatuiEvent::Resize),
         Event::Paste(text) => Some(RatatuiEvent::Paste(text)),
         Event::FocusGained => Some(RatatuiEvent::FocusGained),
-        Event::FocusLost | Event::Mouse(_) => None,
+        Event::Mouse(mouse) => match mouse.kind {
+            MouseEventKind::ScrollUp => Some(RatatuiEvent::MouseScrollUp),
+            MouseEventKind::ScrollDown => Some(RatatuiEvent::MouseScrollDown),
+            _ => None,
+        },
+        Event::FocusLost => None,
     }
 }

@@ -21,10 +21,13 @@
 
 ## 3. Interactive Chat Port
 
-- [ ] Move conversation state rendering from string output to ratatui widgets.
-- [ ] Replace `bubbles::Viewport` with internal scroll state.
+- [x] Move conversation state rendering from string output to ratatui widgets.
+- [x] Replace `bubbles::Viewport` with internal scroll state.
 - [ ] Add scrollback support for mouse wheel, PgUp/PgDown, Home/End, bottom
       anchoring, and preserved scroll position while output streams.
+  - [x] PgUp/PgDown/Home/End keyboard scrollback.
+  - [x] Bottom anchoring and preserved scroll position while output streams.
+  - [ ] Mouse wheel routing with terminal mouse-mode/native selection policy.
 - [ ] Replace `bubbles::TextArea` with a local editor state.
 - [ ] Restore multi-line editing, cursor left/right/up/down, word movement,
       delete, history navigation, and Shift+Enter newline insertion.
