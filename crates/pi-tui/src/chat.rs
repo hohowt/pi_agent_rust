@@ -537,7 +537,7 @@ impl EditorState {
         }
         self.text[..at]
             .grapheme_indices(true)
-            .last()
+            .next_back()
             .map(|(idx, _)| idx)
     }
 
@@ -647,12 +647,12 @@ impl ConversationScroll {
         }
     }
 
-    fn scroll_up(&mut self, amount: u16) {
+    const fn scroll_up(&mut self, amount: u16) {
         self.offset = self.offset.saturating_sub(amount);
         self.pinned_to_bottom = false;
     }
 
-    fn scroll_down(&mut self, amount: u16) {
+    const fn scroll_down(&mut self, amount: u16) {
         self.offset = self.offset.saturating_add(amount);
         self.pinned_to_bottom = false;
     }

@@ -11,6 +11,7 @@ use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct TerminalModeGuard {
     alternate_screen: bool,
     bracketed_paste: bool,
@@ -69,7 +70,7 @@ impl Drop for TerminalModeGuard {
     }
 }
 
-trait TerminalModeOps {
+trait TerminalModeOps: Send {
     fn enable_raw_mode(&mut self) -> io::Result<()>;
     fn enter_alternate_screen(&mut self) -> io::Result<()>;
     fn hide_cursor(&mut self) -> io::Result<()>;
@@ -165,9 +166,8 @@ impl Drop for AlternateScrollGuard {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
     use std::panic::{self, AssertUnwindSafe};
-    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
 
     use super::{TerminalModeGuard, TerminalModeOps};
 
@@ -179,25 +179,25 @@ mod tests {
 
     #[derive(Clone)]
     struct TestTerminalModeOps {
-        state: Rc<RefCell<TestTerminalModeState>>,
+        state: Arc<Mutex<TestTerminalModeState>>,
     }
 
     impl TestTerminalModeOps {
-        fn new(fail_on: Option<&'static str>) -> (Self, Rc<RefCell<TestTerminalModeState>>) {
-            let state = Rc::new(RefCell::new(TestTerminalModeState {
+        fn new(fail_on: Option<&'static str>) -> (Self, Arc<Mutex<TestTerminalModeState>>) {
+            let state = Arc::new(Mutex::new(TestTerminalModeState {
                 calls: Vec::new(),
                 fail_on,
             }));
             (
                 Self {
-                    state: Rc::clone(&state),
+                    state: Arc::clone(&state),
                 },
                 state,
             )
         }
 
         fn step(&mut self, name: &'static str) -> std::io::Result<()> {
-            let mut state = self.state.borrow_mut();
+            let mut state = self.state.lock().expect("test terminal state lock");
             state.calls.push(name);
             if state.fail_on == Some(name) {
                 return Err(std::io::Error::other(name));
@@ -256,7 +256,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(
-            state.borrow().calls,
+            state.lock().expect("test terminal state lock").calls,
             vec![
                 "enable_raw_mode",
                 "enter_alternate_screen",
@@ -280,7 +280,7 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(
-            state.borrow().calls,
+            state.lock().expect("test terminal state lock").calls,
             vec![
                 "enable_raw_mode",
                 "enter_alternate_screen",
