@@ -2370,6 +2370,7 @@ dependencies = [
  "ratatui",
  "tokio",
  "tokio-stream",
+ "unicode-width",
 ]
 
 [[package]]

@@ -22,6 +22,7 @@ ratatui = { workspace = true, features = [
 ] }
 tokio = { workspace = true, features = ["sync", "time"] }
 tokio-stream = { workspace = true, features = ["sync"] }
+unicode-width = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

@@ -11,6 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Paragraph, Wrap};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
+use unicode_width::UnicodeWidthStr;
 
 use crate::event::{RatatuiEvent, RatatuiEventStream};
 use crate::frame::FrameRequester;
@@ -246,8 +247,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &ChatApp) {
     );
     let input_cursor_x = input
         .x
-        .saturating_add(1)
-        .saturating_add(u16::try_from(app.input.chars().count()).unwrap_or(u16::MAX))
+        .saturating_add(u16::try_from(app.input.as_str().width()).unwrap_or(u16::MAX))
         .min(input.right().saturating_sub(1));
     frame.set_cursor_position(Position::new(input_cursor_x, input.y.saturating_add(1)));
 
