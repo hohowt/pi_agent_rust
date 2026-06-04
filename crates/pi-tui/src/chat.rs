@@ -78,6 +78,15 @@ impl ChatOptions {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum ChatAction {
+    PushLine(ChatLine),
+    Clear,
+    Quit,
+    SetOptions(ChatOptions),
+    Many(Vec<Self>),
+}
+
 #[derive(Debug)]
 struct ChatApp {
     options: ChatOptions,
@@ -112,6 +121,20 @@ impl ChatApp {
         self.lines.push(line);
     }
 
+    fn apply_action(&mut self, action: ChatAction) {
+        match action {
+            ChatAction::PushLine(line) => self.push_line(line),
+            ChatAction::Clear => self.lines.clear(),
+            ChatAction::Quit => self.should_quit = true,
+            ChatAction::SetOptions(options) => self.options = options,
+            ChatAction::Many(actions) => {
+                for action in actions {
+                    self.apply_action(action);
+                }
+            }
+        }
+    }
+
     fn handle_event(&mut self, event: RatatuiEvent) {
         match event {
             RatatuiEvent::Key(key) => match key.code {
@@ -139,7 +162,7 @@ impl ChatApp {
     }
 }
 
-pub type SubmitFuture = Pin<Box<dyn Future<Output = anyhow::Result<ChatLine>> + Send>>;
+pub type SubmitFuture = Pin<Box<dyn Future<Output = anyhow::Result<ChatAction>> + Send>>;
 
 pub async fn run_minimal_chat_loop(
     options: ChatOptions,
@@ -177,17 +200,15 @@ pub async fn run_minimal_chat_loop(
             })
         );
         app.handle_event(event);
-        if submit {
-            if let Some(input) = app.take_submitted_input() {
-                app.busy = true;
-                frame_requester.schedule_frame();
-                terminal.draw(|frame| render(frame, &app))?;
-                match on_submit(input).await {
-                    Ok(line) => app.push_line(line),
-                    Err(err) => app.push_line(ChatLine::status(format!("Error: {err}"))),
-                }
-                app.busy = false;
+        if submit && let Some(input) = app.take_submitted_input() {
+            app.busy = true;
+            frame_requester.schedule_frame();
+            terminal.draw(|frame| render(frame, &app))?;
+            match on_submit(input).await {
+                Ok(action) => app.apply_action(action),
+                Err(err) => app.push_line(ChatLine::status(format!("Error: {err}"))),
             }
+            app.busy = false;
         }
         frame_requester.schedule_frame();
 

@@ -6,5 +6,5 @@ mod event;
 mod frame;
 mod terminal;
 
-pub use chat::{ChatLine, ChatOptions, run_minimal_chat_loop};
+pub use chat::{ChatAction, ChatLine, ChatOptions, run_minimal_chat_loop};
 pub use console::{PiConsole, SpinnerStyle};

@@ -2,15 +2,20 @@
 
 use anyhow::Result;
 use pi_core::model::{ContentBlock, TextContent};
+use pi_prompt::PromptCatalog;
 
 use crate::agent::{AgentEvent, AgentSession};
 use crate::config::{Config, Language};
+use crate::model::ThinkingLevel;
 use crate::models::ModelEntry;
 use crate::package_manager::ResolvedResource;
 use crate::resources::{ResourceCliOptions, ResourceLoader};
 use crate::runtime::RuntimeHandle;
+use crate::session::SessionEntry;
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
 
 #[derive(Debug, Clone)]
 pub enum PendingInput {
@@ -96,14 +101,7 @@ impl SlashCommand {
 
     #[must_use]
     pub fn help_text(language: Language) -> &'static str {
-        match language {
-            Language::Zh => {
-                "/help 帮助\n/model 切换模型\n/thinking 设置思考强度\n/session 会话信息\n/tree 对话树\n/exit 退出"
-            }
-            Language::En => {
-                "/help help\n/model switch model\n/thinking set thinking level\n/session session info\n/tree conversation tree\n/exit quit"
-            }
-        }
+        PromptCatalog::new(language).ui_text().slash_help()
     }
 }
 
@@ -171,6 +169,66 @@ pub fn model_entry_resource_origin(_entry: &ModelEntry) -> Option<&ResolvedResou
     None
 }
 
+#[derive(Debug)]
+struct InteractiveContext {
+    config: Config,
+    current_model: ModelEntry,
+    available_models: Vec<ModelEntry>,
+    resources: ResourceLoader,
+    cwd: PathBuf,
+    options: pi_tui::ChatOptions,
+}
+
+impl InteractiveContext {
+    fn new(
+        config: Config,
+        current_model: ModelEntry,
+        available_models: Vec<ModelEntry>,
+        resources: ResourceLoader,
+        cwd: PathBuf,
+    ) -> Self {
+        let mut options = pi_tui::ChatOptions::new(model_label(&current_model));
+        options.status = "就绪".to_string();
+        options.resource_summary = resource_summary(&resources);
+        options.command_hints = vec![
+            "/help".to_string(),
+            "/model".to_string(),
+            "/thinking".to_string(),
+            "/session".to_string(),
+            "/settings".to_string(),
+            "/codegraph status".to_string(),
+            "/exit".to_string(),
+        ];
+        options.key_hints = vec![
+            "Enter: 发送".to_string(),
+            "Ctrl+L: 模型".to_string(),
+            "Ctrl+O: 工具".to_string(),
+            "Shift+Tab: 思考".to_string(),
+            "Shift+Enter: newline".to_string(),
+            "Ctrl+C/Esc: quit".to_string(),
+            "/help".to_string(),
+        ];
+        Self {
+            config,
+            current_model,
+            available_models,
+            resources,
+            cwd,
+            options,
+        }
+    }
+
+    fn language(&self) -> Language {
+        self.config.language()
+    }
+
+    fn sync_footer_model(&mut self) -> pi_tui::ChatAction {
+        self.options.model_label = model_label(&self.current_model);
+        self.options.resource_summary = resource_summary(&self.resources);
+        pi_tui::ChatAction::SetOptions(self.options.clone())
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn run_interactive(
     mut agent: AgentSession,
@@ -178,41 +236,16 @@ pub async fn run_interactive(
     config: Config,
     model_entry: ModelEntry,
     _model_scope: Vec<ModelEntry>,
-    _available_models: Vec<ModelEntry>,
+    available_models: Vec<ModelEntry>,
     pending_inputs: Vec<PendingInput>,
     _save_enabled: bool,
     resources: ResourceLoader,
     _resource_cli: ResourceCliOptions,
-    _cwd: PathBuf,
+    cwd: PathBuf,
     _runtime_handle: RuntimeHandle,
 ) -> Result<()> {
-    let model_label = format!("{}/{}", model_entry.model.provider, model_entry.model.id);
-    let mut options = pi_tui::ChatOptions::new(model_label);
-    options.status = "就绪".to_string();
-    options.resource_summary = format!(
-        "资源: {} 技能, {} 提示, {} 主题",
-        resources.skills().len(),
-        resources.prompts().len(),
-        resources.themes().len()
-    );
-    options.command_hints = vec![
-        "/help".to_string(),
-        "/model".to_string(),
-        "/thinking".to_string(),
-        "/session".to_string(),
-        "/tree".to_string(),
-        "/codegraph status".to_string(),
-        "/exit".to_string(),
-    ];
-    options.key_hints = vec![
-        "Enter: 发送".to_string(),
-        "Ctrl+L: 模型".to_string(),
-        "Ctrl+O: 工具".to_string(),
-        "Shift+Tab: 思考".to_string(),
-        "Shift+Enter: newline".to_string(),
-        "Ctrl+C/Esc: quit".to_string(),
-        "/help".to_string(),
-    ];
+    let context = InteractiveContext::new(config, model_entry, available_models, resources, cwd);
+    let options = context.options.clone();
     let mut initial_lines = Vec::new();
     for pending in pending_inputs {
         let input = match pending {
@@ -240,13 +273,15 @@ pub async fn run_interactive(
     }
 
     let agent = Arc::new(tokio::sync::Mutex::new(agent));
-    let language = config.language();
+    let context = Arc::new(tokio::sync::Mutex::new(context));
 
     pi_tui::run_minimal_chat_loop(options, initial_lines, move |input| {
         let agent = Arc::clone(&agent);
+        let context = Arc::clone(&context);
         Box::pin(async move {
             let mut agent = agent.lock().await;
-            handle_submitted_input(&mut agent, language, input).await
+            let mut context = context.lock().await;
+            handle_submitted_input(&mut agent, &mut context, input).await
         })
     })
     .await
@@ -254,17 +289,25 @@ pub async fn run_interactive(
 
 async fn handle_submitted_input(
     agent: &mut AgentSession,
-    language: Language,
+    context: &mut InteractiveContext,
     input: String,
-) -> Result<pi_tui::ChatLine> {
+) -> Result<pi_tui::ChatAction> {
     if let Some((command, args)) = SlashCommand::parse(&input) {
-        return Ok(handle_slash_command(command, args, language));
+        return handle_slash_command(agent, context, command, args).await;
     }
 
+    let event_lines = Arc::new(StdMutex::new(Vec::new()));
+    let event_sink = Arc::clone(&event_lines);
     let assistant = agent
         .run_with_content(
             vec![ContentBlock::Text(TextContent::new(input))],
-            |_event: AgentEvent| {},
+            move |event| {
+                if let Some(line) = format_agent_event(&event) {
+                    if let Ok(mut lines) = event_sink.lock() {
+                        lines.push(line);
+                    }
+                }
+            },
         )
         .await?;
     let answer = assistant
@@ -276,35 +319,62 @@ async fn handle_submitted_input(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(pi_tui::ChatLine::assistant(answer))
+    let mut actions = event_lines.lock().map_or_else(
+        |_| Vec::new(),
+        |lines| {
+            lines
+                .iter()
+                .cloned()
+                .map(|line| pi_tui::ChatAction::PushLine(pi_tui::ChatLine::status(line)))
+                .collect::<Vec<_>>()
+        },
+    );
+    actions.push(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::assistant(
+        answer,
+    )));
+    Ok(pi_tui::ChatAction::Many(actions))
 }
 
-fn handle_slash_command(command: SlashCommand, args: &str, language: Language) -> pi_tui::ChatLine {
-    let text = match command {
-        SlashCommand::Help => SlashCommand::help_text(language).to_string(),
-        SlashCommand::Exit => "使用 Esc 或 Ctrl+C 退出。".to_string(),
-        SlashCommand::Model => {
-            if args.is_empty() {
-                "/model UI 正在迁移到 ratatui，模型列表会在下一步恢复。".to_string()
-            } else {
-                format!("/model {args} 正在迁移到 ratatui。")
-            }
+async fn handle_slash_command(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+    command: SlashCommand,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
+    let action = match command {
+        SlashCommand::Help => status_action(SlashCommand::help_text(context.language())),
+        SlashCommand::Exit => pi_tui::ChatAction::Quit,
+        SlashCommand::Clear => pi_tui::ChatAction::Clear,
+        SlashCommand::Model => handle_model_command(agent, context, args).await?,
+        SlashCommand::Thinking => handle_thinking_command(agent, context, args).await?,
+        SlashCommand::Session => status_action(format_session_status(agent).await?),
+        SlashCommand::Settings => status_action(format_settings_status(context)),
+        SlashCommand::Reload => status_action(format_resource_status(context)),
+        SlashCommand::ScopedModels => status_action(format_scoped_models(context, args)),
+        SlashCommand::Codegraph => status_action(handle_codegraph_command(context, args)?),
+        SlashCommand::Hotkeys => status_action(context.options.key_hints.join("\n")),
+        SlashCommand::Tree => status_action(format_tree_status(agent).await?),
+        SlashCommand::New => pi_tui::ChatAction::Many(vec![
+            pi_tui::ChatAction::Clear,
+            status_action("已清空当前屏幕。要创建新的持久会话，请退出后使用 pi --new。"),
+        ]),
+        SlashCommand::Resume | SlashCommand::History => {
+            status_action("会话选择器尚未接入当前简化 TUI。当前可退出后使用 pi resume。")
         }
-        SlashCommand::Thinking => {
-            if args.is_empty() {
-                "/thinking 用法: /thinking [off|low|medium|high|auto]".to_string()
-            } else {
-                format!("/thinking {args} 正在迁移到 ratatui。")
-            }
-        }
-        SlashCommand::Session => "当前会话详情 UI 正在迁移到 ratatui。".to_string(),
-        SlashCommand::Tree => "对话树 UI 正在迁移到 ratatui。".to_string(),
-        SlashCommand::Codegraph => "用法: /codegraph [init|sync|status]".to_string(),
-        SlashCommand::Clear => "清屏 UI 正在迁移到 ratatui。".to_string(),
-        SlashCommand::Reload => "资源重载 UI 正在迁移到 ratatui。".to_string(),
-        _ => format!("/{command:?} 正在迁移到 ratatui。"),
+        SlashCommand::Theme => status_action(format_theme_status(context)),
+        SlashCommand::Template => status_action(format_template_status(context)),
+        SlashCommand::Compact => handle_compact_command(agent).await?,
+        SlashCommand::Name => handle_name_command(agent, args).await?,
+        SlashCommand::Language => handle_language_command(context, args),
+        SlashCommand::Login
+        | SlashCommand::Logout
+        | SlashCommand::Export
+        | SlashCommand::Copy
+        | SlashCommand::Fork
+        | SlashCommand::Share
+        | SlashCommand::Changelog => status_action(format_command_unavailable(command)),
     };
-    pi_tui::ChatLine::status(text)
+    Ok(action)
 }
 
 fn content_blocks_to_text(content: &[ContentBlock]) -> String {
@@ -316,6 +386,487 @@ fn content_blocks_to_text(content: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn status_action(text: impl Into<String>) -> pi_tui::ChatAction {
+    pi_tui::ChatAction::PushLine(pi_tui::ChatLine::status(text))
+}
+
+fn model_label(entry: &ModelEntry) -> String {
+    format!("{}/{}", entry.model.provider, entry.model.id)
+}
+
+fn resource_summary(resources: &ResourceLoader) -> String {
+    format!(
+        "资源: {} 技能, {} 提示, {} 主题",
+        resources.skills().len(),
+        resources.prompts().len(),
+        resources.themes().len()
+    )
+}
+
+async fn handle_model_command(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
+    if args.trim().is_empty() {
+        return Ok(status_action(format_model_listing(context)));
+    }
+
+    let Some(entry) = find_model_entry(&context.available_models, args) else {
+        return Ok(status_action(format!("未找到模型: {args}")));
+    };
+    agent
+        .set_provider_model(&entry.model.provider, &entry.model.id)
+        .await?;
+    context.current_model = entry;
+    Ok(pi_tui::ChatAction::Many(vec![
+        status_action(format!(
+            "已切换模型: {}",
+            model_label(&context.current_model)
+        )),
+        context.sync_footer_model(),
+    ]))
+}
+
+async fn handle_thinking_command(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
+    let current = agent
+        .agent
+        .stream_options()
+        .thinking_level
+        .unwrap_or_default();
+    if args.trim().is_empty() {
+        return Ok(status_action(format!(
+            "当前 thinking: {current}\n用法: /thinking [off|minimal|low|medium|high|xhigh]"
+        )));
+    }
+    let requested = args
+        .trim()
+        .parse::<ThinkingLevel>()
+        .map_err(|err| anyhow::anyhow!("Invalid thinking level: {err}"))?;
+    let effective = agent.clamp_thinking_level_for_model(
+        &context.current_model.model.provider,
+        &context.current_model.model.id,
+        requested,
+    );
+    agent.agent.stream_options_mut().thinking_level = Some(effective);
+    {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let mut session = agent
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        let previous = session
+            .effective_thinking_level_for_current_path()
+            .as_deref()
+            .and_then(|value| value.parse::<ThinkingLevel>().ok());
+        session.set_model_header(None, None, Some(effective.to_string()));
+        if previous != Some(effective) {
+            session.append_thinking_level_change(effective.to_string());
+        }
+    }
+    agent.persist_session().await?;
+    let effective = agent
+        .agent
+        .stream_options()
+        .thinking_level
+        .unwrap_or_default();
+    Ok(pi_tui::ChatAction::Many(vec![
+        status_action(format!("thinking 已设置为: {effective}")),
+        context.sync_footer_model(),
+    ]))
+}
+
+fn format_model_listing(context: &InteractiveContext) -> String {
+    let mut out = String::from("可用模型:\n");
+    let current = model_label(&context.current_model);
+    for entry in context.available_models.iter().take(80) {
+        let label = model_label(entry);
+        let marker = if label == current { "*" } else { " " };
+        let reasoning = if entry.model.reasoning {
+            "thinking"
+        } else {
+            "no-thinking"
+        };
+        let _ = writeln!(out, "{marker} {label}  {reasoning}");
+    }
+    if context.available_models.len() > 80 {
+        let _ = writeln!(
+            out,
+            "... 还有 {} 个模型",
+            context.available_models.len() - 80
+        );
+    }
+    out.push_str("\n用法: /model <provider/model 或 model-id>");
+    out
+}
+
+fn find_model_entry(available_models: &[ModelEntry], pattern: &str) -> Option<ModelEntry> {
+    let patterns = parse_scoped_model_patterns(pattern);
+    if patterns.is_empty() {
+        return None;
+    }
+    let resolved = resolve_scoped_model_entries(available_models, &patterns);
+    if resolved.len() == 1 {
+        return resolved.into_iter().next();
+    }
+    let normalized = strip_thinking_level_suffix(pattern.trim()).to_ascii_lowercase();
+    available_models
+        .iter()
+        .find(|entry| {
+            let full = format!("{}/{}", entry.model.provider, entry.model.id).to_ascii_lowercase();
+            full == normalized || entry.model.id.eq_ignore_ascii_case(&normalized)
+        })
+        .cloned()
+}
+
+async fn format_session_status(agent: &AgentSession) -> Result<String> {
+    let cx = crate::agent_cx::AgentCx::for_request();
+    let session = agent
+        .session
+        .lock(cx.cx())
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let model = session.effective_model_for_current_path().map_or_else(
+        || "unknown".to_string(),
+        |(provider, model)| format!("{provider}/{model}"),
+    );
+    let thinking = session
+        .effective_thinking_level_for_current_path()
+        .unwrap_or_else(|| "unknown".to_string());
+    let path = session
+        .path
+        .as_ref()
+        .map_or_else(|| "memory".to_string(), |path| path.display().to_string());
+    Ok(format!(
+        "会话信息\n路径: {path}\n消息: {}\n条目: {}\n模型: {model}\nthinking: {thinking}\n保存: {}",
+        session
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+            .count(),
+        session.entries.len(),
+        agent.save_enabled()
+    ))
+}
+
+async fn format_tree_status(agent: &AgentSession) -> Result<String> {
+    let cx = crate::agent_cx::AgentCx::for_request();
+    let session = agent
+        .session
+        .lock(cx.cx())
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    Ok(format!(
+        "对话树\n当前 leaf: {}\n条目: {}\n当前路径条目: {}",
+        session.leaf_id().unwrap_or("<none>"),
+        session.entries.len(),
+        session.entries_for_current_path().len()
+    ))
+}
+
+fn format_settings_status(context: &InteractiveContext) -> String {
+    format!(
+        "设置\n语言: {:?}\ncodegraph.autoInit: {}\ncodegraph.watch: {}\ncodegraph.debounceMs: {}",
+        context.config.language(),
+        context.config.codegraph_auto_init(),
+        context.config.codegraph_watch(),
+        context.config.codegraph_watch_debounce_ms()
+    )
+}
+
+fn format_resource_status(context: &InteractiveContext) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "资源已加载");
+    let _ = writeln!(out, "- skills: {}", context.resources.skills().len());
+    let _ = writeln!(out, "- prompts: {}", context.resources.prompts().len());
+    let _ = writeln!(out, "- themes: {}", context.resources.themes().len());
+    out
+}
+
+fn format_scoped_models(context: &InteractiveContext, args: &str) -> String {
+    let patterns = parse_scoped_model_patterns(args);
+    if patterns.is_empty() {
+        return "用法: /scoped-models <pattern...>".to_string();
+    }
+    let resolved = resolve_scoped_model_entries(&context.available_models, &patterns);
+    if resolved.is_empty() {
+        return "没有匹配的模型。".to_string();
+    }
+    let mut out = String::from("匹配模型:\n");
+    for entry in resolved {
+        let _ = writeln!(out, "- {}", model_label(&entry));
+    }
+    out
+}
+
+fn handle_codegraph_command(context: &InteractiveContext, args: &str) -> Result<String> {
+    let command = args.trim();
+    match command {
+        "" => Ok("用法: /codegraph [init|sync|status]".to_string()),
+        "init" | "sync" => {
+            let index = pi_codegraph::CodeGraphIndex::open(&context.cwd)?;
+            let sync = index.sync_project()?;
+            let files = index.indexed_files()?.len();
+            Ok(format!(
+                "Codegraph {}\n数据库: {}\n文件: {}\n已索引: {}  未变化: {}  已移除: {}  已跳过: {}",
+                command,
+                index.db_path().display(),
+                files,
+                sync.indexed_files,
+                sync.unchanged_files,
+                sync.removed_files,
+                sync.skipped_files
+            ))
+        }
+        "status" => {
+            let db_path = pi_codegraph::project_db_path(&context.cwd);
+            match pi_codegraph::CodeGraphIndex::open_existing(&context.cwd) {
+                Ok(index) => Ok(format!(
+                    "Codegraph 状态\n已初始化: true\n数据库: {}\n文件: {}",
+                    index.db_path().display(),
+                    index.indexed_files()?.len()
+                )),
+                Err(pi_codegraph::CodeGraphError::IndexNotInitialized(_)) => Ok(format!(
+                    "Codegraph 状态\n已初始化: false\n数据库: {}",
+                    db_path.display()
+                )),
+                Err(err) => Err(err.into()),
+            }
+        }
+        other => Ok(format!(
+            "不支持的 codegraph 命令: {other}\n用法: /codegraph [init|sync|status]"
+        )),
+    }
+}
+
+fn format_theme_status(context: &InteractiveContext) -> String {
+    let mut out = String::from("主题:\n");
+    for theme in context.resources.themes().iter().take(50) {
+        let _ = writeln!(out, "- {} ({})", theme.name, theme.source);
+    }
+    if context.resources.themes().is_empty() {
+        out.push_str("未加载主题。");
+    }
+    out
+}
+
+fn format_template_status(context: &InteractiveContext) -> String {
+    let mut out = String::from("Prompt templates:\n");
+    for prompt in context.resources.prompts().iter().take(50) {
+        let _ = writeln!(out, "- {} ({})", prompt.name, prompt.source);
+    }
+    if context.resources.prompts().is_empty() {
+        out.push_str("未加载 prompt template。");
+    }
+    out
+}
+
+async fn handle_compact_command(agent: &mut AgentSession) -> Result<pi_tui::ChatAction> {
+    agent.compact_now(|_event: AgentEvent| {}).await?;
+    Ok(status_action("压缩已完成。"))
+}
+
+async fn handle_name_command(agent: &mut AgentSession, args: &str) -> Result<pi_tui::ChatAction> {
+    let name = args.trim();
+    if name.is_empty() {
+        return Ok(status_action("用法: /name <session-name>"));
+    }
+    let cx = crate::agent_cx::AgentCx::for_request();
+    {
+        let mut session = agent
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        session.set_name(name);
+    }
+    agent.persist_session().await?;
+    Ok(status_action(format!("会话已命名: {name}")))
+}
+
+fn handle_language_command(context: &mut InteractiveContext, args: &str) -> pi_tui::ChatAction {
+    let trimmed = args.trim();
+    if trimmed.is_empty() {
+        return status_action(format!(
+            "当前语言: {:?}\n用法: /language [zh|en]",
+            context.language()
+        ));
+    }
+
+    let Some(language) = parse_language_arg(trimmed) else {
+        return status_action("不支持的语言。用法: /language [zh|en]");
+    };
+
+    context.config.language = Some(match language {
+        Language::Zh => "zh".to_string(),
+        Language::En => "en".to_string(),
+    });
+    context.options.status = match language {
+        Language::Zh => "就绪".to_string(),
+        Language::En => "Ready".to_string(),
+    };
+    context.options.resource_summary = resource_summary(&context.resources);
+    pi_tui::ChatAction::Many(vec![
+        status_action(
+            PromptCatalog::new(language)
+                .ui_text()
+                .language_updated(language),
+        ),
+        pi_tui::ChatAction::SetOptions(context.options.clone()),
+    ])
+}
+
+fn parse_language_arg(value: &str) -> Option<Language> {
+    match value.to_ascii_lowercase().as_str() {
+        "zh" | "cn" | "chinese" | "中文" => Some(Language::Zh),
+        "en" | "english" => Some(Language::En),
+        _ => None,
+    }
+}
+
+fn format_command_unavailable(command: SlashCommand) -> String {
+    match command {
+        SlashCommand::Login => {
+            "/login 需要 OAuth/API key 专用交互流程；当前请使用非交互 CLI 登录流程。".to_string()
+        }
+        SlashCommand::Logout => {
+            "/logout 需要认证状态写入确认；当前请使用配置/auth 文件管理命令。".to_string()
+        }
+        SlashCommand::Export => "/export 需要选择导出目标；当前请使用会话导出 CLI。".to_string(),
+        SlashCommand::Copy => "/copy 需要剪贴板接入；当前请用终端选择文本复制。".to_string(),
+        SlashCommand::Fork => {
+            "/fork 需要分支选择器；当前请使用 /tree 查看当前路径信息。".to_string()
+        }
+        SlashCommand::Share => {
+            "/share 需要分享后端/浏览器流程；当前 TUI 不自动上传会话。".to_string()
+        }
+        SlashCommand::Changelog => include_str!("../CHANGELOG.md")
+            .lines()
+            .take(80)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => format!("/{command:?} 当前不可用。"),
+    }
+}
+
+fn format_agent_event(event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::TurnStart { turn_index, .. } => Some(format!("turn {turn_index}: 开始")),
+        AgentEvent::TurnEnd {
+            turn_index,
+            tool_results,
+            latency_breakdown,
+            ..
+        } => {
+            let latency = latency_breakdown
+                .as_ref()
+                .map_or(String::new(), |breakdown| {
+                    format!("  {}ms", breakdown.total_ms)
+                });
+            Some(format!(
+                "turn {turn_index}: 完成，工具结果 {}{}",
+                tool_results.len(),
+                latency
+            ))
+        }
+        AgentEvent::ToolExecutionStart {
+            tool_name, args, ..
+        } => Some(format!("tool: {tool_name} 开始 {}", compact_json(args))),
+        AgentEvent::ToolExecutionUpdate {
+            tool_name,
+            partial_result,
+            ..
+        } => Some(format!(
+            "tool: {tool_name} 更新 {}",
+            summarize_tool_output(partial_result)
+        )),
+        AgentEvent::ToolExecutionEnd {
+            tool_name,
+            result,
+            is_error,
+            ..
+        } => Some(format!(
+            "tool: {tool_name} {} {}",
+            if *is_error { "失败" } else { "完成" },
+            summarize_tool_output(result)
+        )),
+        AgentEvent::AutoCompactionStart { reason } => Some(format!("自动压缩开始: {reason}")),
+        AgentEvent::AutoCompactionEnd {
+            aborted,
+            will_retry,
+            error_message,
+            ..
+        } => Some(format!(
+            "自动压缩结束: aborted={aborted} retry={will_retry}{}",
+            error_message
+                .as_ref()
+                .map_or(String::new(), |err| format!(" error={err}"))
+        )),
+        AgentEvent::AutoRetryStart {
+            attempt,
+            max_attempts,
+            delay_ms,
+            error_message,
+        } => Some(format!(
+            "自动重试 {attempt}/{max_attempts}: {delay_ms}ms 后重试，原因: {error_message}"
+        )),
+        AgentEvent::AutoRetryEnd {
+            success,
+            attempt,
+            final_error,
+        } => Some(format!(
+            "自动重试结束 attempt={attempt} success={success}{}",
+            final_error
+                .as_ref()
+                .map_or(String::new(), |err| format!(" error={err}"))
+        )),
+        AgentEvent::AgentStart { .. }
+        | AgentEvent::AgentEnd { .. }
+        | AgentEvent::MessageStart { .. }
+        | AgentEvent::MessageUpdate { .. }
+        | AgentEvent::MessageEnd { .. } => None,
+    }
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    let raw = serde_json::to_string(value).unwrap_or_else(|_| "<json>".to_string());
+    truncate_line(&raw, 180)
+}
+
+fn summarize_tool_output(output: &crate::tools::ToolOutput) -> String {
+    let content = content_blocks_to_text(&output.content);
+    let content = if content.trim().is_empty() {
+        output
+            .details
+            .as_ref()
+            .map_or_else(String::new, compact_json)
+    } else {
+        content
+    };
+    truncate_line(content.trim(), 220)
+}
+
+fn truncate_line(text: &str, max_chars: usize) -> String {
+    let mut out = String::new();
+    for (idx, ch) in text
+        .chars()
+        .filter(|ch| *ch != '\n' && *ch != '\r')
+        .enumerate()
+    {
+        if idx >= max_chars {
+            out.push_str("...");
+            return out;
+        }
+        out.push(ch);
+    }
+    out
 }
 
 fn wildcard_match(pattern: &str, text: &str) -> bool {
