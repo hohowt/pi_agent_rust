@@ -1039,7 +1039,16 @@ fn default_slash_commands() -> Vec<SlashCommandItem> {
 #[cfg(test)]
 mod tests {
     use super::{ConversationScroll, EditorState, normalize_pasted_text};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use unicode_width::UnicodeWidthStr;
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn modified_key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, modifiers)
+    }
 
     #[test]
     fn conversation_scroll_pins_to_bottom_on_new_output() {
@@ -1145,5 +1154,21 @@ mod tests {
             normalize_pasted_text("\"file:///tmp/a%20b.txt\""),
             "/tmp/a b.txt"
         );
+    }
+
+    #[test]
+    fn chat_app_maps_crossterm_keys_to_editor_actions() {
+        let mut app = super::ChatApp::new(super::ChatOptions::new("model"));
+
+        app.handle_key(key(KeyCode::Char('a')));
+        app.handle_key(key(KeyCode::Char('c')));
+        app.handle_key(key(KeyCode::Left));
+        app.handle_key(key(KeyCode::Char('b')));
+        app.handle_key(modified_key(KeyCode::Char('e'), KeyModifiers::CONTROL));
+        app.handle_key(modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_key(key(KeyCode::Char('d')));
+
+        assert_eq!(app.editor.text(), "abc\nd");
+        assert_eq!(app.editor.cursor_position(), (1, 1));
     }
 }
