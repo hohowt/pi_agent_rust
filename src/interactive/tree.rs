@@ -699,16 +699,16 @@ fn build_tree_selector_rows(
     ) {
         for (idx, node) in nodes.iter().enumerate() {
             let is_last = idx + 1 == nodes.len();
-            let shows_connector = !is_root_level || nodes.len() > 1;
 
             let mut display = String::new();
-            if shows_connector {
+            if !is_root_level {
                 for has_more in prefix.iter().copied() {
                     display.push_str(if has_more { "│   " } else { "    " });
                 }
-                display.push_str(if is_last { "└── " } else { "├── " });
+                display.push_str(if is_last { "└─ " } else { "├─ " });
             }
             display.push_str(&node.text);
+
             if current_leaf_id.is_some_and(|leaf| leaf == node.id) {
                 display.push_str(" ← active");
             }
@@ -720,13 +720,13 @@ fn build_tree_selector_rows(
                 resubmit_text: node.resubmit_text.clone(),
             });
 
-            if shows_connector {
+            if is_root_level {
+                prefix.push(false);
+            } else {
                 prefix.push(!is_last);
             }
             flatten_display_nodes(&node.children, prefix, out, current_leaf_id, false);
-            if shows_connector {
-                prefix.pop();
-            }
+            prefix.pop();
         }
     }
 
