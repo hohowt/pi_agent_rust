@@ -15,7 +15,6 @@ use crate::session::SessionEntry;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
 
 #[derive(Debug, Clone)]
 pub enum PendingInput {
@@ -321,13 +320,13 @@ pub async fn run_interactive(
     let agent = Arc::new(tokio::sync::Mutex::new(agent));
     let context = Arc::new(tokio::sync::Mutex::new(context));
 
-    pi_tui::run_minimal_chat_loop(options, initial_lines, move |input| {
+    pi_tui::run_minimal_chat_loop(options, initial_lines, move |input, action_tx| {
         let agent = Arc::clone(&agent);
         let context = Arc::clone(&context);
         Box::pin(async move {
             let mut agent = agent.lock().await;
             let mut context = context.lock().await;
-            handle_submitted_input(&mut agent, &mut context, input).await
+            handle_submitted_input(&mut agent, &mut context, input, action_tx).await
         })
     })
     .await
@@ -337,21 +336,20 @@ async fn handle_submitted_input(
     agent: &mut AgentSession,
     context: &mut InteractiveContext,
     input: String,
+    action_tx: pi_tui::ChatActionSender,
 ) -> Result<pi_tui::ChatAction> {
     if let Some((command, args)) = SlashCommand::parse(&input) {
         return handle_slash_command(agent, context, command, args).await;
     }
 
-    let event_lines = Arc::new(StdMutex::new(Vec::new()));
-    let event_sink = Arc::clone(&event_lines);
+    let event_sink = action_tx.clone();
     let assistant = agent
         .run_with_content(
             vec![ContentBlock::Text(TextContent::new(input))],
             move |event| {
                 if let Some(line) = format_agent_event(&event) {
-                    if let Ok(mut lines) = event_sink.lock() {
-                        lines.push(line);
-                    }
+                    let _ = event_sink
+                        .send(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::status(line)));
                 }
             },
         )
@@ -365,20 +363,9 @@ async fn handle_submitted_input(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    let mut actions = event_lines.lock().map_or_else(
-        |_| Vec::new(),
-        |lines| {
-            lines
-                .iter()
-                .cloned()
-                .map(|line| pi_tui::ChatAction::PushLine(pi_tui::ChatLine::status(line)))
-                .collect::<Vec<_>>()
-        },
-    );
-    actions.push(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::assistant(
+    Ok(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::assistant(
         answer,
-    )));
-    Ok(pi_tui::ChatAction::Many(actions))
+    )))
 }
 
 async fn handle_slash_command(

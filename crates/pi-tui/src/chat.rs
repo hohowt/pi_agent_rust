@@ -10,7 +10,7 @@ use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::StreamExt;
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -750,12 +750,13 @@ enum EventOutcome {
     Submit(String),
 }
 
+pub type ChatActionSender = mpsc::UnboundedSender<ChatAction>;
 pub type SubmitFuture = Pin<Box<dyn Future<Output = anyhow::Result<ChatAction>> + Send>>;
 
 pub async fn run_minimal_chat_loop(
     options: ChatOptions,
     initial_lines: Vec<ChatLine>,
-    mut on_submit: impl FnMut(String) -> SubmitFuture + Send,
+    mut on_submit: impl FnMut(String, ChatActionSender) -> SubmitFuture + Send,
 ) -> anyhow::Result<()> {
     let _terminal_guard = TerminalModeGuard::enter()?;
     let _alternate_scroll = AlternateScrollGuard::enable()?;
@@ -763,6 +764,7 @@ pub async fn run_minimal_chat_loop(
     let (draw_tx, draw_rx) = broadcast::channel(32);
     let frame_requester = FrameRequester::new(draw_tx);
     let mut events = RatatuiEventStream::new(draw_rx);
+    let (action_tx, mut action_rx) = mpsc::unbounded_channel();
     let mut app = ChatApp::new(options);
 
     for line in initial_lines {
@@ -776,8 +778,22 @@ pub async fn run_minimal_chat_loop(
             break;
         }
 
-        let Some(event) = events.next().await else {
-            break;
+        let event = tokio::select! {
+            action = action_rx.recv() => {
+                if let Some(action) = action {
+                    app.apply_action(action);
+                    frame_requester.schedule_frame();
+                    terminal.draw(|frame| render(frame, &mut app))?;
+                    continue;
+                }
+                break;
+            }
+            event = events.next() => {
+                let Some(event) = event else {
+                    break;
+                };
+                event
+            }
         };
 
         let outcome = app.handle_event(event);
@@ -785,7 +801,7 @@ pub async fn run_minimal_chat_loop(
             app.busy = true;
             frame_requester.schedule_frame();
             terminal.draw(|frame| render(frame, &mut app))?;
-            match on_submit(input).await {
+            match on_submit(input, action_tx.clone()).await {
                 Ok(action) => app.apply_action(action),
                 Err(err) => app.push_line(ChatLine::status(format!("Error: {err}"))),
             }

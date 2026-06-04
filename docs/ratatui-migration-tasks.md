@@ -44,11 +44,18 @@
 - [x] Restore slash command prefix completion and Tab completion.
 - [x] Restore generic picker overlay skeleton.
 - [ ] Port streaming assistant updates to frame-request redraws.
+  - [x] Stream agent status/tool/retry/compaction events through frame-request redraws.
+  - [ ] Stream assistant text deltas into the active assistant message.
 - [ ] Render assistant text, thinking deltas, retry events, and compaction
       events incrementally instead of after the turn finishes.
+  - [x] Render retry and compaction events incrementally.
+  - [ ] Render assistant text and thinking deltas incrementally.
 - [ ] Port tool rendering and thinking visibility.
+  - [x] Render live tool progress state as status lines.
 - [ ] Restore collapsed tool previews, full tool output expansion, tool
       progress state, per-tool error styling, and Shift+Tab thinking visibility.
+  - [x] Live tool progress state.
+  - [ ] Collapsed previews, expansion, error styling, and Shift+Tab thinking visibility.
 - [ ] Restore startup OAuth hint and startup changelog rendering.
 
 ## 4. Markdown Rendering

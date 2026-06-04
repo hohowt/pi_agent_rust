@@ -7,7 +7,7 @@ mod frame;
 mod terminal;
 
 pub use chat::{
-    ChatAction, ChatLine, ChatOptions, ChatPicker, PickerItem, SlashCommandItem,
+    ChatAction, ChatActionSender, ChatLine, ChatOptions, ChatPicker, PickerItem, SlashCommandItem,
     run_minimal_chat_loop,
 };
 pub use console::{PiConsole, SpinnerStyle};
