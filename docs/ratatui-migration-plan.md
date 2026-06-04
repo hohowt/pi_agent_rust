@@ -51,6 +51,47 @@ The first milestone is a standalone `pi-tui` crate that can initialize terminal
 modes, process input events, coalesce draw requests, and render a minimal chat
 frame. The second milestone ports the full interactive chat surface.
 
+## Current Regression Gaps
+
+The ratatui port has the dependency and skeleton work in place, but the current
+interactive surface is still behind the pre-migration TUI in these areas:
+
+1. Conversation viewport: no full scrollback model, mouse-wheel routing,
+   PgUp/PgDown/Home/End behavior, scroll anchoring, or preserved scroll position
+   while output streams.
+2. Editor: no full multi-line textarea, cursor movement, editing history,
+   newline insertion, selection-aware paste handling, file drag/drop parsing, or
+   file/image reference expansion.
+3. Streaming: assistant deltas, tool progress, auto-retry, and compaction events
+   are not rendered live with incremental redraws.
+4. Tool display: tool calls/results are not rendered with the old collapsed
+   preview, progress state, detailed output formatting, or thinking visibility
+   toggle behavior.
+5. Markdown: assistant output is plain text; headings, lists, code fences,
+   links, wrapping, CJK width, and syntax-like code presentation are not yet
+   equivalent to the old glamour path.
+6. Slash commands: command completion is partially restored, but command-specific
+   interactive flows are still missing or degraded for login/logout, settings,
+   theme apply, template insertion, export, copy, share, fork, compact status,
+   changelog, and resource reload.
+7. Pickers and overlays: the generic picker exists, but the old model selector,
+   session picker, settings UI, theme picker, branch selector, and tree UI have
+   not been fully ported with their previous filtering, details, deletion,
+   confirmation, persistence, and navigation behavior.
+8. Session switching: `/history` and double-Esc can show a picker, but selecting
+   a session does not yet load and replace the active session state.
+9. Settings persistence: language/theme/settings changes are not all persisted
+   through the same project/global settings paths as before.
+10. Status line: the footer is back, but token usage, VCS information, queue
+    state, spinner/progress hints, thinking/model status, and contextual key
+    hints are not yet at parity.
+11. Mouse and terminal behavior: native selection/copy, tmux wheel forwarding,
+    alternate-scroll behavior, IME placement, resize handling, and bracketed
+    paste need regression coverage against the ratatui implementation.
+12. Startup and secondary UI flows: OAuth hint, changelog, session recovery,
+    standalone session picker, and non-interactive config UI parity are still
+    incomplete.
+
 ## Completion Criteria
 
 - Interactive chat runs on ratatui without `bubbletea` or `bubbles`.
