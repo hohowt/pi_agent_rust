@@ -105,7 +105,7 @@ impl TreeSelectorState {
             scroll: 0,
             max_visible_lines,
             label,
-            user_only: false,
+            user_only: true,
             show_all: false,
             current_leaf_id,
             last_selected_id: None,
@@ -870,8 +870,12 @@ fn view_tree_selector(state: &TreeSelectorState, styles: &TuiStyles) -> String {
     let _ = writeln!(out, "  {}", styles.title.render(title));
 
     let filters = format!(
-        "  Filters: user-only={}  show-all={}",
-        if state.user_only { "on" } else { "off" },
+        "  View: {}  show-all={}",
+        if state.user_only {
+            "user messages"
+        } else {
+            "all messages"
+        },
         if state.show_all { "on" } else { "off" }
     );
     let _ = writeln!(out, "{}", styles.muted.render(&filters));
@@ -899,7 +903,7 @@ fn view_tree_selector(state: &TreeSelectorState, styles: &TuiStyles) -> String {
         out,
         "  {}",
         styles.muted.render(
-            "↑/↓: navigate  Enter: select  Esc: cancel  Ctrl+U: user-only  Ctrl+O: show-all"
+            "↑/↓: navigate  Enter: select  Esc: cancel  Ctrl+U: users/all  Ctrl+O: show-all"
         )
     );
     out
