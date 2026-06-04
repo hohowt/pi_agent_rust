@@ -20,10 +20,11 @@ use bubbles::spinner::{SpinnerModel, TickMsg as SpinnerTickMsg, spinners};
 use bubbles::textarea::TextArea;
 use bubbles::viewport::Viewport;
 use bubbletea::{
-    Cmd, KeyMsg, KeyType, Message, Model as BubbleteaModel, MouseButton, MouseMsg, Program,
-    WindowSizeMsg, batch, quit, sequence,
+    BlurMsg, Cmd, FocusMsg, InterruptMsg, KeyMsg, KeyType, Message, Model as BubbleteaModel,
+    MouseButton, MouseMsg, Program, WindowSizeMsg, batch, quit, sequence,
 };
 use chrono::Utc;
+use crossterm::event::{self, Event, KeyEventKind};
 use crossterm::{cursor, terminal};
 use futures::future::BoxFuture;
 use glamour::StyleConfig as GlamourStyleConfig;
@@ -35,6 +36,9 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 
 use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
@@ -1447,6 +1451,74 @@ const fn bool_label(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> anyhow::Result<Self> {
+        terminal::enable_raw_mode()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn spawn_terminal_input_forwarder(
+    tx: std::sync::mpsc::Sender<Message>,
+    shutdown: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        const POLL_INTERVAL: Duration = Duration::from_millis(16);
+        while !shutdown.load(Ordering::Relaxed) {
+            let Ok(ready) = event::poll(POLL_INTERVAL) else {
+                break;
+            };
+            if !ready {
+                continue;
+            }
+
+            let Ok(evt) = event::read() else {
+                break;
+            };
+            let Some(msg) = terminal_event_to_message_without_mouse(evt) else {
+                continue;
+            };
+            if tx.send(msg).is_err() {
+                break;
+            }
+        }
+    })
+}
+
+fn terminal_event_to_message_without_mouse(evt: Event) -> Option<Message> {
+    match evt {
+        Event::Key(key_event) => {
+            if key_event.kind != KeyEventKind::Press {
+                return None;
+            }
+            let key_msg = bubbletea::key::from_crossterm_key(key_event.code, key_event.modifiers);
+            if key_msg.key_type == KeyType::CtrlC {
+                Some(Message::new(InterruptMsg))
+            } else {
+                Some(Message::new(key_msg))
+            }
+        }
+        Event::Mouse(_) => None,
+        Event::Resize(width, height) => Some(Message::new(WindowSizeMsg { width, height })),
+        Event::FocusGained => Some(Message::new(FocusMsg)),
+        Event::FocusLost => Some(Message::new(BlurMsg)),
+        Event::Paste(text) => Some(Message::new(KeyMsg {
+            key_type: KeyType::Runes,
+            runes: text.chars().collect(),
+            alt: false,
+            paste: true,
+        })),
+    }
+}
+
 /// Run the interactive mode.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_interactive(
@@ -1486,14 +1558,16 @@ pub async fn run_interactive(
     let (event_tx, mut event_rx) = mpsc::channel::<PiMsg>(1024);
     let shutdown_event_tx = event_tx.clone();
     let (ui_tx, ui_rx) = std::sync::mpsc::channel::<Message>();
+    let input_shutdown = Arc::new(AtomicBool::new(false));
 
     let ui_bridge_cx = Cx::current().unwrap_or_else(Cx::for_request);
+    let ui_bridge_tx = ui_tx.clone();
     runtime_handle.spawn(async move {
         while let Ok(msg) = event_rx.recv(&ui_bridge_cx).await {
             if matches!(msg, PiMsg::UiShutdown) {
                 break;
             }
-            let _ = ui_tx.send(Message::new(msg));
+            let _ = ui_bridge_tx.send(Message::new(msg));
         }
     });
 
@@ -1510,6 +1584,18 @@ pub async fn run_interactive(
     // keep native click-drag selection for copying model output. When disabled,
     // users scroll with Page Up/Down or arrow keys instead.
     {
+        let raw_mode_guard;
+        let input_forwarder = if disable_mouse_capture {
+            raw_mode_guard = Some(RawModeGuard::enable()?);
+            Some(spawn_terminal_input_forwarder(
+                ui_tx,
+                Arc::clone(&input_shutdown),
+            ))
+        } else {
+            raw_mode_guard = None;
+            None
+        };
+
         let app = Box::new(PiApp::new(
             agent,
             session,
@@ -1532,10 +1618,19 @@ pub async fn run_interactive(
         let mut program = Program::new(app)
             .with_alt_screen()
             .with_input_receiver(ui_rx);
-        if !disable_mouse_capture {
+        if disable_mouse_capture {
+            program = program.with_custom_io();
+        } else {
             program = program.with_mouse_all_motion();
         }
-        program.run()?;
+        let run_result = program.run();
+
+        input_shutdown.store(true, Ordering::Relaxed);
+        if let Some(handle) = input_forwarder {
+            let _ = handle.join();
+        }
+        drop(raw_mode_guard);
+        run_result?;
     }
 
     // Tell the async bridge to exit promptly even if some background task still
@@ -2110,6 +2205,10 @@ pub struct PiApp {
     // Startup changelog notice shown for first launch after an upgrade.
     startup_changelog: Option<StartupChangelog>,
 
+    // Whether the TUI owns mouse events. Disabled by default so terminal-native
+    // selection and wheel handling remain outside the app.
+    mouse_capture_enabled: bool,
+
     // RAII guard for tmux wheel scroll override (dropped on exit/panic).
     #[allow(dead_code)]
     tmux_wheel_guard: Option<TmuxWheelGuard>,
@@ -2380,6 +2479,7 @@ impl PiApp {
             vcs_info,
             startup_welcome,
             startup_changelog,
+            mouse_capture_enabled: !disable_mouse_capture,
             tmux_wheel_guard: if disable_mouse_capture {
                 None
             } else {
@@ -2483,6 +2583,9 @@ impl PiApp {
         // Handle mouse wheel events: route to overlays when open, otherwise
         // scroll the conversation viewport.
         if let Some(mouse) = msg.downcast_ref::<MouseMsg>() {
+            if !self.mouse_capture_enabled {
+                return None;
+            }
             if mouse.is_wheel()
                 && (mouse.button == MouseButton::WheelUp || mouse.button == MouseButton::WheelDown)
             {
