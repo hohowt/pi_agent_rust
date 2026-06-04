@@ -652,6 +652,39 @@ impl PiApp {
         let _ = self.input.cursor.set_mode(mode);
     }
 
+    fn consume_split_ss3_cursor_sequence(&mut self, key: &KeyMsg) -> bool {
+        const SS3_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+
+        if key.key_type == KeyType::Esc {
+            self.pending_ss3_escape = Some(std::time::Instant::now());
+            return false;
+        }
+
+        let Some(started_at) = self.pending_ss3_escape else {
+            return false;
+        };
+        if started_at.elapsed() > SS3_TIMEOUT {
+            self.pending_ss3_escape = None;
+            return false;
+        }
+
+        if matches!(key.key_type, KeyType::Runes) && key.runes == ['O'] {
+            self.last_escape_time = None;
+            return true;
+        }
+
+        if matches!(key.key_type, KeyType::Runes)
+            && matches!(key.runes.as_slice(), ['A' | 'B' | 'C' | 'D'])
+        {
+            self.pending_ss3_escape = None;
+            self.last_escape_time = None;
+            return true;
+        }
+
+        self.pending_ss3_escape = None;
+        false
+    }
+
     fn apply_hardware_cursor(show: bool) {
         let mut stdout = std::io::stdout();
         if show {
@@ -2043,6 +2076,9 @@ pub struct PiApp {
     last_ctrlc_time: Option<std::time::Instant>,
     // Track last Escape time for double-tap tree/fork
     last_escape_time: Option<std::time::Instant>,
+    // Tracks split SS3 cursor escape sequences such as Esc O A/B that some
+    // terminals emit while scrolling. These must not leak into the editor.
+    pending_ss3_escape: Option<std::time::Instant>,
 
     // Autocomplete state
     autocomplete: AutocompleteState,
@@ -2333,6 +2369,7 @@ impl PiApp {
             keybindings,
             last_ctrlc_time: None,
             last_escape_time: None,
+            pending_ss3_escape: None,
             autocomplete,
             session_picker: None,
             settings_ui: None,
@@ -2462,6 +2499,10 @@ impl PiApp {
 
         // Handle keyboard input via keybindings layer
         if let Some(key) = msg.downcast_ref::<KeyMsg>() {
+            if self.consume_split_ss3_cursor_sequence(key) {
+                return None;
+            }
+
             // Clear status message on any key press
             self.status_message = None;
             if key.key_type != KeyType::Esc {
