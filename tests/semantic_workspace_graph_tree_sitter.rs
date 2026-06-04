@@ -1,6 +1,7 @@
 use pi::semantic_workspace_graph::{
     SemanticEdgeType, SemanticNodeType, SemanticWorkspaceGraphBuilder,
 };
+use pi::session::Session;
 use serde_json::Value;
 
 #[test]
@@ -122,6 +123,39 @@ fn tree_sitter_go_symbols_and_calls_are_indexed() {
     );
     assert_go_call_edge(&graph, "helper");
     assert_go_call_edge(&graph, "Render");
+}
+
+#[test]
+fn sibling_branch_picker_uses_latest_leaf_per_branch() {
+    let mut session = Session::in_memory();
+
+    let id_a = session.append_model_message(user_msg("A"));
+    let id_b = session.append_model_message(user_msg("B"));
+    let id_c_old_leaf = session.append_model_message(user_msg("C old"));
+
+    session.create_branch_from(&id_a);
+    let id_d = session.append_model_message(user_msg("D"));
+
+    session.create_branch_from(&id_b);
+    let id_e_latest_leaf = session.append_model_message(user_msg("E latest"));
+
+    session.navigate_to(&id_d);
+
+    let (_fork_point, branches) = session.sibling_branches().expect("sibling branches");
+    let main_branch = branches
+        .iter()
+        .find(|branch| branch.root_id == id_b)
+        .expect("main branch");
+
+    assert_eq!(main_branch.leaf_id, id_e_latest_leaf);
+    assert_ne!(main_branch.leaf_id, id_c_old_leaf);
+}
+
+fn user_msg(text: &str) -> pi::model::Message {
+    pi::model::Message::User(pi::model::UserMessage {
+        content: pi::model::UserContent::Text(text.to_string()),
+        timestamp: 0,
+    })
 }
 
 fn assert_call_edge(graph: &pi::semantic_workspace_graph::SemanticWorkspaceGraph, callee: &str) {

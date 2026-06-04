@@ -28,17 +28,19 @@ pub struct Config {
     pub show_hardware_cursor: Option<bool>,
     /// Disable terminal mouse capture in the interactive TUI.
     ///
-    /// When `true`, the TUI does not call `with_mouse_all_motion`, so the
+    /// Default `true` keeps terminal-native click-to-select / right-click-paste
+    /// / Shift-Insert working. When `true`, the TUI does not call
+    /// `with_mouse_all_motion`, so the
     /// terminal's native click-to-select / right-click-paste / Shift-Insert
     /// behaviour keeps working — at the cost of in-app mouse-wheel scrolling.
-    /// Default `false` preserves the existing behaviour.
+    /// Set `false` to opt into mouse capture and in-app mouse-wheel scrolling.
     ///
     /// Motivated by Windows users (CMD.exe + Windows Terminal) where mouse
     /// capture blocks copy/paste — particularly the OAuth flow's ~600-char
     /// authorization URL, which becomes effectively impossible to copy out
     /// when the TUI captures every mouse event. See pi_agent_rust#78.
     ///
-    /// Env override: `PI_NO_MOUSE_CAPTURE=1`.
+    /// Env override: `PI_NO_MOUSE_CAPTURE=0` opts back into capture.
     #[serde(alias = "disableMouseCapture", alias = "noMouseCapture")]
     pub disable_mouse_capture: Option<bool>,
 

@@ -3248,7 +3248,7 @@ impl Session {
                 let current_branch_ids: HashSet<&str> =
                     path[idx..].iter().map(String::as_str).collect();
                 for sibling_root in siblings_at_parent {
-                    let leaf = Self::deepest_leaf_from(&children_map, sibling_root);
+                    let leaf = self.latest_leaf_from(&children_map, sibling_root);
                     let (preview, msg_count) = self.path_preview_and_message_count(&leaf);
                     let is_current = current_branch_ids.contains(sibling_root.as_str());
                     branches.push(SiblingBranch {
@@ -3266,24 +3266,36 @@ impl Session {
         None
     }
 
-    /// Follow the first child chain to reach the deepest leaf from a starting entry.
-    fn deepest_leaf_from(
+    /// Return the most recently appended leaf reachable from a branch root.
+    fn latest_leaf_from(
+        &self,
         children_map: &HashMap<Option<String>, Vec<String>>,
         start_id: &str,
     ) -> String {
-        let mut current = start_id.to_string();
+        let mut stack = vec![start_id.to_string()];
         let mut visited = HashSet::new();
-        loop {
+        let mut latest = start_id.to_string();
+        let mut latest_index = self.entry_index.get(start_id).copied().unwrap_or(0);
+
+        while let Some(current) = stack.pop() {
             if !visited.insert(current.clone()) {
                 tracing::warn!("Cycle detected in session tree at entry: {current}");
-                return current;
+                continue;
             }
-            let children = children_map.get(&Some(current.clone()));
-            match children.and_then(|c| c.first()) {
-                Some(child) => current.clone_from(child),
-                None => return current,
+            let Some(children) = children_map.get(&Some(current.clone())) else {
+                let index = self.entry_index.get(&current).copied().unwrap_or(0);
+                if index >= latest_index {
+                    latest_index = index;
+                    latest = current;
+                }
+                continue;
+            };
+            for child in children {
+                stack.push(child.clone());
             }
         }
+
+        latest
     }
 
     /// Compute a short preview (first user message on the path) and the number
@@ -8236,6 +8248,31 @@ mod tests {
         // One should be current, one not
         let current_count = branches.iter().filter(|b| b.is_current).count();
         assert_eq!(current_count, 1);
+    }
+
+    #[test]
+    fn test_sibling_branches_uses_latest_leaf_per_branch() {
+        let mut session = Session::in_memory();
+
+        let id_a = session.append_message(make_test_message("A"));
+        let id_b = session.append_message(make_test_message("B"));
+        let id_c_old_leaf = session.append_message(make_test_message("C old"));
+
+        session.create_branch_from(&id_a);
+        let id_d = session.append_message(make_test_message("D"));
+
+        session.create_branch_from(&id_b);
+        let id_e_latest_leaf = session.append_message(make_test_message("E latest"));
+
+        session.navigate_to(&id_d);
+
+        let (_fork_point, branches) = session.sibling_branches().expect("sibling branches");
+        let main_branch = branches
+            .iter()
+            .find(|branch| branch.root_id == id_b)
+            .expect("main branch");
+        assert_eq!(main_branch.leaf_id, id_e_latest_leaf);
+        assert_ne!(main_branch.leaf_id, id_c_old_leaf);
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use crossterm::cursor;
 use unicode_width::UnicodeWidthChar;
 
 /// Ensure the view output fits within `term_height` terminal rows.
@@ -503,6 +504,8 @@ impl PiApp {
             output.push_str(&self.render_model_selector(selector));
         }
 
+        let input_start_row = output.lines().count();
+
         // Input area (only when idle and no overlay open)
         if self.editor_input_is_available() {
             output.push_str(&self.render_input());
@@ -532,8 +535,37 @@ impl PiApp {
 
         // Clamp the output to `term_height` rows so the terminal never
         // scrolls in the alternate-screen buffer.
-        let output = clamp_to_terminal_height(output, self.term_height);
+        let mut output = clamp_to_terminal_height(output, self.term_height);
+        if self.editor_input_is_available() && self.effective_show_hardware_cursor() {
+            self.append_input_cursor_position(&mut output, input_start_row);
+        }
         normalize_raw_terminal_newlines(output)
+    }
+
+    fn append_input_cursor_position(&self, output: &mut String, input_start_row: usize) {
+        use std::fmt::Write as _;
+
+        let (cursor_line, cursor_col) = self.input.cursor_pos();
+        let row = input_start_row
+            // render_input starts with a blank line, then the mode line, then
+            // one row per textarea line.
+            .saturating_add(2)
+            .saturating_add(cursor_line)
+            .min(self.term_height.saturating_sub(1));
+        let col = 2usize
+            .saturating_add(self.editor_padding_x)
+            .saturating_add(2)
+            .saturating_add(self.input.prompt.chars().count())
+            .saturating_add(cursor_col)
+            .min(self.term_width.saturating_sub(1));
+        let _ = write!(
+            output,
+            "{}",
+            cursor::MoveTo(
+                u16::try_from(col).unwrap_or(u16::MAX),
+                u16::try_from(row).unwrap_or(u16::MAX),
+            )
+        );
     }
 
     fn render_header_into(&self, output: &mut String) {
@@ -1531,6 +1563,22 @@ mod tests {
         // term_height=3 => max 2 newlines. Input has exactly 2 => fits.
         let input = "a\nb\nc".to_string();
         assert_eq!(clamp_to_terminal_height(input.clone(), 3), input);
+    }
+
+    #[test]
+    fn input_cursor_position_appends_terminal_move_escape() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut app = crate::interactive::tests::build_test_app(temp.path().to_path_buf());
+        app.config.show_hardware_cursor = Some(true);
+        app.set_terminal_size(80, 24);
+        app.input.set_value("hello");
+
+        let view = app.view();
+
+        assert!(
+            view.contains("\x1b["),
+            "hardware cursor mode should append a terminal cursor-position escape"
+        );
     }
 
     #[test]

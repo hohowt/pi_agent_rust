@@ -636,7 +636,7 @@ impl PiApp {
         self.config.show_hardware_cursor.unwrap_or_else(|| {
             std::env::var("PI_HARDWARE_CURSOR")
                 .ok()
-                .is_some_and(|val| val == "1")
+                .is_none_or(|val| val != "0")
         })
     }
 
@@ -1420,18 +1420,15 @@ pub async fn run_interactive(
     let show_hardware_cursor = config.show_hardware_cursor.unwrap_or_else(|| {
         std::env::var("PI_HARDWARE_CURSOR")
             .ok()
-            .is_some_and(|val| val == "1")
+            .is_none_or(|val| val != "0")
     });
-    // Mouse capture defaults ON (preserves existing in-app wheel-scroll
-    // behaviour). Users on Windows/CMD/Windows Terminal can opt out via
-    // `--no-mouse-capture`, `disable_mouse_capture: true` in settings, or
-    // `PI_NO_MOUSE_CAPTURE=1` env var to restore terminal-native click-to-
-    // select / right-click-paste / Shift-Insert. See pi_agent_rust#78 for
-    // the OAuth-flow copy-out problem this solves.
+    // Mouse capture defaults OFF so terminal-native selection/copy continues
+    // to work. Users can opt back in with `disable_mouse_capture: false` for
+    // in-app mouse-wheel scrolling.
     let disable_mouse_capture = config.disable_mouse_capture.unwrap_or_else(|| {
         std::env::var("PI_NO_MOUSE_CAPTURE")
             .ok()
-            .is_some_and(|val| val == "1")
+            .is_none_or(|val| val != "0")
     });
     let mut stdout = std::io::stdout();
     if show_hardware_cursor {
@@ -1463,11 +1460,8 @@ pub async fn run_interactive(
         conversation_from_session(&guard)
     };
 
-    // Build the bubbletea program. Mouse capture is conditional: ON by
-    // default (so in-app mouse-wheel scrolling routes to the TUI), but
-    // disabled when the user opts out via --no-mouse-capture / settings /
-    // PI_NO_MOUSE_CAPTURE so terminal-native copy/paste keeps working
-    // (Windows-specific UX win — see pi_agent_rust#78). When disabled,
+    // Build the bubbletea program. Mouse capture is opt-in so the terminal can
+    // keep native click-drag selection for copying model output. When disabled,
     // users scroll with Page Up/Down or arrow keys instead.
     {
         let app = Box::new(PiApp::new(

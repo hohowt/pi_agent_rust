@@ -77,8 +77,11 @@ fn test_model_entry() -> ModelEntry {
     }
 }
 
-fn build_test_app(cwd: PathBuf) -> PiApp {
-    let config = Config::default();
+pub(super) fn build_test_app(cwd: PathBuf) -> PiApp {
+    let config = Config {
+        show_hardware_cursor: Some(false),
+        ..Config::default()
+    };
     let provider: Arc<dyn Provider> = Arc::new(DummyProvider);
     let agent = Agent::new(
         provider,
