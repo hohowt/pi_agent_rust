@@ -504,8 +504,17 @@ impl PiApp {
             return None;
         }
 
-        // No overlay open: scroll the conversation viewport.
-        // Sync content before scrolling (same pattern as PageUp/PageDown).
+        let delta =
+            isize::try_from(self.conversation_viewport.mouse_wheel_delta.max(1)).unwrap_or(1);
+        self.scroll_conversation_viewport_by(if is_up { -delta } else { delta });
+        None
+    }
+
+    pub(super) fn scroll_conversation_viewport_by(&mut self, lines: isize) {
+        if lines == 0 {
+            return;
+        }
+
         let saved_offset = self.conversation_viewport.y_offset();
         let content = self.build_conversation_content();
         let effective = self.view_effective_conversation_height().max(1);
@@ -513,18 +522,16 @@ impl PiApp {
         self.conversation_viewport.set_content(content.trim_end());
         self.conversation_viewport.set_y_offset(saved_offset);
 
-        let delta = self.conversation_viewport.mouse_wheel_delta.max(1);
-        if is_up {
-            self.conversation_viewport.scroll_up(delta);
+        if lines < 0 {
+            self.conversation_viewport.scroll_up(lines.unsigned_abs());
             self.follow_stream_tail = false;
         } else {
-            self.conversation_viewport.scroll_down(delta);
-            // Re-enable auto-follow if scrolled back to the bottom.
+            let lines = usize::try_from(lines).unwrap_or(usize::MAX);
+            self.conversation_viewport.scroll_down(lines);
             if self.is_at_bottom() {
                 self.follow_stream_tail = true;
             }
         }
-        None
     }
 
     fn apply_theme(&mut self, theme: Theme) {
@@ -1455,6 +1462,8 @@ const fn bool_label(value: bool) -> &'static str {
 }
 
 const TERMINAL_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const TERMINAL_SCROLL_FLUSH_INTERVAL: Duration = Duration::from_millis(33);
+const TERMINAL_SCROLL_MIN_KEY_REPEAT: usize = 2;
 
 struct RawModeGuard;
 
@@ -1471,23 +1480,21 @@ impl Drop for RawModeGuard {
     }
 }
 
-struct MouseWheelCaptureGuard;
+struct AlternateScrollGuard;
 
-impl MouseWheelCaptureGuard {
+impl AlternateScrollGuard {
     fn enable() -> anyhow::Result<Self> {
         let mut stdout = io::stdout();
-        // Enable normal mouse reporting plus SGR coordinates. Avoid 1002/1003
-        // motion modes so drag/move events do not flood the TUI.
-        stdout.write_all(b"\x1b[?1000h\x1b[?1006h")?;
+        stdout.write_all(b"\x1b[?1007h")?;
         stdout.flush()?;
         Ok(Self)
     }
 }
 
-impl Drop for MouseWheelCaptureGuard {
+impl Drop for AlternateScrollGuard {
     fn drop(&mut self) {
         let mut stdout = io::stdout();
-        let _ = stdout.write_all(b"\x1b[?1006l\x1b[?1000l");
+        let _ = stdout.write_all(b"\x1b[?1007l");
         let _ = stdout.flush();
     }
 }
@@ -1518,11 +1525,29 @@ fn spawn_terminal_input_forwarder(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let mut trace = InputTrace::from_env();
+        let mut pending_scroll: isize = 0;
+        let mut pending_arrow: Option<KeyType> = None;
+        let mut pending_arrow_count = 0usize;
+        let mut last_scroll_flush = std::time::Instant::now();
         while !shutdown.load(Ordering::Relaxed) {
+            if pending_scroll != 0 && last_scroll_flush.elapsed() >= TERMINAL_SCROLL_FLUSH_INTERVAL
+            {
+                if !send_viewport_scroll(&tx, &mut trace, &mut pending_scroll) {
+                    break;
+                }
+                last_scroll_flush = std::time::Instant::now();
+            }
+
             let Ok(ready) = event::poll(TERMINAL_INPUT_POLL_INTERVAL) else {
                 break;
             };
             if !ready {
+                flush_pending_arrow_key(
+                    &tx,
+                    &mut trace,
+                    &mut pending_arrow,
+                    &mut pending_arrow_count,
+                );
                 continue;
             }
 
@@ -1538,6 +1563,26 @@ fn spawn_terminal_input_forwarder(
                 }
                 continue;
             };
+            if let Some(scroll_delta) = scroll_delta_from_input_message(&msg) {
+                pending_scroll += scroll_delta;
+                continue;
+            }
+            if capture_alternate_scroll_arrow(
+                &msg,
+                &tx,
+                &mut trace,
+                &mut pending_scroll,
+                &mut pending_arrow,
+                &mut pending_arrow_count,
+            ) {
+                continue;
+            }
+            flush_pending_arrow_key(
+                &tx,
+                &mut trace,
+                &mut pending_arrow,
+                &mut pending_arrow_count,
+            );
             if let Some(trace) = trace.as_mut() {
                 trace.log(describe_input_message(&msg));
             }
@@ -1546,6 +1591,91 @@ fn spawn_terminal_input_forwarder(
             }
         }
     })
+}
+
+fn send_viewport_scroll(
+    tx: &std::sync::mpsc::Sender<Message>,
+    trace: &mut Option<InputTrace>,
+    pending_scroll: &mut isize,
+) -> bool {
+    let lines = *pending_scroll;
+    *pending_scroll = 0;
+    if lines == 0 {
+        return true;
+    }
+    let msg = Message::new(PiMsg::ViewportScroll { lines });
+    if let Some(trace) = trace.as_mut() {
+        trace.log(format!("message: viewport scroll lines={lines}"));
+    }
+    tx.send(msg).is_ok()
+}
+
+fn scroll_delta_from_input_message(msg: &Message) -> Option<isize> {
+    let mouse = msg.downcast_ref::<MouseMsg>()?;
+    if !mouse.is_wheel() {
+        return None;
+    }
+    match mouse.button {
+        MouseButton::WheelUp => Some(-3),
+        MouseButton::WheelDown => Some(3),
+        _ => None,
+    }
+}
+
+fn capture_alternate_scroll_arrow(
+    msg: &Message,
+    tx: &std::sync::mpsc::Sender<Message>,
+    trace: &mut Option<InputTrace>,
+    pending_scroll: &mut isize,
+    pending_arrow: &mut Option<KeyType>,
+    pending_arrow_count: &mut usize,
+) -> bool {
+    let Some(key) = msg.downcast_ref::<KeyMsg>() else {
+        return false;
+    };
+    if key.alt || key.paste {
+        return false;
+    }
+    let direction = match key.key_type {
+        KeyType::Up => KeyType::Up,
+        KeyType::Down => KeyType::Down,
+        _ => return false,
+    };
+
+    if pending_arrow.is_some_and(|current| current != direction) {
+        flush_pending_arrow_key(tx, trace, pending_arrow, pending_arrow_count);
+    }
+
+    *pending_arrow = Some(direction);
+    *pending_arrow_count = pending_arrow_count.saturating_add(1);
+    if *pending_arrow_count >= TERMINAL_SCROLL_MIN_KEY_REPEAT {
+        let delta = match direction {
+            KeyType::Up => -3,
+            KeyType::Down => 3,
+            _ => 0,
+        };
+        *pending_scroll += delta;
+    }
+    true
+}
+
+fn flush_pending_arrow_key(
+    tx: &std::sync::mpsc::Sender<Message>,
+    trace: &mut Option<InputTrace>,
+    pending_arrow: &mut Option<KeyType>,
+    pending_arrow_count: &mut usize,
+) {
+    let Some(key_type) = pending_arrow.take() else {
+        return;
+    };
+    let count = std::mem::take(pending_arrow_count);
+    if count == 1 {
+        let msg = Message::new(KeyMsg::from_type(key_type));
+        if let Some(trace) = trace.as_mut() {
+            trace.log(describe_input_message(&msg));
+        }
+        let _ = tx.send(msg);
+    }
 }
 
 fn terminal_event_to_message_with_native_mouse(evt: Event) -> Option<Message> {
@@ -1678,17 +1808,17 @@ pub async fn run_interactive(
     // users scroll with Page Up/Down or arrow keys instead.
     {
         let raw_mode_guard;
-        let mouse_capture_guard;
+        let alternate_scroll_guard;
         let input_forwarder = if disable_mouse_capture {
             raw_mode_guard = Some(RawModeGuard::enable()?);
-            mouse_capture_guard = Some(MouseWheelCaptureGuard::enable()?);
+            alternate_scroll_guard = Some(AlternateScrollGuard::enable()?);
             Some(spawn_terminal_input_forwarder(
                 ui_tx,
                 Arc::clone(&input_shutdown),
             ))
         } else {
             raw_mode_guard = None;
-            mouse_capture_guard = None;
+            alternate_scroll_guard = None;
             None
         };
 
@@ -1725,7 +1855,7 @@ pub async fn run_interactive(
         if let Some(handle) = input_forwarder {
             let _ = handle.join();
         }
-        drop(mouse_capture_guard);
+        drop(alternate_scroll_guard);
         drop(raw_mode_guard);
         run_result?;
     }
@@ -1763,6 +1893,8 @@ pub enum PiMsg {
     UiShutdown,
     /// Periodic autocomplete refresh tick (background file index).
     AutocompleteRefresh,
+    /// Scroll the conversation viewport by a signed number of lines.
+    ViewportScroll { lines: isize },
     /// Text delta from assistant.
     TextDelta(String),
     /// Thinking delta from assistant.

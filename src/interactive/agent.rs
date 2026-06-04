@@ -291,6 +291,9 @@ impl PiApp {
                 self.autocomplete.provider.refresh_background();
                 return Self::autocomplete_refresh_cmd();
             }
+            PiMsg::ViewportScroll { lines } => {
+                self.scroll_conversation_viewport_by(lines);
+            }
             PiMsg::TextDelta(text) => {
                 self.current_response.push_str(&text);
                 // While tail-following, `view()` computes the bottom slice
