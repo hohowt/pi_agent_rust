@@ -38,7 +38,7 @@ use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
@@ -1451,6 +1451,8 @@ const fn bool_label(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
+const TERMINAL_INPUT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -1471,9 +1473,9 @@ fn spawn_terminal_input_forwarder(
     shutdown: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        const POLL_INTERVAL: Duration = Duration::from_millis(16);
+        let mut last_wheel_sent: Option<Instant> = None;
         while !shutdown.load(Ordering::Relaxed) {
-            let Ok(ready) = event::poll(POLL_INTERVAL) else {
+            let Ok(ready) = event::poll(TERMINAL_INPUT_POLL_INTERVAL) else {
                 break;
             };
             if !ready {
@@ -1483,7 +1485,8 @@ fn spawn_terminal_input_forwarder(
             let Ok(evt) = event::read() else {
                 break;
             };
-            let Some(msg) = terminal_event_to_message_without_mouse(evt) else {
+            let Some(msg) = terminal_event_to_message_with_native_mouse(evt, &mut last_wheel_sent)
+            else {
                 continue;
             };
             if tx.send(msg).is_err() {
@@ -1493,7 +1496,10 @@ fn spawn_terminal_input_forwarder(
     })
 }
 
-fn terminal_event_to_message_without_mouse(evt: Event) -> Option<Message> {
+fn terminal_event_to_message_with_native_mouse(
+    evt: Event,
+    last_wheel_sent: &mut Option<Instant>,
+) -> Option<Message> {
     match evt {
         Event::Key(key_event) => {
             if key_event.kind != KeyEventKind::Press {
@@ -1506,7 +1512,24 @@ fn terminal_event_to_message_without_mouse(evt: Event) -> Option<Message> {
                 Some(Message::new(key_msg))
             }
         }
-        Event::Mouse(_) => None,
+        Event::Mouse(mouse_event) => {
+            let mouse_msg = bubbletea::mouse::from_crossterm_mouse(mouse_event);
+            if !mouse_msg.is_wheel()
+                || (mouse_msg.button != MouseButton::WheelUp
+                    && mouse_msg.button != MouseButton::WheelDown)
+            {
+                return None;
+            }
+
+            let now = Instant::now();
+            if last_wheel_sent
+                .is_some_and(|last| now.duration_since(last) < TERMINAL_INPUT_POLL_INTERVAL)
+            {
+                return None;
+            }
+            *last_wheel_sent = Some(now);
+            Some(Message::new(mouse_msg))
+        }
         Event::Resize(width, height) => Some(Message::new(WindowSizeMsg { width, height })),
         Event::FocusGained => Some(Message::new(FocusMsg)),
         Event::FocusLost => Some(Message::new(BlurMsg)),
@@ -2583,14 +2606,14 @@ impl PiApp {
         // Handle mouse wheel events: route to overlays when open, otherwise
         // scroll the conversation viewport.
         if let Some(mouse) = msg.downcast_ref::<MouseMsg>() {
-            if !self.mouse_capture_enabled {
-                return None;
-            }
             if mouse.is_wheel()
                 && (mouse.button == MouseButton::WheelUp || mouse.button == MouseButton::WheelDown)
             {
                 let is_up = mouse.button == MouseButton::WheelUp;
                 return self.handle_mouse_wheel(is_up);
+            }
+            if !self.mouse_capture_enabled {
+                return None;
             }
         }
 
