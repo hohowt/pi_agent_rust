@@ -695,35 +695,38 @@ fn build_tree_selector_rows(
         prefix: &mut Vec<bool>,
         out: &mut Vec<TreeSelectorRow>,
         current_leaf_id: Option<&str>,
+        is_root_level: bool,
     ) {
         for (idx, node) in nodes.iter().enumerate() {
             let is_last = idx + 1 == nodes.len();
+            let shows_connector = !is_root_level || nodes.len() > 1;
 
-            let mut line = String::new();
-            for has_more in prefix.iter().copied() {
-                if has_more {
-                    line.push_str("│  ");
-                } else {
-                    line.push_str("   ");
+            let mut display = String::new();
+            if shows_connector {
+                for has_more in prefix.iter().copied() {
+                    display.push_str(if has_more { "│   " } else { "    " });
                 }
+                display.push_str(if is_last { "└── " } else { "├── " });
             }
-            line.push_str(if is_last { "└─ " } else { "├─ " });
-            line.push_str(&node.text);
-
+            display.push_str(&node.text);
             if current_leaf_id.is_some_and(|leaf| leaf == node.id) {
-                line.push_str(" ← active");
+                display.push_str(" ← active");
             }
 
             out.push(TreeSelectorRow {
                 id: node.id.clone(),
                 parent_id: node.parent_id.clone(),
-                display: line,
+                display,
                 resubmit_text: node.resubmit_text.clone(),
             });
 
-            prefix.push(!is_last);
-            flatten_display_nodes(&node.children, prefix, out, current_leaf_id);
-            prefix.pop();
+            if shows_connector {
+                prefix.push(!is_last);
+            }
+            flatten_display_nodes(&node.children, prefix, out, current_leaf_id, false);
+            if shows_connector {
+                prefix.pop();
+            }
         }
     }
 
@@ -755,7 +758,6 @@ fn build_tree_selector_rows(
         }
     }
 
-    // Sort children by timestamp (oldest first).
     for children in children_by_parent.values_mut() {
         children.sort_by(|a, b| {
             let ta = timestamp_by_id
@@ -785,7 +787,13 @@ fn build_tree_selector_rows(
     }
 
     let mut rows = Vec::new();
-    flatten_display_nodes(&display_roots, &mut Vec::new(), &mut rows, current_leaf_id);
+    flatten_display_nodes(
+        &display_roots,
+        &mut Vec::new(),
+        &mut rows,
+        current_leaf_id,
+        true,
+    );
 
     (rows, parent_by_id)
 }
@@ -866,7 +874,7 @@ fn view_tree_selector(state: &TreeSelectorState, styles: &TuiStyles) -> String {
         .label
         .as_deref()
         .filter(|value| !value.trim().is_empty())
-        .unwrap_or("Session Tree");
+        .unwrap_or("Session List");
     let _ = writeln!(out, "  {}", styles.title.render(title));
 
     let filters = format!(
