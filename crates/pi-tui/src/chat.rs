@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use tokio::sync::broadcast;
 use tokio_stream::StreamExt;
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 use crate::event::{RatatuiEvent, RatatuiEventStream};
@@ -154,7 +155,7 @@ pub enum ChatAction {
 #[derive(Debug)]
 struct ChatApp {
     options: ChatOptions,
-    input: String,
+    editor: EditorState,
     lines: Vec<ChatLine>,
     busy: bool,
     should_quit: bool,
@@ -167,7 +168,7 @@ impl ChatApp {
     const fn new(options: ChatOptions) -> Self {
         Self {
             options,
-            input: String::new(),
+            editor: EditorState::new(),
             lines: Vec::new(),
             busy: false,
             should_quit: false,
@@ -178,11 +179,11 @@ impl ChatApp {
     }
 
     fn take_submitted_input(&mut self) -> Option<String> {
-        let input = self.input.trim().to_string();
+        let input = self.editor.text().trim().to_string();
         if input.is_empty() {
             return None;
         }
-        self.input.clear();
+        self.editor.clear();
         self.lines.push(ChatLine::user(input.clone()));
         self.scroll.mark_content_changed();
         Some(input)
@@ -215,7 +216,7 @@ impl ChatApp {
         match event {
             RatatuiEvent::Key(key) => self.handle_key(key),
             RatatuiEvent::Paste(text) => {
-                self.input.push_str(&text);
+                self.editor.insert_str(&text);
                 EventOutcome::None
             }
             RatatuiEvent::MouseScrollUp => {
@@ -250,23 +251,25 @@ impl ChatApp {
                     .is_some_and(|last| now.duration_since(last) <= Duration::from_millis(450));
                 self.last_escape = Some(now);
                 if double_escape {
-                    self.input = "/history".to_string();
-                    return EventOutcome::Submit(self.input.clone());
+                    self.editor.set_text("/history");
+                    return EventOutcome::Submit(self.editor.text().to_string());
                 }
             }
-            KeyCode::Tab if self.input.trim_start().starts_with('/') => {
+            KeyCode::Tab if self.editor.text().trim_start().starts_with('/') => {
                 if let Some(item) = self.filtered_slash_commands().first() {
-                    self.input = item.command.clone();
-                    self.input.push(' ');
+                    self.editor.set_text(format!("{} ", item.command));
                 }
             }
             KeyCode::Enter => {
-                if self.input.trim_start().starts_with('/') {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    self.editor.insert_char('\n');
+                    return EventOutcome::None;
+                }
+                if self.editor.text().trim_start().starts_with('/') {
                     if let Some(item) = self.filtered_slash_commands().first() {
-                        let current_command = slash_command_token(&self.input);
+                        let current_command = slash_command_token(self.editor.text());
                         if current_command != item.command {
-                            self.input = item.command.clone();
-                            self.input.push(' ');
+                            self.editor.set_text(format!("{} ", item.command));
                             return EventOutcome::None;
                         }
                     }
@@ -277,12 +280,50 @@ impl ChatApp {
             }
             KeyCode::Char(ch) => {
                 self.last_escape = None;
-                self.input.push(ch);
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    match ch {
+                        'a' => self.editor.move_to_line_start(),
+                        'e' => self.editor.move_to_line_end(),
+                        'u' => self.editor.delete_to_line_start(),
+                        'k' => self.editor.delete_to_line_end(),
+                        _ => {}
+                    }
+                } else if key.modifiers.contains(KeyModifiers::ALT) {
+                    match ch {
+                        'b' => self.editor.move_word_left(),
+                        'f' => self.editor.move_word_right(),
+                        'd' => self.editor.delete_word_forward(),
+                        _ => {}
+                    }
+                } else {
+                    self.editor.insert_char(ch);
+                }
             }
             KeyCode::Backspace => {
                 self.last_escape = None;
-                self.input.pop();
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.editor.delete_word_backward();
+                } else {
+                    self.editor.delete_backward();
+                }
             }
+            KeyCode::Delete => self.editor.delete_forward(),
+            KeyCode::Left => {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.editor.move_word_left();
+                } else {
+                    self.editor.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if key.modifiers.contains(KeyModifiers::ALT) {
+                    self.editor.move_word_right();
+                } else {
+                    self.editor.move_right();
+                }
+            }
+            KeyCode::Up => self.editor.move_up(),
+            KeyCode::Down => self.editor.move_down(),
             KeyCode::PageUp => self.scroll.scroll_up(10),
             KeyCode::PageDown => self.scroll.scroll_down(10),
             KeyCode::Home => self.scroll.scroll_to_top(),
@@ -325,7 +366,7 @@ impl ChatApp {
                 });
                 self.picker = None;
                 if let Some(command) = command {
-                    self.input.clone_from(&command);
+                    self.editor.set_text(command.clone());
                     return EventOutcome::Submit(command);
                 }
             }
@@ -335,7 +376,7 @@ impl ChatApp {
     }
 
     fn filtered_slash_commands(&self) -> Vec<&SlashCommandItem> {
-        let token = slash_command_token(&self.input).to_ascii_lowercase();
+        let token = slash_command_token(self.input()).to_ascii_lowercase();
         self.options
             .slash_commands
             .iter()
@@ -348,6 +389,214 @@ impl ChatApp {
     const fn should_quit(&self) -> bool {
         self.should_quit
     }
+
+    fn input(&self) -> &str {
+        self.editor.text()
+    }
+}
+
+#[derive(Debug, Default)]
+struct EditorState {
+    text: String,
+    cursor: usize,
+}
+
+impl EditorState {
+    const fn new() -> Self {
+        Self {
+            text: String::new(),
+            cursor: 0,
+        }
+    }
+
+    fn text(&self) -> &str {
+        &self.text
+    }
+
+    fn set_text(&mut self, text: impl Into<String>) {
+        self.text = text.into();
+        self.cursor = self.text.len();
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.cursor = 0;
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        self.text.insert(self.cursor, ch);
+        self.cursor += ch.len_utf8();
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        self.text.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+
+    fn delete_backward(&mut self) {
+        let Some(prev) = self.prev_boundary(self.cursor) else {
+            return;
+        };
+        self.text.drain(prev..self.cursor);
+        self.cursor = prev;
+    }
+
+    fn delete_forward(&mut self) {
+        let Some(next) = self.next_boundary(self.cursor) else {
+            return;
+        };
+        self.text.drain(self.cursor..next);
+    }
+
+    fn move_left(&mut self) {
+        if let Some(prev) = self.prev_boundary(self.cursor) {
+            self.cursor = prev;
+        }
+    }
+
+    fn move_right(&mut self) {
+        if let Some(next) = self.next_boundary(self.cursor) {
+            self.cursor = next;
+        }
+    }
+
+    fn move_up(&mut self) {
+        let (line_start, column) = self.line_start_and_column();
+        if line_start == 0 {
+            return;
+        }
+        let prev_end = line_start.saturating_sub(1);
+        let prev_start = self.line_start_before(prev_end);
+        self.cursor = self.cursor_for_column(prev_start, prev_end, column);
+    }
+
+    fn move_down(&mut self) {
+        let (_, column) = self.line_start_and_column();
+        let Some(next_start) = self.text[self.cursor..]
+            .find('\n')
+            .map(|idx| self.cursor + idx + 1)
+        else {
+            return;
+        };
+        let next_end = self.text[next_start..]
+            .find('\n')
+            .map_or(self.text.len(), |idx| next_start + idx);
+        self.cursor = self.cursor_for_column(next_start, next_end, column);
+    }
+
+    fn move_word_left(&mut self) {
+        self.cursor = word_left_boundary(&self.text, self.cursor);
+    }
+
+    fn move_word_right(&mut self) {
+        self.cursor = word_right_boundary(&self.text, self.cursor);
+    }
+
+    fn delete_word_backward(&mut self) {
+        let start = word_left_boundary(&self.text, self.cursor);
+        self.text.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    fn delete_word_forward(&mut self) {
+        let end = word_right_boundary(&self.text, self.cursor);
+        self.text.drain(self.cursor..end);
+    }
+
+    fn move_to_line_start(&mut self) {
+        self.cursor = self.line_start_and_column().0;
+    }
+
+    fn move_to_line_end(&mut self) {
+        self.cursor = self.line_end_from(self.cursor);
+    }
+
+    fn delete_to_line_start(&mut self) {
+        let start = self.line_start_and_column().0;
+        self.text.drain(start..self.cursor);
+        self.cursor = start;
+    }
+
+    fn delete_to_line_end(&mut self) {
+        let end = self.line_end_from(self.cursor);
+        self.text.drain(self.cursor..end);
+    }
+
+    fn cursor_position(&self) -> (usize, usize) {
+        let (line_start, column) = self.line_start_and_column();
+        let row = self.text[..line_start]
+            .bytes()
+            .filter(|byte| *byte == b'\n')
+            .count();
+        (row, column)
+    }
+
+    fn prev_boundary(&self, at: usize) -> Option<usize> {
+        if at == 0 {
+            return None;
+        }
+        self.text[..at]
+            .grapheme_indices(true)
+            .last()
+            .map(|(idx, _)| idx)
+    }
+
+    fn next_boundary(&self, at: usize) -> Option<usize> {
+        if at >= self.text.len() {
+            return None;
+        }
+        self.text[at..]
+            .grapheme_indices(true)
+            .nth(1)
+            .map_or(Some(self.text.len()), |(idx, _)| Some(at + idx))
+    }
+
+    fn line_start_and_column(&self) -> (usize, usize) {
+        let line_start = self.line_start_before(self.cursor);
+        let column = self.text[line_start..self.cursor].width();
+        (line_start, column)
+    }
+
+    fn line_start_before(&self, at: usize) -> usize {
+        self.text[..at].rfind('\n').map_or(0, |idx| idx + 1)
+    }
+
+    fn line_end_from(&self, at: usize) -> usize {
+        self.text[at..]
+            .find('\n')
+            .map_or(self.text.len(), |idx| at + idx)
+    }
+
+    fn cursor_for_column(&self, start: usize, end: usize, target_column: usize) -> usize {
+        let mut width = 0;
+        for (idx, grapheme) in self.text[start..end].grapheme_indices(true) {
+            let next_width = width + grapheme.width();
+            if next_width > target_column {
+                return start + idx;
+            }
+            width = next_width;
+        }
+        end
+    }
+}
+
+fn word_left_boundary(text: &str, cursor: usize) -> usize {
+    let mut boundary = 0;
+    for (idx, word) in text[..cursor].unicode_word_indices() {
+        if idx + word.len() < cursor {
+            boundary = idx;
+        } else {
+            return idx;
+        }
+    }
+    boundary
+}
+
+fn word_right_boundary(text: &str, cursor: usize) -> usize {
+    text[cursor..]
+        .unicode_word_indices()
+        .nth(1)
+        .map_or(text.len(), |(idx, _)| cursor + idx)
 }
 
 #[derive(Debug)]
@@ -526,9 +775,10 @@ pub async fn run_minimal_chat_loop(
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
     let area = frame.area();
+    let input_height = editor_height(&app.editor);
     let [body, input, footer] = Layout::vertical([
         Constraint::Min(3),
-        Constraint::Length(3),
+        Constraint::Length(input_height),
         Constraint::Length(1),
     ])
     .areas(area);
@@ -553,7 +803,7 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
     );
 
     frame.render_widget(
-        Paragraph::new(app.input.as_str()).block(
+        Paragraph::new(app.editor.text()).block(
             Block::default()
                 .borders(Borders::TOP)
                 .border_style(dim)
@@ -561,11 +811,17 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
         ),
         input,
     );
+    let (cursor_row, cursor_column) = app.editor.cursor_position();
     let input_cursor_x = input
         .x
-        .saturating_add(u16::try_from(app.input.as_str().width()).unwrap_or(u16::MAX))
+        .saturating_add(u16::try_from(cursor_column).unwrap_or(u16::MAX))
         .min(input.right().saturating_sub(1));
-    frame.set_cursor_position(Position::new(input_cursor_x, input.y.saturating_add(1)));
+    let input_cursor_y = input
+        .y
+        .saturating_add(1)
+        .saturating_add(u16::try_from(cursor_row).unwrap_or(u16::MAX))
+        .min(input.bottom().saturating_sub(1));
+    frame.set_cursor_position(Position::new(input_cursor_x, input_cursor_y));
 
     let status = if app.busy {
         "运行中"
@@ -576,9 +832,16 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
 
     if let Some(picker) = &app.picker {
         render_picker(frame, app, picker, body);
-    } else if app.input.trim_start().starts_with('/') {
+    } else if app.editor.text().trim_start().starts_with('/') {
         render_slash_completion(frame, app, input);
     }
+}
+
+fn editor_height(editor: &EditorState) -> u16 {
+    let rows = editor.text().bytes().filter(|byte| *byte == b'\n').count() + 1;
+    u16::try_from(rows.saturating_add(2))
+        .unwrap_or(8)
+        .clamp(3, 8)
 }
 
 fn conversation_lines(lines: &[ChatLine]) -> Vec<Line<'_>> {
@@ -604,7 +867,7 @@ fn conversation_lines(lines: &[ChatLine]) -> Vec<Line<'_>> {
 }
 
 fn footer_line(app: &ChatApp, status: &str) -> String {
-    if app.input.trim_start().starts_with('/') {
+    if app.editor.text().trim_start().starts_with('/') {
         let hints = if app.options.command_hints.is_empty() {
             vec![
                 "/help".to_string(),
@@ -749,7 +1012,8 @@ fn default_slash_commands() -> Vec<SlashCommandItem> {
 
 #[cfg(test)]
 mod tests {
-    use super::ConversationScroll;
+    use super::{ConversationScroll, EditorState};
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn conversation_scroll_pins_to_bottom_on_new_output() {
@@ -789,5 +1053,58 @@ mod tests {
         scroll.scroll_to_bottom();
         assert_eq!(scroll.resolve(40, 10), 30);
         assert!(scroll.pinned_to_bottom);
+    }
+
+    #[test]
+    fn editor_inserts_and_deletes_at_cursor() {
+        let mut editor = EditorState::new();
+        editor.insert_str("ac");
+        editor.move_left();
+        editor.insert_char('b');
+        assert_eq!(editor.text(), "abc");
+
+        editor.delete_backward();
+        assert_eq!(editor.text(), "ac");
+        editor.delete_forward();
+        assert_eq!(editor.text(), "a");
+    }
+
+    #[test]
+    fn editor_supports_multiline_vertical_cursor_movement() {
+        let mut editor = EditorState::new();
+        editor.insert_str("abcd\nef\nghij");
+        editor.move_to_line_start();
+        assert_eq!(editor.cursor_position(), (2, 0));
+
+        editor.move_up();
+        assert_eq!(editor.cursor_position(), (1, 0));
+        editor.move_down();
+        assert_eq!(editor.cursor_position(), (2, 0));
+    }
+
+    #[test]
+    fn editor_word_movement_and_deletion_use_word_boundaries() {
+        let mut editor = EditorState::new();
+        editor.insert_str("alpha beta gamma");
+
+        editor.move_word_left();
+        assert_eq!(editor.cursor_position(), (0, "alpha beta ".width()));
+        editor.delete_word_backward();
+        assert_eq!(editor.text(), "alpha gamma");
+
+        editor.move_to_line_start();
+        editor.delete_word_forward();
+        assert_eq!(editor.text(), "gamma");
+    }
+
+    #[test]
+    fn editor_tracks_newline_inserted_at_cursor() {
+        let mut editor = EditorState::new();
+        editor.insert_str("ab");
+        editor.move_left();
+        editor.insert_char('\n');
+
+        assert_eq!(editor.text(), "a\nb");
+        assert_eq!(editor.cursor_position(), (1, 0));
     }
 }

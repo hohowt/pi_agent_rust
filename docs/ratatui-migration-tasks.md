@@ -28,9 +28,13 @@
   - [x] PgUp/PgDown/Home/End keyboard scrollback.
   - [x] Bottom anchoring and preserved scroll position while output streams.
   - [ ] Mouse wheel routing with terminal mouse-mode/native selection policy.
-- [ ] Replace `bubbles::TextArea` with a local editor state.
+- [x] Replace `bubbles::TextArea` with a local editor state.
 - [ ] Restore multi-line editing, cursor left/right/up/down, word movement,
       delete, history navigation, and Shift+Enter newline insertion.
+  - [x] Multi-line editing and Shift+Enter newline insertion.
+  - [x] Cursor left/right/up/down movement.
+  - [x] Word movement and delete/backspace behavior.
+  - [ ] Editing history navigation.
 - [ ] Restore paste, bracketed paste, drag/drop file paths, quoted paths, and
       file/image reference expansion.
 - [ ] Port keyboard bindings to crossterm key events.
