@@ -1077,11 +1077,7 @@ impl Session {
     ) -> Result<Self> {
         let is_interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         let mut picker_input_override = picker_input_override;
-        if picker_input_override.is_none() && is_interactive {
-            if let Some(session) = crate::session_picker::pick_session(override_dir).await {
-                return Ok(session);
-            }
-        }
+        let _ = is_interactive;
 
         let base_dir = override_dir.map_or_else(Config::sessions_dir, PathBuf::from);
         let store_kind = SessionStoreKind::from_config(config);

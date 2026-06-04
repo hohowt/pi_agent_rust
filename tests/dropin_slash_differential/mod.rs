@@ -157,13 +157,15 @@ pub fn canonicalize_response(mut response: Value) -> Value {
     if let Some(number) = response.as_number() {
         const MAX_EXACT_F64_INTEGER: f64 = 9_007_199_254_740_991.0;
 
-        if let Some(float) = number.as_f64()
-            && float.is_finite()
-            && float.fract() == 0.0
-            && float.abs() <= MAX_EXACT_F64_INTEGER
-            && let Ok(integer) = format!("{float:.0}").parse::<i64>()
-        {
-            return json!(integer);
+        if let Some(float) = number.as_f64() {
+            if float.is_finite()
+                && float.fract() == 0.0
+                && float.abs() <= MAX_EXACT_F64_INTEGER
+            {
+                if let Ok(integer) = format!("{float:.0}").parse::<i64>() {
+                    return json!(integer);
+                }
+            }
         }
     }
 

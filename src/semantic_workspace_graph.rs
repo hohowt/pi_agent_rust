@@ -1115,19 +1115,19 @@ impl<'a> SemanticContextBundlePlanner<'a> {
         path_normalization: &[ContextPathNormalization],
     ) -> BTreeSet<String> {
         let mut ids = BTreeSet::new();
-        if let Some(bead_id) = request.bead_id.as_deref()
-            && let Some(bead_node) = self.graph.nodes.iter().find(|node| {
+        if let Some(bead_id) = request.bead_id.as_deref() {
+            if let Some(bead_node) = self.graph.nodes.iter().find(|node| {
                 node.node_type == SemanticNodeType::Bead
                     && node.metadata.get("bead_id").and_then(Value::as_str) == Some(bead_id)
-            })
-        {
-            ids.insert(bead_node.id.clone());
-            for edge in &self.graph.edges {
-                if edge.source == bead_node.id {
-                    ids.insert(edge.target.clone());
-                }
-                if edge.target == bead_node.id {
-                    ids.insert(edge.source.clone());
+            }) {
+                ids.insert(bead_node.id.clone());
+                for edge in &self.graph.edges {
+                    if edge.source == bead_node.id {
+                        ids.insert(edge.target.clone());
+                    }
+                    if edge.target == bead_node.id {
+                        ids.insert(edge.source.clone());
+                    }
                 }
             }
         }
@@ -1204,11 +1204,11 @@ impl<'a> SemanticContextBundlePlanner<'a> {
                     }
                 }
 
-                if let Some(failing_command) = failing_command.as_deref()
-                    && validation_command_matches(node, failing_command)
-                {
-                    score += 220;
-                    reasons.push("failing_command_match");
+                if let Some(failing_command) = failing_command.as_deref() {
+                    if validation_command_matches(node, failing_command) {
+                        score += 220;
+                        reasons.push("failing_command_match");
+                    }
                 }
 
                 if score > 0 {

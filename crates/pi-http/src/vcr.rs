@@ -246,6 +246,7 @@ impl VcrRecorder {
         self.mode
     }
 
+    #[allow(clippy::missing_const_for_fn)]
     pub fn cassette_path(&self) -> &Path {
         &self.cassette_path
     }

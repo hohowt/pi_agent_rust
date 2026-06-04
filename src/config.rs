@@ -934,10 +934,10 @@ fn settings_lock_path(path: &Path) -> PathBuf {
 
 fn open_settings_lock_file(path: &Path) -> Result<File> {
     let lock_path = settings_lock_path(path);
-    if let Some(parent) = lock_path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        std::fs::create_dir_all(parent)?;
+    if let Some(parent) = lock_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
     }
 
     let mut options = File::options();

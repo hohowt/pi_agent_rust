@@ -1887,12 +1887,11 @@ fn normalized_blocker_evidence(entry: &SwarmActivityLedgerEntry) -> String {
     }
     let mut parts = vec![entry.summary.as_str()];
     for key in BLOCKER_FINGERPRINT_DETAIL_KEYS {
-        if let Some(value) = entry.details().get(*key)
-            && !is_sensitive_field(key)
-            && value != REDACTED
-        {
-            parts.push(*key);
-            parts.push(value.as_str());
+        if let Some(value) = entry.details().get(*key) {
+            if !is_sensitive_field(key) && value != REDACTED {
+                parts.push(*key);
+                parts.push(value.as_str());
+            }
         }
     }
     let normalized = normalize_blocker_text(&parts.join(" "));

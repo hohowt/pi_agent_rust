@@ -1,26 +1,27 @@
 [package]
-name = "pi-theme"
+name = "pi-tui"
 version = "0.1.16"
 edition = "2024"
 rust-version = "1.86"
 license-file = "../../LICENSE"
 
 [lib]
-name = "pi_theme"
+name = "pi_tui"
 path = "src/lib.rs"
 test = false
 doctest = false
 
 [dependencies]
-dirs = { workspace = true }
-pi-core = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
-serde_json = { workspace = true }
-tracing = { workspace = true }
-
-[dev-dependencies]
-proptest = { workspace = true }
-tempfile = { workspace = true }
+anyhow = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
+ratatui = { workspace = true, features = [
+    "scrolling-regions",
+    "unstable-backend-writer",
+    "unstable-rendered-line-info",
+    "unstable-widget-ref",
+] }
+tokio = { workspace = true, features = ["sync", "time"] }
+tokio-stream = { workspace = true, features = ["sync"] }
 
 [lints.rust]
 unsafe_code = "forbid"

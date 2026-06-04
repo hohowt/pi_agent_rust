@@ -539,6 +539,7 @@ impl Response {
     }
 
     #[must_use]
+    #[allow(clippy::missing_const_for_fn)]
     pub fn headers(&self) -> &[(String, String)] {
         &self.headers
     }

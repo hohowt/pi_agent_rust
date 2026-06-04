@@ -3622,14 +3622,14 @@ fn abandon_bash_rpc_spill_file(
     *spill_failed = true;
     *temp_file = None;
     if let Some(path) = temp_file_path.take() {
-        if let Err(e) = std::fs::remove_file(&path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::debug!(
-                "Failed to remove incomplete RPC bash spill file {}: {}",
-                path.display(),
-                e
-            );
+        if let Err(e) = std::fs::remove_file(&path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::debug!(
+                    "Failed to remove incomplete RPC bash spill file {}: {}",
+                    path.display(),
+                    e
+                );
+            }
         }
     }
 }

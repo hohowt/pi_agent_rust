@@ -128,7 +128,6 @@ pub mod session_index;
 #[doc(hidden)]
 pub use pi_observability as session_metrics;
 #[doc(hidden)]
-pub mod session_picker;
 #[cfg(feature = "sqlite-sessions")]
 #[doc(hidden)]
 pub mod session_sqlite;
@@ -145,9 +144,9 @@ pub use pi_theme as theme;
 #[doc(hidden)]
 pub mod tools;
 #[doc(hidden)]
-pub mod tui;
-#[doc(hidden)]
 pub use pi_http::vcr;
+#[doc(hidden)]
+pub use pi_tui as tui;
 
 pub use error::{Error, Result as PiResult};
 #[doc(hidden)]

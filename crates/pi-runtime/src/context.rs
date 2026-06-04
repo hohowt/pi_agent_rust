@@ -103,7 +103,6 @@ impl Cx {
         None
     }
 
-    #[must_use]
     pub const fn checkpoint(&self) -> Result<(), std::convert::Infallible> {
         Ok(())
     }

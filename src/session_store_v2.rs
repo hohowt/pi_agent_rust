@@ -1489,12 +1489,12 @@ fn validate_parent_graph_links(
     parent_by_entry: &std::collections::HashMap<String, Option<String>>,
 ) -> Result<()> {
     for (entry_id, parent_id) in parent_by_entry {
-        if let Some(parent_id) = parent_id.as_deref()
-            && !parent_by_entry.contains_key(parent_id)
-        {
-            return Err(Error::session(format!(
-                "missing parent entry detected in session store: entry_id={entry_id} parent_id={parent_id}"
-            )));
+        if let Some(parent_id) = parent_id.as_deref() {
+            if !parent_by_entry.contains_key(parent_id) {
+                return Err(Error::session(format!(
+                    "missing parent entry detected in session store: entry_id={entry_id} parent_id={parent_id}"
+                )));
+            }
         }
     }
 
@@ -1532,12 +1532,13 @@ fn validate_parent_graph_acyclic(
             visit_state.insert(current_id, ParentGraphVisitState::Visiting);
             stack.push((current_id, true));
 
-            if let Some(parent_id) = parent_by_entry
+            let parent_id = parent_by_entry
                 .get(current_id)
-                .and_then(std::option::Option::as_deref)
-                && parent_by_entry.contains_key(parent_id)
-            {
-                stack.push((parent_id, false));
+                .and_then(std::option::Option::as_deref);
+            if let Some(parent_id) = parent_id {
+                if parent_by_entry.contains_key(parent_id) {
+                    stack.push((parent_id, false));
+                }
             }
         }
     }

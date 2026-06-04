@@ -1699,9 +1699,10 @@ impl ToolOutputCache {
                 .entries
                 .get(&key)
                 .is_some_and(|entry| entry.generation == generation)
-                && let Some(removed) = self.entries.remove(&key)
             {
-                self.total_bytes = self.total_bytes.saturating_sub(removed.weight);
+                if let Some(removed) = self.entries.remove(&key) {
+                    self.total_bytes = self.total_bytes.saturating_sub(removed.weight);
+                }
             }
         }
     }
@@ -6544,20 +6545,27 @@ pub fn cleanup_temp_files() {
             };
 
             // Match "pi-bash-" or "pi-rpc-bash-" prefix and ".log" suffix.
-            if (file_name.starts_with("pi-bash-") || file_name.starts_with("pi-rpc-bash-"))
+            let is_pi_log = (file_name.starts_with("pi-bash-")
+                || file_name.starts_with("pi-rpc-bash-"))
                 && std::path::Path::new(file_name)
                     .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("log"))
-                && let Ok(metadata) = entry.metadata()
-                && metadata.modified().is_ok_and(|modified| {
-                    modified
-                        .elapsed()
-                        .is_ok_and(|age| age > Duration::from_secs(24 * 60 * 60))
-                })
-                && let Err(e) = std::fs::remove_file(&path)
-            {
-                // Log but don't panic on cleanup failure
-                tracing::debug!("Failed to remove temp file {}: {}", path.display(), e);
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("log"));
+            if !is_pi_log {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let is_stale = metadata.modified().is_ok_and(|modified| {
+                modified
+                    .elapsed()
+                    .is_ok_and(|age| age > Duration::from_secs(24 * 60 * 60))
+            });
+            if is_stale {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    // Log but don't panic on cleanup failure
+                    tracing::debug!("Failed to remove temp file {}: {}", path.display(), e);
+                }
             }
         }
     });
@@ -6741,14 +6749,14 @@ impl BashOutputState {
         self.spill_failed = true;
         self.temp_file = None;
         if let Some(path) = self.temp_file_path.take() {
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::debug!(
-                    "Failed to remove incomplete bash spill file {}: {}",
-                    path.display(),
-                    e
-                );
+            if let Err(e) = std::fs::remove_file(&path) {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(
+                        "Failed to remove incomplete bash spill file {}: {}",
+                        path.display(),
+                        e
+                    );
+                }
             }
         }
     }

@@ -2,7 +2,7 @@
 name = "pi_agent_rust"
 version = "0.1.16"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.86"
 description = "High-performance AI coding agent CLI - Rust port of Pi Agent"
 authors = ["Jeffrey Emanuel"]
 license-file = "LICENSE"
@@ -74,6 +74,7 @@ pi-platform = { workspace = true }
 pi-prompt = { workspace = true }
 pi-runtime = { workspace = true }
 pi-theme = { workspace = true }
+pi-tui = { workspace = true }
 
 # CLI
 clap = { workspace = true, features = ["derive", "env", "string"] }
@@ -81,7 +82,7 @@ clap = { workspace = true, features = ["derive", "env", "string"] }
 # Async runtime
 futures = { workspace = true }
 async-trait = { workspace = true }
-tokio = { workspace = true, features = ["fs", "io-util", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "sync", "time"] }
 
 # URL parsing/building
 url = { workspace = true }
@@ -97,15 +98,14 @@ serde_json = { workspace = true, features = ["raw_value"] }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 
-# Terminal output (rich_rust for beautiful TUI)
-rich_rust = { workspace = true, features = ["markdown"] }
-crossterm = { workspace = true }
-
-# Interactive TUI (charmed_rust - bubbletea/lipgloss/bubbles/glamour)
-bubbletea = { workspace = true }
-lipgloss = { workspace = true }
-bubbles = { workspace = true }
-glamour = { workspace = true }
+# Terminal output and interactive UI
+crossterm = { workspace = true, features = ["event-stream"] }
+pulldown-cmark = { workspace = true }
+textwrap = { workspace = true }
+tokio-stream = { workspace = true, features = ["sync"] }
+tokio-util = { workspace = true, features = ["time"] }
+supports-color = { workspace = true }
+unicode-segmentation = { workspace = true }
 unicode-width = { workspace = true }
 arboard = { workspace = true, optional = true }
 
@@ -150,12 +150,11 @@ full = [
     "clipboard",
     "sqlite-sessions",
     "syntax-highlighting",
-    "rich_rust/full",
 ]
 image-resize = ["image"]
 clipboard = ["dep:arboard"]
 sqlite-sessions = []
-syntax-highlighting = ["rich_rust/syntax"]
+syntax-highlighting = []
 
 [profile.release]
 opt-level = "z"
@@ -178,30 +177,12 @@ nursery = { level = "warn", priority = -1 }
 missing_errors_doc = "allow"
 missing_panics_doc = "allow"
 module_name_repetitions = "allow"
-
-# ---------------------------------------------------------------------------
-# Local development with sibling crates
-# ---------------------------------------------------------------------------
-# This project depends on published crates.io versions of rich_rust and
-# charmed-*. CI builds verify this (no sibling repos are checked out).
-#
-# To develop against LOCAL checkouts of these crates, uncomment the
-# [patch.crates-io] section below. Cargo will use the local paths when they
-# satisfy the version requirement and fall back to crates.io otherwise.
-#
-# IMPORTANT: Do NOT commit this section. To prevent accidental commits:
-#   git update-index --skip-worktree Cargo.toml
-# To re-enable tracking:
-#   git update-index --no-skip-worktree Cargo.toml
-#
-# [patch.crates-io]
-# rich_rust = { path = "../rich_rust" }
-# charmed-bubbletea = { path = "../charmed_rust/crates/bubbletea" }
-# charmed-bubbletea-macros = { path = "../charmed_rust/crates/bubbletea-macros" }
-# charmed-lipgloss = { path = "../charmed_rust/crates/lipgloss" }
-# charmed-bubbles = { path = "../charmed_rust/crates/bubbles" }
-# charmed-glamour = { path = "../charmed_rust/crates/glamour" }
-# charmed-harmonica = { path = "../charmed_rust/crates/harmonica" }
+assigning_clones = "allow"
+cognitive_complexity = "allow"
+inefficient_to_string = "allow"
+missing_const_for_fn = "allow"
+needless_continue = "allow"
+option_if_let_else = "allow"
 
 [workspace]
 members = [
@@ -214,6 +195,7 @@ members = [
     "crates/pi-prompt",
     "crates/pi-runtime",
     "crates/pi-theme",
+    "crates/pi-tui",
 ]
 resolver = "3"
 
@@ -222,8 +204,6 @@ anyhow = "1.0.102"
 arboard = "3.6.1"
 async-trait = "0.1"
 base64 = "0.22"
-bubbles = { package = "charmed-bubbles", version = "0.2.0" }
-bubbletea = { package = "charmed-bubbletea", version = "0.2.0" }
 chrono = "0.4"
 clap = "4.5.60"
 crc32c = "0.6"
@@ -233,11 +213,9 @@ dirs = "6"
 enable-ansi-support = "0.2"
 fs4 = "0.13"
 futures = "0.3"
-glamour = { package = "charmed-glamour", version = "0.2.0" }
 glob = "0.3"
 ignore = "0.4"
 image = "0.25"
-lipgloss = { package = "charmed-lipgloss", version = "0.2.0" }
 memchr = "2.8.0"
 pi-core = { path = "crates/pi-core" }
 pi-codegraph = { path = "crates/pi-codegraph" }
@@ -247,27 +225,35 @@ pi-platform = { path = "crates/pi-platform" }
 pi-prompt = { path = "crates/pi-prompt" }
 pi-runtime = { path = "crates/pi-runtime" }
 pi-theme = { path = "crates/pi-theme" }
+pi-tui = { path = "crates/pi-tui" }
 proptest = "1.9.0"
+pulldown-cmark = "0.13.4"
+ratatui = "0.30.0"
 regex = "1.12.3"
 reqwest = { version = "0.12", default-features = false }
-rich_rust = "0.2.0"
 rusqlite = "0.37"
 notify = "8.2.0"
 serde = "1"
 serde_json = "1"
 sha2 = "0.10"
 similar = "2"
-sysinfo = "0.38.2"
+supports-color = "3.0.2"
+sysinfo = "=0.36.1"
 tempfile = "3.25.0"
+textwrap = "0.16.2"
 thiserror = "2"
 tokio = "1"
+tokio-stream = "0.1.18"
+tokio-util = "0.7.17"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 tree-sitter = "0.26.9"
 tree-sitter-go = "0.25.0"
 tree-sitter-rust = "0.24.2"
 unicode-normalization = "0.1"
+unicode-segmentation = "1.12.0"
 unicode-width = "0.2"
 url = "2"
 uuid = "1.21.0"
+vt100 = "0.16.2"
 xxhash-rust = "0.8"

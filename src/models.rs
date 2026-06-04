@@ -2133,10 +2133,10 @@ pub(crate) fn ad_hoc_model_entry(provider: &str, model_id: &str) -> Option<Model
     // auth / environment variables so `model_entry_is_ready` reflects reality
     // and downstream selection logic does not treat an otherwise-usable
     // provider as unconfigured.
-    if entry.api_key.is_none()
-        && let Some(auth) = auth.as_ref()
-    {
-        entry.api_key = normalize_api_key_opt(auth.resolve_api_key(provider, None));
+    if entry.api_key.is_none() {
+        if let Some(auth) = auth.as_ref() {
+            entry.api_key = normalize_api_key_opt(auth.resolve_api_key(provider, None));
+        }
     }
 
     Some(entry)

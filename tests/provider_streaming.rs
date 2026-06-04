@@ -425,10 +425,10 @@ fn current_git_commit() -> Option<String> {
     let head = head.trim();
     if let Some(reference) = head.strip_prefix("ref: ") {
         for candidate in git_ref_candidates(&git_dir, reference) {
-            if let Ok(hash) = std::fs::read_to_string(candidate)
-                && let Some(hash) = normalize_git_hash(&hash)
-            {
-                return Some(hash);
+            if let Ok(hash) = std::fs::read_to_string(candidate) {
+                if let Some(hash) = normalize_git_hash(&hash) {
+                    return Some(hash);
+                }
             }
         }
         return read_packed_ref(&git_dir, reference);

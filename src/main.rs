@@ -8,7 +8,6 @@
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeSet;
-use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -19,7 +18,6 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::{Result, bail};
-use bubbletea::{Cmd, KeyMsg, KeyType, Message as BubbleMessage, Program, quit};
 use clap::error::ErrorKind;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use pi::Cx;
@@ -146,18 +144,18 @@ async fn resolve_selection_with_auth(
         ) {
             Ok(selection) => selection,
             Err(err) => {
-                if let Some(startup) = err.downcast_ref::<StartupError>()
-                    && allow_setup_prompt
-                {
-                    if run_first_time_setup(startup, auth, cli, models_path).await? {
-                        *model_registry = reload_model_registry_with_extra_entries(
-                            auth,
-                            models_path,
-                            extra_entries,
-                        );
-                        continue;
+                if let Some(startup) = err.downcast_ref::<StartupError>() {
+                    if allow_setup_prompt {
+                        if run_first_time_setup(startup, auth, cli, models_path).await? {
+                            *model_registry = reload_model_registry_with_extra_entries(
+                                auth,
+                                models_path,
+                                extra_entries,
+                            );
+                            continue;
+                        }
+                        return Ok(None);
                     }
-                    return Ok(None);
                 }
                 return Err(err);
             }
@@ -1833,166 +1831,6 @@ impl PackageFilterState {
     }
 }
 
-#[derive(Debug, Clone)]
-struct ConfigUiResult {
-    save_requested: bool,
-    packages: Vec<ConfigPackageState>,
-}
-
-#[derive(bubbletea::Model)]
-struct ConfigUiApp {
-    packages: Vec<ConfigPackageState>,
-    selected: usize,
-    settings_summary: String,
-    status: String,
-    result_slot: Arc<StdMutex<Option<ConfigUiResult>>>,
-}
-
-impl ConfigUiApp {
-    fn new(
-        packages: Vec<ConfigPackageState>,
-        settings_summary: String,
-        result_slot: Arc<StdMutex<Option<ConfigUiResult>>>,
-    ) -> Self {
-        let status = if packages.iter().any(|pkg| !pkg.resources.is_empty()) {
-            String::new()
-        } else {
-            "No package resources discovered. Press Enter to exit.".to_string()
-        };
-
-        Self {
-            packages,
-            selected: 0,
-            settings_summary,
-            status,
-            result_slot,
-        }
-    }
-
-    fn selectable_count(&self) -> usize {
-        self.packages.iter().map(|pkg| pkg.resources.len()).sum()
-    }
-
-    fn selected_coords(&self) -> Option<(usize, usize)> {
-        let mut cursor = 0usize;
-        for (pkg_idx, pkg) in self.packages.iter().enumerate() {
-            for (res_idx, _) in pkg.resources.iter().enumerate() {
-                if cursor.eq(&self.selected) {
-                    return Some((pkg_idx, res_idx));
-                }
-                cursor = cursor.saturating_add(1);
-            }
-        }
-        None
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        let total = self.selectable_count();
-        if total.eq(&0) {
-            self.selected = 0;
-            return;
-        }
-
-        let max_index = total.saturating_sub(1);
-        let step = delta.unsigned_abs();
-        if delta.is_negative() {
-            self.selected = self.selected.saturating_sub(step);
-        } else {
-            self.selected = self.selected.saturating_add(step).min(max_index);
-        }
-    }
-
-    fn toggle_selected(&mut self) {
-        if let Some((pkg_idx, res_idx)) = self.selected_coords() {
-            if let Some(resource) = self
-                .packages
-                .get_mut(pkg_idx)
-                .and_then(|pkg| pkg.resources.get_mut(res_idx))
-            {
-                resource.enabled = !resource.enabled;
-            }
-        }
-    }
-
-    fn finish(&self, save_requested: bool) -> Cmd {
-        if let Ok(mut slot) = self.result_slot.lock() {
-            *slot = Some(ConfigUiResult {
-                save_requested,
-                packages: self.packages.clone(),
-            });
-        }
-        quit()
-    }
-
-    #[allow(clippy::missing_const_for_fn, clippy::unused_self)]
-    fn init(&self) -> Option<Cmd> {
-        None
-    }
-
-    #[allow(clippy::needless_pass_by_value)]
-    fn update(&mut self, msg: BubbleMessage) -> Option<Cmd> {
-        if let Some(key) = msg.downcast_ref::<KeyMsg>() {
-            match key.key_type {
-                KeyType::Up => self.move_selection(-1),
-                KeyType::Down => self.move_selection(1),
-                KeyType::Runes if key.runes.eq(&['k']) => self.move_selection(-1),
-                KeyType::Runes if key.runes.eq(&['j']) => self.move_selection(1),
-                KeyType::Space => self.toggle_selected(),
-                KeyType::Enter => return Some(self.finish(true)),
-                KeyType::Esc | KeyType::CtrlC => return Some(self.finish(false)),
-                KeyType::Runes if key.runes.eq(&['q']) => return Some(self.finish(false)),
-                _ => {}
-            }
-        }
-        None
-    }
-
-    fn view(&self) -> String {
-        let mut out = String::new();
-        out.push_str("Pi Config UI\n");
-        let _ = writeln!(out, "{}", self.settings_summary);
-        out.push_str("Keys: ↑/↓ (or j/k) move, Space toggle, Enter save, q cancel\n\n");
-
-        let mut cursor = 0usize;
-        for package in &self.packages {
-            let _ = writeln!(
-                out,
-                "{} package: {}",
-                scope_label(package.scope),
-                package.source
-            );
-
-            if package.resources.is_empty() {
-                out.push_str("    (no discovered resources)\n");
-                continue;
-            }
-
-            for resource in &package.resources {
-                let selected = cursor.eq(&self.selected);
-                let marker = if resource.enabled { "x" } else { " " };
-                let prefix = if selected { ">" } else { " " };
-                let _ = writeln!(
-                    out,
-                    "{} [{}] {:<10} {}",
-                    prefix,
-                    marker,
-                    resource.kind.label(),
-                    resource.path
-                );
-                cursor = cursor.saturating_add(1);
-            }
-
-            out.push('\n');
-        }
-
-        if !self.status.is_empty() {
-            let _ = writeln!(out, "{}", self.status);
-        }
-
-        out
-    }
-}
-
 const fn scope_label(scope: SettingsScope) -> &'static str {
     match scope {
         SettingsScope::Global => "Global",
@@ -2318,17 +2156,31 @@ fn interactive_config_settings_summary(cwd: &Path) -> Result<String> {
 }
 
 fn run_config_tui(
-    packages: Vec<ConfigPackageState>,
-    settings_summary: String,
-) -> Result<Option<Vec<ConfigPackageState>>> {
-    let result_slot = Arc::new(StdMutex::new(None));
-    let app = ConfigUiApp::new(packages, settings_summary, Arc::clone(&result_slot));
-    Program::new(app).with_alt_screen().run()?;
+    packages: &[ConfigPackageState],
+    settings_summary: &str,
+) -> Option<Vec<ConfigPackageState>> {
+    println!("Pi Config UI");
+    println!("{settings_summary}");
+    print_config_package_toggles(packages);
+    println!("Interactive package toggles are temporarily disabled during the ratatui migration.");
+    None
+}
 
-    let result = result_slot.lock().ok().and_then(|guard| guard.clone());
-    match result {
-        Some(result) if result.save_requested => Ok(Some(result.packages)),
-        _ => Ok(None),
+fn print_config_package_toggles(packages: &[ConfigPackageState]) {
+    for package in packages {
+        println!("{} package: {}", scope_label(package.scope), package.source);
+        if package.resources.is_empty() {
+            println!("    (no discovered resources)");
+            continue;
+        }
+        for resource in &package.resources {
+            let marker = if resource.enabled { "x" } else { " " };
+            println!(
+                "  [{marker}] {:<10} {}",
+                resource.kind.label(),
+                resource.path
+            );
+        }
     }
 }
 
@@ -2540,7 +2392,7 @@ async fn handle_config(
 
     if interactive_requested && has_tty {
         let settings_summary = interactive_config_settings_summary(cwd)?;
-        if let Some(updated) = run_config_tui(packages, settings_summary)? {
+        if let Some(updated) = run_config_tui(&packages, &settings_summary) {
             persist_package_toggles(cwd, &updated)?;
             println!("Saved package resource toggles.");
         } else {
@@ -3042,8 +2894,8 @@ fn provider_choice_from_token(token: &str) -> Option<ProviderChoice> {
     let select_choice_for_provider = |provider: &str| -> Option<ProviderChoice> {
         let canonical = provider_metadata::canonical_provider_id(provider).unwrap_or(provider);
 
-        if (wants_oauth || wants_key)
-            && let Some(found) = PROVIDER_CHOICES.iter().copied().find(|choice| {
+        if wants_oauth || wants_key {
+            if let Some(found) = PROVIDER_CHOICES.iter().copied().find(|choice| {
                 choice.provider.eq_ignore_ascii_case(canonical)
                     && ((wants_oauth
                         && matches!(
@@ -3051,9 +2903,9 @@ fn provider_choice_from_token(token: &str) -> Option<ProviderChoice> {
                             SetupCredentialKind::OAuthPkce | SetupCredentialKind::OAuthDeviceFlow
                         ))
                         || (wants_key && matches!(choice.kind, SetupCredentialKind::ApiKey)))
-            })
-        {
-            return Some(found);
+            }) {
+                return Some(found);
+            }
         }
 
         provider_choice_default_for_provider(canonical)
@@ -3781,14 +3633,15 @@ async fn run_print_mode(
                 if let Ok(serialized) = serde_json::to_string(&event) {
                     println!("{serialized}");
                 }
-            } else if stream_text_events
-                && let Some(delta) = streamed_text_delta(&event)
-                && emit_text_delta(delta).is_ok()
-            {
-                let mut guard = text_stream_state
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.observe_delta(delta);
+            } else if stream_text_events {
+                if let Some(delta) = streamed_text_delta(&event) {
+                    if emit_text_delta(delta).is_ok() {
+                        let mut guard = text_stream_state
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        guard.observe_delta(delta);
+                    }
+                }
             }
         }
     };
@@ -4245,10 +4098,10 @@ async fn run_interactive_mode(
         pending.push(pi::interactive::PendingInput::Text(message));
     }
 
-    let AgentSession { agent, session, .. } = session;
+    let session_handle = Arc::clone(&session.session);
     let interactive_result = pi::interactive::run_interactive(
-        agent,
         session,
+        session_handle,
         config,
         model_entry,
         model_scope,
@@ -4860,68 +4713,6 @@ mod tests {
     }
 
     #[test]
-    fn config_ui_app_empty_packages_shows_empty_message() {
-        let result_slot = Arc::new(StdMutex::new(None));
-        let app = ConfigUiApp::new(
-            Vec::new(),
-            "provider=(default)  model=(default)  thinking=(default)".to_string(),
-            result_slot,
-        );
-
-        let view = app.view();
-        assert!(
-            view.contains("Pi Config UI"),
-            "missing config ui header:\n{view}"
-        );
-        assert!(
-            view.contains("No package resources discovered. Press Enter to exit."),
-            "missing empty packages hint:\n{view}"
-        );
-    }
-
-    #[test]
-    fn config_ui_app_toggle_selected_updates_resource_state() {
-        let result_slot = Arc::new(StdMutex::new(None));
-        let mut app = ConfigUiApp::new(
-            vec![ConfigPackageState {
-                scope: SettingsScope::Project,
-                source: "local:demo".to_string(),
-                resources: vec![
-                    ConfigResourceState {
-                        kind: ConfigResourceKind::Extensions,
-                        path: "extensions/a.js".to_string(),
-                        enabled: true,
-                    },
-                    ConfigResourceState {
-                        kind: ConfigResourceKind::Skills,
-                        path: "skills/demo/SKILL.md".to_string(),
-                        enabled: false,
-                    },
-                ],
-            }],
-            "provider=(default)  model=(default)  thinking=(default)".to_string(),
-            result_slot,
-        );
-
-        assert!(
-            app.packages[0].resources[0].enabled,
-            "first resource should start enabled"
-        );
-        app.toggle_selected();
-        assert!(
-            !app.packages[0].resources[0].enabled,
-            "toggling selected resource should flip enabled flag"
-        );
-
-        app.move_selection(1);
-        app.toggle_selected();
-        assert!(
-            app.packages[0].resources[1].enabled,
-            "second resource should toggle on after moving selection"
-        );
-    }
-
-    #[test]
     fn format_settings_summary_uses_effective_config_values() {
         let config = Config {
             default_provider: Some("openai".to_string()),
@@ -4994,13 +4785,13 @@ mod tests {
                 source: "npm:foo".to_string(),
                 resources: vec![
                     ConfigResourceState {
-                        kind: ConfigResourceKind::Extensions,
-                        path: "extensions/a.js".to_string(),
+                        kind: ConfigResourceKind::Themes,
+                        path: "themes/a.json".to_string(),
                         enabled: true,
                     },
                     ConfigResourceState {
-                        kind: ConfigResourceKind::Extensions,
-                        path: "extensions/b.js".to_string(),
+                        kind: ConfigResourceKind::Themes,
+                        path: "themes/b.json".to_string(),
                         enabled: false,
                     },
                 ],
@@ -5037,13 +4828,13 @@ mod tests {
         );
         assert_eq!(
             global_pkg
-                .get("extensions")
+                .get("themes")
                 .and_then(serde_json::Value::as_array)
-                .expect("extensions")
+                .expect("themes")
                 .iter()
                 .filter_map(serde_json::Value::as_str)
                 .collect::<Vec<_>>(),
-            vec!["extensions/a.js"]
+            vec!["themes/a.json"]
         );
 
         let project_value: serde_json::Value = serde_json::from_str(
@@ -5121,7 +4912,7 @@ mod tests {
                     {
                         "source": "npm:override",
                         "kind": "npm",
-                        "extensions": ["extensions/old.js"]
+                        "themes": ["themes/old.json"]
                     }
                 ]
             }))
@@ -5183,13 +4974,13 @@ mod tests {
                 source: "npm:override".to_string(),
                 resources: vec![
                     ConfigResourceState {
-                        kind: ConfigResourceKind::Extensions,
-                        path: "extensions/new.js".to_string(),
+                        kind: ConfigResourceKind::Themes,
+                        path: "themes/new.json".to_string(),
                         enabled: true,
                     },
                     ConfigResourceState {
-                        kind: ConfigResourceKind::Extensions,
-                        path: "extensions/disabled.js".to_string(),
+                        kind: ConfigResourceKind::Themes,
+                        path: "themes/disabled.json".to_string(),
                         enabled: false,
                     },
                 ],
@@ -5227,8 +5018,8 @@ mod tests {
         assert_override_package(
             &override_packages[0],
             "npm:override",
-            "extensions",
-            &["extensions/new.js"],
+            "themes",
+            &["themes/new.json"],
         );
         assert_override_package(
             &override_packages[1],

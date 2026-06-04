@@ -1044,14 +1044,14 @@ fn collect_rust_ast_symbols(
             continue;
         }
 
-        if let Some(caller) = current_symbol
-            && let Some(callee) = rust_call_name_from_node(child, bytes)
-        {
-            calls.push(ExtractedCodeCall {
-                caller: caller.to_string(),
-                callee,
-                line: one_indexed_row(child),
-            });
+        if let Some(caller) = current_symbol {
+            if let Some(callee) = rust_call_name_from_node(child, bytes) {
+                calls.push(ExtractedCodeCall {
+                    caller: caller.to_string(),
+                    callee,
+                    line: one_indexed_row(child),
+                });
+            }
         }
 
         collect_rust_ast_symbols(child, bytes, symbols, calls, current_symbol, false);
@@ -1178,14 +1178,14 @@ fn collect_go_ast_symbols(
             continue;
         }
 
-        if let Some(caller) = current_symbol
-            && let Some(callee) = go_call_name_from_node(child, bytes)
-        {
-            calls.push(ExtractedCodeCall {
-                caller: caller.to_string(),
-                callee,
-                line: one_indexed_row(child),
-            });
+        if let Some(caller) = current_symbol {
+            if let Some(callee) = go_call_name_from_node(child, bytes) {
+                calls.push(ExtractedCodeCall {
+                    caller: caller.to_string(),
+                    callee,
+                    line: one_indexed_row(child),
+                });
+            }
         }
 
         collect_go_ast_symbols(child, bytes, symbols, calls, current_symbol, false);

@@ -555,8 +555,8 @@ impl AuthStorage {
 
         // Prefer explicit stored OAuth/Bearer credentials over ambient env vars.
         // This prevents stale shell env keys from silently overriding successful `/login` flows.
-        if let Some(credential) = self.credential_for_provider(provider)
-            && let Some(key) = match credential {
+        if let Some(credential) = self.credential_for_provider(provider) {
+            if let Some(key) = match credential {
                 AuthCredential::OAuth { .. }
                     if canonical_provider_id(provider)
                         .unwrap_or(provider)
@@ -569,9 +569,9 @@ impl AuthStorage {
                     api_key_from_credential(credential)
                 }
                 _ => None,
+            } {
+                return Some(key);
             }
-        {
-            return Some(key);
         }
 
         if let Some(key) = env_keys_for_provider(provider).iter().find_map(|var| {

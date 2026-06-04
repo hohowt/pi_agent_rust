@@ -4,8 +4,6 @@
 //! - Global themes: `~/.pi/agent/themes/*.json`
 //! - Project themes: `<cwd>/.pi/themes/*.json`
 
-use glamour::{Style as GlamourStyle, StyleConfig as GlamourStyleConfig};
-use lipgloss::Style as LipglossStyle;
 use pi_core::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
@@ -28,20 +26,50 @@ impl ThemeConfig for Option<&str> {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TuiStyle {
+    pub foreground: Option<String>,
+    pub background: Option<String>,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl TuiStyle {
+    #[must_use]
+    pub fn render(&self, text: &str) -> String {
+        text.to_string()
+    }
+
+    #[must_use]
+    pub const fn italic(mut self) -> Self {
+        self.italic = true;
+        self
+    }
+}
+
+fn style(foreground: Option<&str>, background: Option<&str>, bold: bool, italic: bool) -> TuiStyle {
+    TuiStyle {
+        foreground: foreground.map(str::to_string),
+        background: background.map(str::to_string),
+        bold,
+        italic,
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TuiStyles {
-    pub title: LipglossStyle,
-    pub muted: LipglossStyle,
-    pub muted_bold: LipglossStyle,
-    pub muted_italic: LipglossStyle,
-    pub accent: LipglossStyle,
-    pub accent_bold: LipglossStyle,
-    pub success_bold: LipglossStyle,
-    pub warning: LipglossStyle,
-    pub warning_bold: LipglossStyle,
-    pub error_bold: LipglossStyle,
-    pub border: LipglossStyle,
-    pub selection: LipglossStyle,
+    pub title: TuiStyle,
+    pub muted: TuiStyle,
+    pub muted_bold: TuiStyle,
+    pub muted_italic: TuiStyle,
+    pub accent: TuiStyle,
+    pub accent_bold: TuiStyle,
+    pub success_bold: TuiStyle,
+    pub warning: TuiStyle,
+    pub warning_bold: TuiStyle,
+    pub error_bold: TuiStyle,
+    pub border: TuiStyle,
+    pub selection: TuiStyle,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -177,84 +205,30 @@ impl Theme {
 
     #[must_use]
     pub fn tui_styles(&self) -> TuiStyles {
-        let title = LipglossStyle::new()
-            .bold()
-            .foreground(self.colors.accent.as_str());
-        let muted = LipglossStyle::new().foreground(self.colors.muted.as_str());
-        let muted_bold = muted.clone().bold();
-        let muted_italic = muted.clone().italic();
+        let title = style(Some(&self.colors.accent), None, true, false);
+        let muted = style(Some(&self.colors.muted), None, false, false);
+        let muted_bold = style(Some(&self.colors.muted), None, true, false);
+        let muted_italic = style(Some(&self.colors.muted), None, false, true);
 
         TuiStyles {
             title,
             muted,
             muted_bold,
             muted_italic,
-            accent: LipglossStyle::new().foreground(self.colors.accent.as_str()),
-            accent_bold: LipglossStyle::new()
-                .foreground(self.colors.accent.as_str())
-                .bold(),
-            success_bold: LipglossStyle::new()
-                .foreground(self.colors.success.as_str())
-                .bold(),
-            warning: LipglossStyle::new().foreground(self.colors.warning.as_str()),
-            warning_bold: LipglossStyle::new()
-                .foreground(self.colors.warning.as_str())
-                .bold(),
-            error_bold: LipglossStyle::new()
-                .foreground(self.colors.error.as_str())
-                .bold(),
-            border: LipglossStyle::new().foreground(self.ui.border.as_str()),
-            selection: LipglossStyle::new()
-                .foreground(self.colors.foreground.as_str())
-                .background(self.ui.selection.as_str())
-                .bold(),
+            accent: style(Some(&self.colors.accent), None, false, false),
+            accent_bold: style(Some(&self.colors.accent), None, true, false),
+            success_bold: style(Some(&self.colors.success), None, true, false),
+            warning: style(Some(&self.colors.warning), None, false, false),
+            warning_bold: style(Some(&self.colors.warning), None, true, false),
+            error_bold: style(Some(&self.colors.error), None, true, false),
+            border: style(Some(&self.ui.border), None, false, false),
+            selection: style(
+                Some(&self.colors.foreground),
+                Some(&self.ui.selection),
+                true,
+                false,
+            ),
         }
-    }
-
-    #[must_use]
-    pub fn glamour_style_config(&self) -> GlamourStyleConfig {
-        let mut config = if self.is_light() {
-            GlamourStyle::Light.config()
-        } else {
-            GlamourStyle::Dark.config()
-        };
-
-        config.document.style.color = Some(self.colors.foreground.clone());
-
-        // Headings use accent color
-        let accent = Some(self.colors.accent.clone());
-        config.heading.style.color.clone_from(&accent);
-        config.h1.style.color.clone_from(&accent);
-        config.h2.style.color.clone_from(&accent);
-        config.h3.style.color.clone_from(&accent);
-        config.h4.style.color.clone_from(&accent);
-        config.h5.style.color.clone_from(&accent);
-        config.h6.style.color.clone_from(&accent);
-
-        // Links
-        config.link.color.clone_from(&accent);
-        config.link_text.color = accent;
-
-        // Emphasis (bold/italic) uses foreground
-        config.strong.color = Some(self.colors.foreground.clone());
-        config.emph.color = Some(self.colors.foreground.clone());
-
-        // Basic code styling (syntax-highlighting is controlled by glamour feature flags).
-        let code_color = Some(self.syntax.string.clone());
-        config.code.style.color.clone_from(&code_color);
-        config.code_block.block.style.color = code_color;
-
-        // Blockquotes use muted color
-        config.block_quote.style.color = Some(self.colors.muted.clone());
-
-        // Horizontal rules use muted color
-        config.horizontal_rule.color = Some(self.colors.muted.clone());
-
-        // Lists use foreground
-        config.item.color = Some(self.colors.foreground.clone());
-        config.enumeration.color = Some(self.colors.foreground.clone());
-
-        config
     }
 
     /// Discover available theme JSON files.
@@ -1064,7 +1038,7 @@ mod tests {
         );
     }
 
-    // ── tui_styles and glamour_style_config smoke tests ─────────────
+    // ── tui_styles smoke tests ──────────────────────────────────────
 
     #[test]
     fn tui_styles_returns_valid_struct() {
@@ -1074,15 +1048,6 @@ mod tests {
         let _ = format!("{:?}", styles.muted);
         let _ = format!("{:?}", styles.accent);
         let _ = format!("{:?}", styles.error_bold);
-    }
-
-    #[test]
-    fn glamour_style_config_smoke() {
-        let dark_config = Theme::dark().glamour_style_config();
-        let light_config = Theme::light().glamour_style_config();
-        // Verify the configs are created without panic
-        assert!(dark_config.document.style.color.is_some());
-        assert!(light_config.document.style.color.is_some());
     }
 
     mod proptest_theme {
