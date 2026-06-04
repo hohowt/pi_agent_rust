@@ -37,6 +37,9 @@
   - [ ] Editing history navigation.
 - [ ] Restore paste, bracketed paste, drag/drop file paths, quoted paths, and
       file/image reference expansion.
+  - [x] Paste and bracketed paste insertion through editor state.
+  - [x] Drag/drop `file://` and quoted path normalization.
+  - [ ] File/image reference expansion into submitted content.
 - [ ] Port keyboard bindings to crossterm key events.
 - [x] Restore slash command prefix completion and Tab completion.
 - [x] Restore generic picker overlay skeleton.

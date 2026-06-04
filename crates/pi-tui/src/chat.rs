@@ -216,7 +216,7 @@ impl ChatApp {
         match event {
             RatatuiEvent::Key(key) => self.handle_key(key),
             RatatuiEvent::Paste(text) => {
-                self.editor.insert_str(&text);
+                self.editor.insert_str(&normalize_pasted_text(&text));
                 EventOutcome::None
             }
             RatatuiEvent::MouseScrollUp => {
@@ -597,6 +597,32 @@ fn word_right_boundary(text: &str, cursor: usize) -> usize {
         .unicode_word_indices()
         .nth(1)
         .map_or(text.len(), |(idx, _)| cursor + idx)
+}
+
+fn normalize_pasted_text(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.split_whitespace().count() == 1
+        && (trimmed.starts_with("file://")
+            || (trimmed.starts_with('"') && trimmed.ends_with('"'))
+            || (trimmed.starts_with('\'') && trimmed.ends_with('\'')))
+    {
+        return normalize_pasted_token(trimmed);
+    }
+    text.to_string()
+}
+
+fn normalize_pasted_token(token: &str) -> String {
+    let unquoted = token
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            token
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+        .unwrap_or(token);
+    let without_file_scheme = unquoted.strip_prefix("file://").unwrap_or(unquoted);
+    without_file_scheme.replace("%20", " ")
 }
 
 #[derive(Debug)]
@@ -1012,7 +1038,7 @@ fn default_slash_commands() -> Vec<SlashCommandItem> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConversationScroll, EditorState};
+    use super::{ConversationScroll, EditorState, normalize_pasted_text};
     use unicode_width::UnicodeWidthStr;
 
     #[test]
@@ -1106,5 +1132,18 @@ mod tests {
 
         assert_eq!(editor.text(), "a\nb");
         assert_eq!(editor.cursor_position(), (1, 0));
+    }
+
+    #[test]
+    fn pasted_text_preserves_multiline_content() {
+        assert_eq!(normalize_pasted_text("a\nb c"), "a\nb c");
+    }
+
+    #[test]
+    fn pasted_drag_drop_path_normalizes_file_url_and_quotes() {
+        assert_eq!(
+            normalize_pasted_text("\"file:///tmp/a%20b.txt\""),
+            "/tmp/a b.txt"
+        );
     }
 }
