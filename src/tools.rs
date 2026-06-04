@@ -5687,7 +5687,7 @@ codegraph_tool_boilerplate!(
     CodegraphSearchTool,
     "codegraph_search",
     "codegraph search",
-    "Search indexed code symbols by name, kind, or source path.",
+    "PRIMARY for codebase navigation. Search the initialized code graph for symbols or files before grep/read when locating code.",
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -5718,7 +5718,7 @@ codegraph_tool_boilerplate!(
     CodegraphCallersTool,
     "codegraph_callers",
     "codegraph callers",
-    "List indexed calls that target a symbol.",
+    "PRIMARY for 'who calls X' questions. List indexed calls that target a symbol; use this instead of grep/read for caller lookup.",
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -5749,7 +5749,7 @@ codegraph_tool_boilerplate!(
     CodegraphCalleesTool,
     "codegraph_callees",
     "codegraph callees",
-    "List indexed calls made by a symbol.",
+    "PRIMARY for 'what does X call' questions. List indexed calls made by a symbol; use this instead of grep/read for callee lookup.",
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -5780,7 +5780,7 @@ codegraph_tool_boilerplate!(
     CodegraphImpactTool,
     "codegraph_impact",
     "codegraph impact",
-    "List symbols that can be affected by changing a symbol.",
+    "PRIMARY before refactors or edits. Estimate reverse-call impact from the indexed graph before changing a symbol.",
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -5814,7 +5814,7 @@ codegraph_tool_boilerplate!(
     CodegraphNodeTool,
     "codegraph_node",
     "codegraph node",
-    "Return one indexed symbol with its callers and callees.",
+    "PRIMARY for inspecting one symbol. Return the indexed symbol with callers and callees from the graph.",
     serde_json::json!({
         "type": "object",
         "properties": {
@@ -5845,7 +5845,7 @@ codegraph_tool_boilerplate!(
     CodegraphTraceTool,
     "codegraph_trace",
     "codegraph trace",
-    "Find an indexed call path from one symbol to another.",
+    "PRIMARY for flow/path questions. Find an indexed call path from one symbol to another.",
     serde_json::json!({
         "type": "object",
         "properties": {

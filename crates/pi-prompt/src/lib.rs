@@ -617,9 +617,20 @@ fn default_guidelines(language: Language, enabled_tools: &[&str]) -> String {
     let has_ls = has_tool("ls");
     let has_read = has_tool("read");
     let has_hashline_edit = has_tool("hashline_edit");
+    let has_codegraph = enabled_tools
+        .iter()
+        .any(|tool| tool.starts_with("codegraph_"));
 
     let mut guidelines = Vec::new();
     if language.is_english() {
+        if has_codegraph {
+            guidelines.push(
+                "For codebase structure, symbol lookup, callers/callees, call paths, architecture, or impact analysis, call codegraph_* first. Do not start with grep/read/bash for these tasks unless codegraph reports missing or stale data, or exact file text is required.",
+            );
+            guidelines.push(
+                "Use codegraph_search to find symbols, codegraph_node for one symbol and its callers/callees, codegraph_callers/codegraph_callees for direct edges, codegraph_trace for paths, and codegraph_impact before refactors.",
+            );
+        }
         if has_bash && !has_grep && !has_find && !has_ls {
             guidelines.push("Use bash for file operations like ls, rg, find");
         } else if has_bash && (has_grep || has_find || has_ls) {
@@ -651,6 +662,10 @@ fn default_guidelines(language: Language, enabled_tools: &[&str]) -> String {
         guidelines.push("Be concise in your responses");
         guidelines.push("Show file paths clearly when working with files");
     } else {
+        if has_codegraph {
+            guidelines.push("涉及代码结构、符号查找、调用方/被调用方、调用路径、架构理解或影响面分析时，优先调用 codegraph_*；不要先用 grep/read/bash，除非 codegraph 提示索引缺失、结果过期，或必须读取精确文件文本");
+            guidelines.push("用 codegraph_search 找符号，codegraph_node 看单个符号及其 callers/callees，codegraph_callers/codegraph_callees 查直接调用边，codegraph_trace 查路径，codegraph_impact 做重构影响面");
+        }
         if has_bash && !has_grep && !has_find && !has_ls {
             guidelines.push("使用 bash 执行 ls、rg、find 等文件操作");
         } else if has_bash && (has_grep || has_find || has_ls) {
@@ -751,6 +766,30 @@ const DEFAULT_TOOL_DESCRIPTIONS_EN: &[(&str, &str)] = &[
         "hashline_edit",
         "Apply precise file edits using LINE#HASH tags from read or grep with hashline=true",
     ),
+    (
+        "codegraph_search",
+        "PRIMARY for codebase navigation: search the initialized code graph for symbols or files before grep/read when locating code",
+    ),
+    (
+        "codegraph_callers",
+        "PRIMARY for 'who calls X' questions: list indexed calls that target a symbol",
+    ),
+    (
+        "codegraph_callees",
+        "PRIMARY for 'what does X call' questions: list indexed calls made by a symbol",
+    ),
+    (
+        "codegraph_impact",
+        "PRIMARY before refactors or edits: estimate reverse-call impact from the index",
+    ),
+    (
+        "codegraph_node",
+        "PRIMARY for inspecting one symbol: return the indexed symbol with callers and callees",
+    ),
+    (
+        "codegraph_trace",
+        "PRIMARY for flow questions: find an indexed call path between two symbols",
+    ),
 ];
 
 const DEFAULT_TOOL_DESCRIPTIONS_ZH: &[(&str, &str)] = &[
@@ -767,6 +806,30 @@ const DEFAULT_TOOL_DESCRIPTIONS_ZH: &[(&str, &str)] = &[
     (
         "hashline_edit",
         "使用 read/grep 的 LINE#HASH 标记做精确行编辑",
+    ),
+    (
+        "codegraph_search",
+        "代码导航优先工具：定位代码时先搜索已初始化的 codegraph 符号或文件，再考虑 grep/read",
+    ),
+    (
+        "codegraph_callers",
+        "“谁调用 X”问题的优先工具：列出指向某个符号的索引调用",
+    ),
+    (
+        "codegraph_callees",
+        "“X 调用了什么”问题的优先工具：列出某个符号发出的索引调用",
+    ),
+    (
+        "codegraph_impact",
+        "重构或编辑前的优先工具：从反向调用图估算影响面",
+    ),
+    (
+        "codegraph_node",
+        "查看单个符号的优先工具：返回索引符号及其 callers/callees",
+    ),
+    (
+        "codegraph_trace",
+        "调用流程问题的优先工具：查找两个符号之间的索引调用路径",
     ),
 ];
 
@@ -915,6 +978,44 @@ mod tests {
         assert!(prompt.contains("You are an expert coding assistant"));
         assert!(prompt.contains("Available tools"));
         assert!(prompt.contains("Current working directory: <CWD>"));
+    }
+
+    #[test]
+    fn default_prompt_guides_codegraph_first_in_chinese() {
+        let catalog = PromptCatalog::new(Language::Zh);
+        let prompt = catalog.default_system_prompt(DefaultSystemPromptInput {
+            enabled_tools: &["read", "grep", "codegraph_search", "codegraph_trace"],
+            readme_path: "README.md",
+            docs_path: "docs",
+            examples_path: "examples",
+            project_context: &[],
+            skills_prompt: None,
+            date_time: "<TIME>",
+            cwd: Some("<CWD>"),
+        });
+
+        assert!(prompt.contains("优先调用 codegraph_*"));
+        assert!(prompt.contains("不要先用 grep/read/bash"));
+        assert!(prompt.contains("codegraph_trace"));
+    }
+
+    #[test]
+    fn default_prompt_guides_codegraph_first_in_english() {
+        let catalog = PromptCatalog::new(Language::En);
+        let prompt = catalog.default_system_prompt(DefaultSystemPromptInput {
+            enabled_tools: &["read", "grep", "codegraph_search", "codegraph_impact"],
+            readme_path: "README.md",
+            docs_path: "docs",
+            examples_path: "examples",
+            project_context: &[],
+            skills_prompt: None,
+            date_time: "<TIME>",
+            cwd: Some("<CWD>"),
+        });
+
+        assert!(prompt.contains("call codegraph_* first"));
+        assert!(prompt.contains("Do not start with grep/read/bash"));
+        assert!(prompt.contains("codegraph_impact before refactors"));
     }
 
     #[test]
