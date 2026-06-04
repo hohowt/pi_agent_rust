@@ -33,12 +33,14 @@ use serde_json::{Value, json};
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
+use std::fs::OpenOptions;
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::agent::{AbortHandle, Agent, AgentEvent, QueueMode};
 use crate::autocomplete::{AutocompleteCatalog, AutocompleteItem, AutocompleteItemKind};
@@ -511,11 +513,12 @@ impl PiApp {
         self.conversation_viewport.set_content(content.trim_end());
         self.conversation_viewport.set_y_offset(saved_offset);
 
+        let delta = self.conversation_viewport.mouse_wheel_delta.max(1);
         if is_up {
-            self.conversation_viewport.scroll_up(1);
+            self.conversation_viewport.scroll_up(delta);
             self.follow_stream_tail = false;
         } else {
-            self.conversation_viewport.scroll_down(1);
+            self.conversation_viewport.scroll_down(delta);
             // Re-enable auto-follow if scrolled back to the bottom.
             if self.is_at_bottom() {
                 self.follow_stream_tail = true;
@@ -1468,12 +1471,53 @@ impl Drop for RawModeGuard {
     }
 }
 
+struct MouseWheelCaptureGuard;
+
+impl MouseWheelCaptureGuard {
+    fn enable() -> anyhow::Result<Self> {
+        let mut stdout = io::stdout();
+        // Enable normal mouse reporting plus SGR coordinates. Avoid 1002/1003
+        // motion modes so drag/move events do not flood the TUI.
+        stdout.write_all(b"\x1b[?1000h\x1b[?1006h")?;
+        stdout.flush()?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MouseWheelCaptureGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = stdout.write_all(b"\x1b[?1006l\x1b[?1000l");
+        let _ = stdout.flush();
+    }
+}
+
+struct InputTrace {
+    file: std::fs::File,
+}
+
+impl InputTrace {
+    fn from_env() -> Option<Self> {
+        let path = std::env::var_os("PI_TUI_INPUT_TRACE")?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()?;
+        Some(Self { file })
+    }
+
+    fn log(&mut self, line: impl AsRef<str>) {
+        let _ = writeln!(self.file, "{}", line.as_ref());
+    }
+}
+
 fn spawn_terminal_input_forwarder(
     tx: std::sync::mpsc::Sender<Message>,
     shutdown: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
-        let mut last_wheel_sent: Option<Instant> = None;
+        let mut trace = InputTrace::from_env();
         while !shutdown.load(Ordering::Relaxed) {
             let Ok(ready) = event::poll(TERMINAL_INPUT_POLL_INTERVAL) else {
                 break;
@@ -1485,10 +1529,18 @@ fn spawn_terminal_input_forwarder(
             let Ok(evt) = event::read() else {
                 break;
             };
-            let Some(msg) = terminal_event_to_message_with_native_mouse(evt, &mut last_wheel_sent)
-            else {
+            if let Some(trace) = trace.as_mut() {
+                trace.log(format!("event: {evt:?}"));
+            }
+            let Some(msg) = terminal_event_to_message_with_native_mouse(evt) else {
+                if let Some(trace) = trace.as_mut() {
+                    trace.log("message: ignored");
+                }
                 continue;
             };
+            if let Some(trace) = trace.as_mut() {
+                trace.log(describe_input_message(&msg));
+            }
             if tx.send(msg).is_err() {
                 break;
             }
@@ -1496,10 +1548,7 @@ fn spawn_terminal_input_forwarder(
     })
 }
 
-fn terminal_event_to_message_with_native_mouse(
-    evt: Event,
-    last_wheel_sent: &mut Option<Instant>,
-) -> Option<Message> {
+fn terminal_event_to_message_with_native_mouse(evt: Event) -> Option<Message> {
     match evt {
         Event::Key(key_event) => {
             if key_event.kind != KeyEventKind::Press {
@@ -1521,13 +1570,6 @@ fn terminal_event_to_message_with_native_mouse(
                 return None;
             }
 
-            let now = Instant::now();
-            if last_wheel_sent
-                .is_some_and(|last| now.duration_since(last) < TERMINAL_INPUT_POLL_INTERVAL)
-            {
-                return None;
-            }
-            *last_wheel_sent = Some(now);
             Some(Message::new(mouse_msg))
         }
         Event::Resize(width, height) => Some(Message::new(WindowSizeMsg { width, height })),
@@ -1540,6 +1582,34 @@ fn terminal_event_to_message_with_native_mouse(
             paste: true,
         })),
     }
+}
+
+fn describe_input_message(msg: &Message) -> String {
+    if let Some(key) = msg.downcast_ref::<KeyMsg>() {
+        return format!(
+            "message: key type={:?} runes={:?} alt={} paste={}",
+            key.key_type, key.runes, key.alt, key.paste
+        );
+    }
+    if let Some(mouse) = msg.downcast_ref::<MouseMsg>() {
+        return format!(
+            "message: mouse button={:?} action={:?} x={} y={}",
+            mouse.button, mouse.action, mouse.x, mouse.y
+        );
+    }
+    if let Some(size) = msg.downcast_ref::<WindowSizeMsg>() {
+        return format!("message: resize {}x{}", size.width, size.height);
+    }
+    if msg.is::<InterruptMsg>() {
+        return "message: interrupt".to_string();
+    }
+    if msg.is::<FocusMsg>() {
+        return "message: focus gained".to_string();
+    }
+    if msg.is::<BlurMsg>() {
+        return "message: focus lost".to_string();
+    }
+    "message: other".to_string()
 }
 
 /// Run the interactive mode.
@@ -1608,14 +1678,17 @@ pub async fn run_interactive(
     // users scroll with Page Up/Down or arrow keys instead.
     {
         let raw_mode_guard;
+        let mouse_capture_guard;
         let input_forwarder = if disable_mouse_capture {
             raw_mode_guard = Some(RawModeGuard::enable()?);
+            mouse_capture_guard = Some(MouseWheelCaptureGuard::enable()?);
             Some(spawn_terminal_input_forwarder(
                 ui_tx,
                 Arc::clone(&input_shutdown),
             ))
         } else {
             raw_mode_guard = None;
+            mouse_capture_guard = None;
             None
         };
 
@@ -1652,6 +1725,7 @@ pub async fn run_interactive(
         if let Some(handle) = input_forwarder {
             let _ = handle.join();
         }
+        drop(mouse_capture_guard);
         drop(raw_mode_guard);
         run_result?;
     }
