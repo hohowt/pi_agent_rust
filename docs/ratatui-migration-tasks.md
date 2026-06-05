@@ -23,20 +23,20 @@
 
 - [x] Move conversation state rendering from string output to ratatui widgets.
 - [x] Replace `bubbles::Viewport` with internal scroll state.
-- [ ] Add scrollback support for mouse wheel, PgUp/PgDown, Home/End, bottom
+- [x] Add scrollback support for mouse wheel, PgUp/PgDown, Home/End, bottom
       anchoring, and preserved scroll position while output streams.
   - [x] PgUp/PgDown/Home/End keyboard scrollback.
   - [x] Bottom anchoring and preserved scroll position while output streams.
   - [x] Mouse wheel routing with terminal mouse-mode/native selection policy.
 - [x] Replace `bubbles::TextArea` with a local editor state.
-- [ ] Restore multi-line editing, cursor left/right/up/down, word movement,
+- [x] Restore multi-line editing, cursor left/right/up/down, word movement,
       delete, history navigation, and Ctrl+J newline insertion.
   - [x] Multi-line editing and Ctrl+J newline insertion.
   - [x] Cursor left/right/up/down movement.
   - [x] Word movement and delete/backspace behavior.
   - [x] Ctrl+W word deletion and Ctrl+U line-start deletion parity.
   - [x] Editing history navigation.
-- [ ] Restore paste, bracketed paste, drag/drop file paths, quoted paths, and
+- [x] Restore paste, bracketed paste, drag/drop file paths, quoted paths, and
       file/image reference expansion.
   - [x] Paste and bracketed paste insertion through editor state.
   - [x] Drag/drop `file://` and quoted path normalization.
@@ -87,13 +87,13 @@
   - [ ] Restore editable settings rows for theme, language, queue mode,
         compaction, double-Esc action, editor padding, and autocomplete size.
   - [ ] Persist project/global settings through existing config paths.
-- [ ] Port theme picker.
+- [x] Port theme picker.
   - [x] Open a generic theme picker.
   - [x] Apply selected themes immediately and persist project theme.
-- [ ] Port prompt template picker.
+- [x] Port prompt template picker.
   - [x] Open a generic prompt template picker.
   - [x] Apply selected template content immediately.
-- [ ] Port language picker.
+- [x] Port language picker.
   - [x] Open a generic language picker.
   - [x] Persist language changes and refresh all UI/prompt text consistently.
 - [ ] Port tree/branch selector.
