@@ -33,6 +33,7 @@ previous UI performed a richer action.
 | `/language` | Opens a generic picker or accepts an explicit language, persists the setting, and refreshes footer/options text. | `src/interactive.rs:1013-1075` |
 | Assistant streaming | Assistant text deltas stream into the active assistant message; thinking deltas stream into a Thinking line. | `src/interactive.rs:361-436`, `crates/pi-tui/src/chat.rs:170-265` |
 | File/image reference expansion | Submitted `@path`, single path, and `file://` references are expanded into text/image content blocks. | `src/interactive.rs:438-520`, `tests/interactive_session_resume.rs:177-223` |
+| `/reload` | Reloads resources, auth, and model registry, refreshes footer/autocomplete state, and reports diagnostics. | `src/interactive.rs:542`, `src/interactive.rs:884-940` |
 | Markdown rendering | Assistant messages are rendered through the ratatui markdown path for headings, lists, links, code fences, and CJK text. | `crates/pi-tui/src/chat.rs:1144-1352`, `crates/pi-tui/src/chat.rs:1959-1989` |
 | Editing history | Up/down navigation restores previous prompts and the current draft. | `crates/pi-tui/src/chat.rs:318-435`, `crates/pi-tui/src/chat.rs:1811-1855` |
 | Mouse wheel | Mouse wheel routing is wired through the terminal mouse capture policy. | `crates/pi-tui/src/chat.rs:289-303`, `crates/pi-tui/src/terminal.rs:29-77` |
@@ -55,7 +56,6 @@ previous UI performed a richer action.
 | `/settings` | Displays a read-only settings summary. | `src/interactive.rs:384`, `src/interactive.rs:625-633` | Editable settings overlay, queue/compaction/double-Esc/editor/autocomplete settings, project/global persistence. |
 | `/tree` | Displays basic leaf/path counts. | `src/interactive.rs:389`, `src/interactive.rs:610-622` | Full tree navigation, branch selection, summary prompts, and custom fork prompt flow. |
 | `/compact` | Runs compaction and returns only “completed”; event callback is discarded. | `src/interactive.rs:397`, `src/interactive.rs:766-768` | Progress/events and resulting summary in the TUI. |
-| `/reload` | Displays current resource counts. It does not reload resources. | `src/interactive.rs:385`, `src/interactive.rs:636-642` | Reload models/resources, refresh autocomplete catalog, show diagnostics. |
 | `/model` picker | Generic picker can switch model by selected value. | `src/interactive.rs:381`, `src/interactive.rs:438-484` | Provider grouping, auth warnings, current marker, richer details, thinking suffix parity, direct Enter selection parity. |
 | `/changelog` | Prints first 80 changelog lines via unavailable-command path. | `src/interactive.rs:400-406`, `src/interactive.rs:879-883` | Startup/current changelog UI parity. |
 | `/name` | Sets name and prints confirmation. | `src/interactive.rs:398`, `src/interactive.rs:771-786` | Old status-bar style confirmation/error parity. |
@@ -80,7 +80,7 @@ previous UI performed a richer action.
 1. Credential and data egress flows: `/login`, `/logout`, `/export`, `/copy`,
    `/share` are explicit unavailable-command paths.
 2. Tree/fork parity: `/tree` is read-only summary; `/fork` is unavailable.
-3. Settings/reload/compact parity: these commands exist but still lack the full
+3. Settings/compact parity: these commands exist but still lack the full
    interactive flows and diagnostics.
 4. Picker richness: model/session pickers work, but still lack grouping,
    metadata, delete confirmation, filter states, and cwd/all-session toggles.

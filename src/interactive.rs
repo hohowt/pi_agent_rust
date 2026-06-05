@@ -5,9 +5,11 @@ use pi_core::model::{ContentBlock, TextContent};
 use pi_prompt::PromptCatalog;
 
 use crate::agent::{AgentEvent, AgentSession};
+use crate::auth::AuthStorage;
 use crate::config::{Config, Language, SettingsScope};
 use crate::model::{AssistantMessageEvent, Message, ThinkingLevel, UserContent};
-use crate::models::ModelEntry;
+use crate::models::{ModelEntry, ModelRegistry};
+use crate::package_manager::PackageManager;
 use crate::package_manager::ResolvedResource;
 use crate::resources::{ResourceCliOptions, ResourceLoader, parse_command_args, substitute_args};
 use crate::runtime::RuntimeHandle;
@@ -178,23 +180,32 @@ struct InteractiveContext {
     current_model: ModelEntry,
     available_models: Vec<ModelEntry>,
     resources: ResourceLoader,
+    resource_cli: ResourceCliOptions,
+    package_manager: PackageManager,
+    auth_path: PathBuf,
+    models_path: PathBuf,
     cwd: PathBuf,
     options: pi_tui::ChatOptions,
 }
 
+struct InteractiveContextInit {
+    config: Config,
+    current_model: ModelEntry,
+    available_models: Vec<ModelEntry>,
+    resources: ResourceLoader,
+    resource_cli: ResourceCliOptions,
+    auth_path: PathBuf,
+    models_path: PathBuf,
+    cwd: PathBuf,
+}
+
 impl InteractiveContext {
-    fn new(
-        config: Config,
-        current_model: ModelEntry,
-        available_models: Vec<ModelEntry>,
-        resources: ResourceLoader,
-        cwd: PathBuf,
-    ) -> Self {
-        let mut options = pi_tui::ChatOptions::new(model_label(&current_model));
+    fn new(init: InteractiveContextInit) -> Self {
+        let mut options = pi_tui::ChatOptions::new(model_label(&init.current_model));
         options.status = "就绪".to_string();
-        options.theme = Theme::resolve(&config, &cwd);
-        options.resource_summary = resource_summary(&resources);
-        options.mouse_capture = config.disable_mouse_capture == Some(false);
+        options.theme = Theme::resolve(&init.config, &init.cwd);
+        options.resource_summary = resource_summary(&init.resources);
+        options.mouse_capture = init.config.disable_mouse_capture == Some(false);
         options.command_hints = vec![
             "/help".to_string(),
             "/model".to_string(),
@@ -214,13 +225,17 @@ impl InteractiveContext {
             "Esc Esc: 会话".to_string(),
             "/help".to_string(),
         ];
-        options.slash_commands = slash_command_items(config.language());
+        options.slash_commands = slash_command_items(init.config.language());
         Self {
-            config,
-            current_model,
-            available_models,
-            resources,
-            cwd,
+            config: init.config,
+            current_model: init.current_model,
+            available_models: init.available_models,
+            resources: init.resources,
+            resource_cli: init.resource_cli,
+            package_manager: PackageManager::new(init.cwd.clone()),
+            auth_path: init.auth_path,
+            models_path: init.models_path,
+            cwd: init.cwd,
             options,
         }
     }
@@ -239,6 +254,13 @@ impl InteractiveContext {
         self.options.theme = theme;
         pi_tui::ChatAction::SetOptions(Box::new(self.options.clone()))
     }
+
+    fn sync_resource_options(&mut self) -> pi_tui::ChatAction {
+        self.options.model_label = model_label(&self.current_model);
+        self.options.resource_summary = resource_summary(&self.resources);
+        self.options.slash_commands = slash_command_items(self.config.language());
+        pi_tui::ChatAction::SetOptions(Box::new(self.options.clone()))
+    }
 }
 
 fn slash_command_items(language: Language) -> Vec<pi_tui::SlashCommandItem> {
@@ -255,7 +277,7 @@ fn slash_command_items(language: Language) -> Vec<pi_tui::SlashCommandItem> {
             ("/tree", "显示对话树信息"),
             ("/compact", "压缩上下文"),
             ("/clear", "清屏"),
-            ("/reload", "显示资源加载状态"),
+            ("/reload", "重新加载资源"),
             ("/template", "选择 prompt template"),
             ("/language", "切换语言"),
             ("/codegraph", "管理 codegraph 索引"),
@@ -273,7 +295,7 @@ fn slash_command_items(language: Language) -> Vec<pi_tui::SlashCommandItem> {
             ("/tree", "Show conversation tree info"),
             ("/compact", "Compact context"),
             ("/clear", "Clear screen"),
-            ("/reload", "Show resource status"),
+            ("/reload", "Reload resources"),
             ("/template", "Pick prompt template"),
             ("/language", "Switch language"),
             ("/codegraph", "Manage codegraph index"),
@@ -296,11 +318,22 @@ pub async fn run_interactive(
     pending_inputs: Vec<PendingInput>,
     _save_enabled: bool,
     resources: ResourceLoader,
-    _resource_cli: ResourceCliOptions,
+    resource_cli: ResourceCliOptions,
+    auth_path: PathBuf,
+    models_path: PathBuf,
     cwd: PathBuf,
     _runtime_handle: RuntimeHandle,
 ) -> Result<()> {
-    let context = InteractiveContext::new(config, model_entry, available_models, resources, cwd);
+    let context = InteractiveContext::new(InteractiveContextInit {
+        config,
+        current_model: model_entry,
+        available_models,
+        resources,
+        resource_cli,
+        auth_path,
+        models_path,
+        cwd,
+    });
     let options = context.options.clone();
     let mut initial_lines = Vec::new();
     for pending in pending_inputs {
@@ -523,7 +556,7 @@ async fn handle_slash_command(
         SlashCommand::Thinking => handle_thinking_command(agent, context, args).await?,
         SlashCommand::Session => status_action(format_session_status(agent).await?),
         SlashCommand::Settings => status_action(format_settings_status(context)),
-        SlashCommand::Reload => status_action(format_resource_status(context)),
+        SlashCommand::Reload => handle_reload_command(agent, context).await?,
         SlashCommand::ScopedModels => status_action(format_scoped_models(context, args)),
         SlashCommand::Codegraph => status_action(handle_codegraph_command(context, args)?),
         SlashCommand::Hotkeys => status_action(context.options.key_hints.join("\n")),
@@ -861,12 +894,92 @@ fn format_settings_status(context: &InteractiveContext) -> String {
 }
 
 fn format_resource_status(context: &InteractiveContext) -> String {
-    let mut out = String::new();
-    let _ = writeln!(out, "资源已加载");
-    let _ = writeln!(out, "- skills: {}", context.resources.skills().len());
-    let _ = writeln!(out, "- prompts: {}", context.resources.prompts().len());
-    let _ = writeln!(out, "- themes: {}", context.resources.themes().len());
+    format_resource_status_for_loader("资源已加载", &context.resources)
+}
+
+async fn handle_reload_command(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+) -> Result<pi_tui::ChatAction> {
+    let (resources, auth_result) = futures::future::join(
+        ResourceLoader::load(
+            &context.package_manager,
+            &context.cwd,
+            &context.config,
+            &context.resource_cli,
+        ),
+        AuthStorage::load_async(context.auth_path.clone()),
+    )
+    .await;
+    let resources = resources?;
+    let mut auth = auth_result?;
+    auth.refresh_expired_oauth_tokens().await?;
+    let model_registry = ModelRegistry::load(&auth, Some(context.models_path.clone()));
+    let models_error = model_registry.error().map(ToString::to_string);
+    let available_models = model_registry.get_available();
+    let previous_model = model_label(&context.current_model);
+    let current_model_refreshed = if let Some(refreshed_current) = model_registry.find(
+        &context.current_model.model.provider,
+        &context.current_model.model.id,
+    ) {
+        context.current_model = refreshed_current;
+        true
+    } else {
+        false
+    };
+    agent.set_auth_storage(auth);
+    agent.set_model_registry(model_registry);
+    context.available_models = available_models;
+    context.resources = resources;
+    let status = format_reload_status(
+        &context.resources,
+        context.available_models.len(),
+        models_error.as_deref(),
+        (!current_model_refreshed).then_some(previous_model.as_str()),
+    );
+    Ok(pi_tui::ChatAction::Many(vec![
+        status_action(status),
+        context.sync_resource_options(),
+    ]))
+}
+
+#[doc(hidden)]
+pub fn format_reload_status(
+    resources: &ResourceLoader,
+    model_count: usize,
+    models_error: Option<&str>,
+    retained_model: Option<&str>,
+) -> String {
+    let mut out = format_resource_status_for_loader("资源已重新加载", resources);
+    let _ = writeln!(out, "- models: {model_count}");
+    if let Some(error) = models_error {
+        let _ = writeln!(out, "- models.json: {error}");
+    }
+    if let Some(model) = retained_model {
+        let _ = writeln!(out, "- current model retained: {model}");
+    }
     out
+}
+
+#[doc(hidden)]
+pub fn format_resource_status_for_loader(prefix: &str, resources: &ResourceLoader) -> String {
+    let mut out = String::new();
+    let _ = writeln!(out, "{prefix}");
+    let _ = writeln!(out, "- skills: {}", resources.skills().len());
+    let _ = writeln!(out, "- prompts: {}", resources.prompts().len());
+    let _ = writeln!(out, "- themes: {}", resources.themes().len());
+    let _ = writeln!(
+        out,
+        "- diagnostics: {}",
+        resource_diagnostic_count(resources)
+    );
+    out
+}
+
+fn resource_diagnostic_count(resources: &ResourceLoader) -> usize {
+    resources.skill_diagnostics().len()
+        + resources.prompt_diagnostics().len()
+        + resources.theme_diagnostics().len()
 }
 
 fn format_scoped_models(context: &InteractiveContext, args: &str) -> String {

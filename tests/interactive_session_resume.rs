@@ -4,13 +4,14 @@ use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::interactive::{
     build_model_picker_items, expand_submitted_content_for_tui, format_agent_event,
-    resume_session_from_path_for_tui,
+    format_reload_status, resume_session_from_path_for_tui,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
 };
 use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
+use pi::resources::ResourceLoader;
 use pi::session::{Session, SessionMessage};
 use pi::sync::Mutex;
 use pi::tools::{ToolOutput, ToolRegistry};
@@ -186,6 +187,22 @@ fn model_picker_items_include_current_marker_and_details_without_changing_submit
     assert!(items[1].label.starts_with("  openai / gpt-4o"));
     assert!(items[1].description.contains("auth: missing"));
     assert!(items[1].description.contains("thinking: off"));
+}
+
+#[test]
+fn reload_status_reports_resource_model_counts_and_diagnostics() {
+    let resources = ResourceLoader::empty(true);
+
+    let status = format_reload_status(&resources, 2, Some("bad models.json"), Some("old/model"));
+
+    assert!(status.contains("资源已重新加载"));
+    assert!(status.contains("- skills: 0"));
+    assert!(status.contains("- prompts: 0"));
+    assert!(status.contains("- themes: 0"));
+    assert!(status.contains("- diagnostics: 0"));
+    assert!(status.contains("- models: 2"));
+    assert!(status.contains("- models.json: bad models.json"));
+    assert!(status.contains("- current model retained: old/model"));
 }
 
 #[test]

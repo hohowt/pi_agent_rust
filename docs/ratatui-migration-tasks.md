@@ -119,7 +119,7 @@
 - [ ] `/tree`: restore full tree UI instead of basic status text.
 - [ ] `/fork`: restore branch picker/fork flow.
 - [ ] `/compact`: show compaction progress/events and resulting summary.
-- [ ] `/reload`: reload models/resources, update autocomplete catalog, and show
+- [x] `/reload`: reload models/resources, update autocomplete catalog, and show
       diagnostics.
 - [ ] `/export`: restore default export path, HTML/JSON export, and status.
 - [ ] `/copy`: restore clipboard support behind the clipboard feature.

@@ -4110,6 +4110,8 @@ async fn run_interactive_mode(
         save_enabled,
         resources,
         resource_cli,
+        Config::auth_path(),
+        default_models_path(&Config::global_dir()),
         cwd,
         runtime_handle,
     )
