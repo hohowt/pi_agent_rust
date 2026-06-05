@@ -1720,6 +1720,56 @@ mod tests {
     }
 
     #[test]
+    fn single_escape_does_not_submit_or_quit() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+
+        let outcome = app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(outcome, EventOutcome::None);
+        assert!(!app.should_quit());
+        assert_eq!(app.editor.text(), "");
+    }
+
+    #[test]
+    fn double_escape_submits_history_command() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), EventOutcome::None);
+        let outcome = app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(outcome, EventOutcome::Submit("/history".to_string()));
+    }
+
+    #[test]
+    fn picker_escape_closes_picker_without_touching_editor() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("/model");
+        app.apply_action(ChatAction::OpenPicker(ChatPicker::new(
+            "模型",
+            "/model",
+            vec![PickerItem::new("gpt", "gpt", "model")],
+        )));
+
+        let outcome = app.handle_key(key(KeyCode::Esc));
+
+        assert_eq!(outcome, EventOutcome::None);
+        assert!(app.picker.is_none());
+        assert_eq!(app.editor.text(), "/model");
+    }
+
+    #[test]
+    fn ctrl_c_sets_quit_without_submitting() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("draft");
+
+        let outcome = app.handle_key(modified_key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(outcome, EventOutcome::None);
+        assert!(app.should_quit());
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
     fn up_down_navigate_submitted_input_history() {
         let mut app = ChatApp::new(ChatOptions::new("model"));
         app.editor.set_text("first");
