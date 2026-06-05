@@ -94,7 +94,7 @@
   - [x] Apply selected template content immediately.
 - [ ] Port language picker.
   - [x] Open a generic language picker.
-  - [ ] Persist language changes and refresh all UI/prompt text consistently.
+  - [x] Persist language changes and refresh all UI/prompt text consistently.
 - [ ] Port tree/branch selector.
   - [ ] Restore tree navigation, branch selection, fork behavior, summary
         prompts, and custom prompt flow.

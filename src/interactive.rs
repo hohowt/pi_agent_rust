@@ -425,7 +425,7 @@ async fn handle_slash_command(
         }
         SlashCommand::Compact => handle_compact_command(agent).await?,
         SlashCommand::Name => handle_name_command(agent, args).await?,
-        SlashCommand::Language => handle_language_command(context, args),
+        SlashCommand::Language => handle_language_command(context, args)?,
         SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Export
@@ -894,41 +894,68 @@ async fn handle_name_command(agent: &mut AgentSession, args: &str) -> Result<pi_
     Ok(status_action(format!("会话已命名: {name}")))
 }
 
-fn handle_language_command(context: &mut InteractiveContext, args: &str) -> pi_tui::ChatAction {
+fn handle_language_command(
+    context: &mut InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
     let trimmed = args.trim();
     if trimmed.is_empty() {
-        return pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
+        return Ok(pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
             "语言",
             "/language",
             vec![
                 pi_tui::PickerItem::new("中文", "zh", "中文 UI 和 prompt"),
                 pi_tui::PickerItem::new("English", "en", "English UI and prompts"),
             ],
-        ));
+        )));
     }
 
     let Some(language) = parse_language_arg(trimmed) else {
-        return status_action("不支持的语言。用法: /language [zh|en]");
+        return Ok(status_action("不支持的语言。用法: /language [zh|en]"));
     };
 
-    context.config.language = Some(match language {
+    let language_code = match language {
         Language::Zh => "zh".to_string(),
         Language::En => "en".to_string(),
-    });
-    context.options.status = match language {
-        Language::Zh => "就绪".to_string(),
-        Language::En => "Ready".to_string(),
     };
-    context.options.resource_summary = resource_summary(&context.resources);
-    context.options.slash_commands = slash_command_items(language);
-    pi_tui::ChatAction::Many(vec![
+    Config::patch_settings_with_roots(
+        SettingsScope::Project,
+        &Config::global_dir(),
+        &context.cwd,
+        json!({ "language": language_code }),
+    )?;
+    apply_language_selection(context, language, language_code);
+    Ok(pi_tui::ChatAction::Many(vec![
         status_action(
             PromptCatalog::new(language)
                 .ui_text()
                 .language_updated(language),
         ),
         pi_tui::ChatAction::SetOptions(Box::new(context.options.clone())),
-    ])
+    ]))
+}
+
+fn apply_language_selection(
+    context: &mut InteractiveContext,
+    language: Language,
+    language_code: String,
+) {
+    context.config.language = Some(language_code);
+    context.options.status = match language {
+        Language::Zh => "就绪".to_string(),
+        Language::En => "Ready".to_string(),
+    };
+    context.options.resource_summary = resource_summary(&context.resources);
+    context.options.command_hints = vec![
+        "/help".to_string(),
+        "/model".to_string(),
+        "/thinking".to_string(),
+        "/session".to_string(),
+        "/settings".to_string(),
+        "/codegraph status".to_string(),
+        "/exit".to_string(),
+    ];
+    context.options.slash_commands = slash_command_items(language);
 }
 
 async fn handle_history_command(
