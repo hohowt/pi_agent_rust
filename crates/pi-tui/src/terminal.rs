@@ -4,7 +4,8 @@ use std::io::{self, Write};
 use crossterm::Command;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -17,21 +18,23 @@ pub struct TerminalModeGuard {
     bracketed_paste: bool,
     cursor_hidden: bool,
     focus_change: bool,
+    mouse_capture: bool,
     raw_mode: bool,
     ops: Box<dyn TerminalModeOps>,
 }
 
 impl TerminalModeGuard {
-    pub(crate) fn enter() -> io::Result<Self> {
-        Self::enter_with(Box::new(CrosstermTerminalModeOps))
+    pub(crate) fn enter(mouse_capture: bool) -> io::Result<Self> {
+        Self::enter_with(Box::new(CrosstermTerminalModeOps), mouse_capture)
     }
 
-    fn enter_with(ops: Box<dyn TerminalModeOps>) -> io::Result<Self> {
+    fn enter_with(ops: Box<dyn TerminalModeOps>, mouse_capture: bool) -> io::Result<Self> {
         let mut guard = Self {
             alternate_screen: false,
             bracketed_paste: false,
             cursor_hidden: false,
             focus_change: false,
+            mouse_capture: false,
             raw_mode: false,
             ops,
         };
@@ -46,12 +49,19 @@ impl TerminalModeGuard {
         guard.bracketed_paste = true;
         guard.ops.enable_focus_change()?;
         guard.focus_change = true;
+        if mouse_capture {
+            guard.ops.enable_mouse_capture()?;
+            guard.mouse_capture = true;
+        }
         Ok(guard)
     }
 }
 
 impl Drop for TerminalModeGuard {
     fn drop(&mut self) {
+        if self.mouse_capture {
+            self.ops.disable_mouse_capture();
+        }
         if self.focus_change {
             self.ops.disable_focus_change();
         }
@@ -76,6 +86,8 @@ trait TerminalModeOps: Send {
     fn hide_cursor(&mut self) -> io::Result<()>;
     fn enable_bracketed_paste(&mut self) -> io::Result<()>;
     fn enable_focus_change(&mut self) -> io::Result<()>;
+    fn enable_mouse_capture(&mut self) -> io::Result<()>;
+    fn disable_mouse_capture(&mut self);
     fn disable_focus_change(&mut self);
     fn disable_bracketed_paste(&mut self);
     fn show_cursor(&mut self);
@@ -104,6 +116,14 @@ impl TerminalModeOps for CrosstermTerminalModeOps {
 
     fn enable_focus_change(&mut self) -> io::Result<()> {
         execute!(io::stdout(), EnableFocusChange)
+    }
+
+    fn enable_mouse_capture(&mut self) -> io::Result<()> {
+        execute!(io::stdout(), EnableMouseCapture)
+    }
+
+    fn disable_mouse_capture(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
     }
 
     fn disable_focus_change(&mut self) {
@@ -227,6 +247,14 @@ mod tests {
             self.step("enable_focus_change")
         }
 
+        fn enable_mouse_capture(&mut self) -> std::io::Result<()> {
+            self.step("enable_mouse_capture")
+        }
+
+        fn disable_mouse_capture(&mut self) {
+            let _ = self.step("disable_mouse_capture");
+        }
+
         fn disable_focus_change(&mut self) {
             let _ = self.step("disable_focus_change");
         }
@@ -252,7 +280,7 @@ mod tests {
     fn restores_raw_mode_when_enter_fails_after_raw_mode() {
         let (ops, state) = TestTerminalModeOps::new(Some("enable_bracketed_paste"));
 
-        let result = TerminalModeGuard::enter_with(Box::new(ops));
+        let result = TerminalModeGuard::enter_with(Box::new(ops), false);
 
         assert!(result.is_err());
         assert_eq!(
@@ -274,7 +302,8 @@ mod tests {
         let (ops, state) = TestTerminalModeOps::new(None);
 
         let result = panic::catch_unwind(AssertUnwindSafe(|| {
-            let _guard = TerminalModeGuard::enter_with(Box::new(ops)).expect("enter terminal mode");
+            let _guard =
+                TerminalModeGuard::enter_with(Box::new(ops), false).expect("enter terminal mode");
             panic!("simulate panic while raw mode is enabled");
         }));
 
@@ -287,6 +316,34 @@ mod tests {
                 "hide_cursor",
                 "enable_bracketed_paste",
                 "enable_focus_change",
+                "disable_focus_change",
+                "disable_bracketed_paste",
+                "show_cursor",
+                "leave_alternate_screen",
+                "disable_raw_mode",
+            ]
+        );
+    }
+
+    #[test]
+    fn mouse_capture_is_opt_in_and_restored_before_focus() {
+        let (ops, state) = TestTerminalModeOps::new(None);
+
+        {
+            let _guard =
+                TerminalModeGuard::enter_with(Box::new(ops), true).expect("enter terminal mode");
+        }
+
+        assert_eq!(
+            state.lock().expect("test terminal state lock").calls,
+            vec![
+                "enable_raw_mode",
+                "enter_alternate_screen",
+                "hide_cursor",
+                "enable_bracketed_paste",
+                "enable_focus_change",
+                "enable_mouse_capture",
+                "disable_mouse_capture",
                 "disable_focus_change",
                 "disable_bracketed_paste",
                 "show_cursor",

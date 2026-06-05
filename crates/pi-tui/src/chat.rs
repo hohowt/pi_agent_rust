@@ -63,6 +63,7 @@ pub struct ChatOptions {
     pub command_hints: Vec<String>,
     pub key_hints: Vec<String>,
     pub slash_commands: Vec<SlashCommandItem>,
+    pub mouse_capture: bool,
 }
 
 impl ChatOptions {
@@ -82,6 +83,7 @@ impl ChatOptions {
                 "/help".to_string(),
             ],
             slash_commands: default_slash_commands(),
+            mouse_capture: false,
         }
     }
 }
@@ -857,7 +859,7 @@ pub async fn run_minimal_chat_loop(
     initial_lines: Vec<ChatLine>,
     mut on_submit: impl FnMut(String, ChatActionSender) -> SubmitFuture + Send,
 ) -> anyhow::Result<()> {
-    let _terminal_guard = TerminalModeGuard::enter()?;
+    let _terminal_guard = TerminalModeGuard::enter(options.mouse_capture)?;
     let _alternate_scroll = AlternateScrollGuard::enable()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let (draw_tx, draw_rx) = broadcast::channel(32);

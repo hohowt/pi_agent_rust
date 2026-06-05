@@ -27,7 +27,7 @@
       anchoring, and preserved scroll position while output streams.
   - [x] PgUp/PgDown/Home/End keyboard scrollback.
   - [x] Bottom anchoring and preserved scroll position while output streams.
-  - [ ] Mouse wheel routing with terminal mouse-mode/native selection policy.
+  - [x] Mouse wheel routing with terminal mouse-mode/native selection policy.
 - [x] Replace `bubbles::TextArea` with a local editor state.
 - [ ] Restore multi-line editing, cursor left/right/up/down, word movement,
       delete, history navigation, and Ctrl+J newline insertion.

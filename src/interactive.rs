@@ -192,6 +192,7 @@ impl InteractiveContext {
         options.status = "就绪".to_string();
         options.theme = Theme::resolve(&config, &cwd);
         options.resource_summary = resource_summary(&resources);
+        options.mouse_capture = config.disable_mouse_capture == Some(false);
         options.command_hints = vec![
             "/help".to_string(),
             "/model".to_string(),
