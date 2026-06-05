@@ -1160,20 +1160,39 @@ async fn handle_compact_command(agent: &mut AgentSession) -> Result<pi_tui::Chat
 
 async fn handle_name_command(agent: &mut AgentSession, args: &str) -> Result<pi_tui::ChatAction> {
     let name = args.trim();
-    if name.is_empty() {
-        return Ok(status_action("用法: /name <session-name>"));
+    if let Some(error) = validate_session_name_for_tui(name) {
+        return Ok(status_action(error));
     }
     let cx = crate::agent_cx::AgentCx::for_request();
+    let entry_id;
     {
         let mut session = agent
             .session
             .lock(cx.cx())
             .await
             .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        session.set_name(name);
+        entry_id = session.set_name(name);
     }
     agent.persist_session().await?;
-    Ok(status_action(format!("会话已命名: {name}")))
+    Ok(status_action(format_session_name_status(name, &entry_id)))
+}
+
+fn validate_session_name_for_tui(name: &str) -> Option<String> {
+    if name.is_empty() {
+        return Some("用法: /name <session-name>".to_string());
+    }
+    if name.chars().any(|ch| ch == '\n' || ch == '\r') {
+        return Some("会话名称不能包含换行。".to_string());
+    }
+    if name.chars().count() > 120 {
+        return Some("会话名称过长，最多 120 个字符。".to_string());
+    }
+    None
+}
+
+#[doc(hidden)]
+pub fn format_session_name_status(name: &str, entry_id: &str) -> String {
+    format!("会话已命名\n名称: {name}\n记录: {entry_id}")
 }
 
 fn handle_language_command(

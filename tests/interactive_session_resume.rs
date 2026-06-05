@@ -4,7 +4,7 @@ use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::interactive::{
     build_model_picker_items, expand_submitted_content_for_tui, format_agent_event,
-    format_reload_status, resume_session_from_path_for_tui,
+    format_reload_status, format_session_name_status, resume_session_from_path_for_tui,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -203,6 +203,15 @@ fn reload_status_reports_resource_model_counts_and_diagnostics() {
     assert!(status.contains("- models: 2"));
     assert!(status.contains("- models.json: bad models.json"));
     assert!(status.contains("- current model retained: old/model"));
+}
+
+#[test]
+fn session_name_status_includes_visible_name_and_entry_id() {
+    let status = format_session_name_status("release notes", "entry-42");
+
+    assert!(status.contains("会话已命名"));
+    assert!(status.contains("名称: release notes"));
+    assert!(status.contains("记录: entry-42"));
 }
 
 #[test]

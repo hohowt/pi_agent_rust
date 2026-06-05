@@ -125,7 +125,7 @@
 - [ ] `/copy`: restore clipboard support behind the clipboard feature.
 - [ ] `/share`: restore share flow.
 - [ ] `/changelog`: restore startup/current changelog UI.
-- [ ] `/name`: keep current naming behavior and add visible confirmation/error
+- [x] `/name`: keep current naming behavior and add visible confirmation/error
       parity with the old status bar.
 
 ## 6. Theme Migration
