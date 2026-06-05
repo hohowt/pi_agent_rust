@@ -12,10 +12,11 @@ use crate::package_manager::ResolvedResource;
 use crate::resources::{ResourceCliOptions, ResourceLoader, parse_command_args, substitute_args};
 use crate::runtime::RuntimeHandle;
 use crate::session::SessionEntry;
+use crate::tools::process_file_arguments;
 use pi_theme::Theme;
 use serde_json::json;
 use std::fmt::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[derive(Debug, Clone)]
@@ -302,17 +303,19 @@ pub async fn run_interactive(
     let options = context.options.clone();
     let mut initial_lines = Vec::new();
     for pending in pending_inputs {
-        let input = match pending {
-            PendingInput::Text(text) => text,
-            PendingInput::Content(content) => content_blocks_to_text(&content),
-            PendingInput::Continue => "continue".to_string(),
+        let content = match pending {
+            PendingInput::Text(text) => expand_submitted_content_for_tui(
+                &text,
+                &context.cwd,
+                context.config.image_auto_resize(),
+            )?,
+            PendingInput::Content(content) => content,
+            PendingInput::Continue => vec![ContentBlock::Text(TextContent::new("continue"))],
         };
+        let input = content_blocks_to_text(&content);
         initial_lines.push(pi_tui::ChatLine::user(input.clone()));
         let assistant = agent
-            .run_with_content(
-                vec![ContentBlock::Text(TextContent::new(input))],
-                |_event: AgentEvent| {},
-            )
+            .run_with_content(content, |_event: AgentEvent| {})
             .await?;
         let answer = assistant
             .content
@@ -351,26 +354,27 @@ async fn handle_submitted_input(
         return handle_slash_command(agent, context, command, args, action_tx).await;
     }
 
-    run_user_prompt(agent, input, action_tx, false).await
+    run_user_prompt(agent, context, input, action_tx, false).await
 }
 
 async fn run_user_prompt(
     agent: &mut AgentSession,
+    context: &InteractiveContext,
     input: String,
     action_tx: pi_tui::ChatActionSender,
     echo_user: bool,
 ) -> Result<pi_tui::ChatAction> {
     let event_sink = action_tx.clone();
+    let content =
+        expand_submitted_content_for_tui(&input, &context.cwd, context.config.image_auto_resize())?;
+    let user_line = content_blocks_to_text(&content);
     let assistant = agent
-        .run_with_content(
-            vec![ContentBlock::Text(TextContent::new(input.clone()))],
-            move |event| {
-                if let Some(line) = format_agent_event(&event) {
-                    let _ = event_sink
-                        .send(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::status(line)));
-                }
-            },
-        )
+        .run_with_content(content, move |event| {
+            if let Some(line) = format_agent_event(&event) {
+                let _ =
+                    event_sink.send(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::status(line)));
+            }
+        })
         .await?;
     let answer = assistant
         .content
@@ -384,12 +388,83 @@ async fn run_user_prompt(
     let assistant_line = pi_tui::ChatAction::PushLine(pi_tui::ChatLine::assistant(answer));
     if echo_user {
         Ok(pi_tui::ChatAction::Many(vec![
-            pi_tui::ChatAction::PushLine(pi_tui::ChatLine::user(input)),
+            pi_tui::ChatAction::PushLine(pi_tui::ChatLine::user(user_line)),
             assistant_line,
         ]))
     } else {
         Ok(assistant_line)
     }
+}
+
+#[doc(hidden)]
+pub fn expand_submitted_content_for_tui(
+    input: &str,
+    cwd: &Path,
+    auto_resize_images: bool,
+) -> Result<Vec<ContentBlock>> {
+    let (message_text, file_args) = split_submitted_file_references(input, cwd);
+    if file_args.is_empty() {
+        return Ok(vec![ContentBlock::Text(TextContent::new(
+            input.to_string(),
+        ))]);
+    }
+
+    let processed = process_file_arguments(&file_args, cwd, auto_resize_images)?;
+    let mut text = processed.text;
+    if !message_text.trim().is_empty() {
+        text.push_str(message_text.trim());
+    }
+
+    let mut content = Vec::new();
+    if !text.is_empty() {
+        content.push(ContentBlock::Text(TextContent::new(text)));
+    }
+    content.extend(processed.images.into_iter().map(ContentBlock::Image));
+    Ok(content)
+}
+
+fn split_submitted_file_references(input: &str, cwd: &Path) -> (String, Vec<String>) {
+    let tokens = parse_command_args(input);
+    if tokens.is_empty() {
+        return (String::new(), Vec::new());
+    }
+
+    if tokens.len() == 1 && token_is_single_path_reference(&tokens[0], cwd) {
+        return (
+            String::new(),
+            vec![normalize_file_reference_token(&tokens[0])],
+        );
+    }
+
+    let mut message = Vec::new();
+    let mut files = Vec::new();
+    for token in tokens {
+        if token.starts_with('@') || token.starts_with("file://") {
+            files.push(normalize_file_reference_token(&token));
+        } else {
+            message.push(token);
+        }
+    }
+    (message.join(" "), files)
+}
+
+fn token_is_single_path_reference(token: &str, cwd: &Path) -> bool {
+    if token.starts_with('@') || token.starts_with("file://") {
+        return true;
+    }
+    let path = Path::new(token);
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    };
+    candidate.is_file()
+}
+
+fn normalize_file_reference_token(token: &str) -> String {
+    let without_at = token.strip_prefix('@').unwrap_or(token);
+    let without_scheme = without_at.strip_prefix("file://").unwrap_or(without_at);
+    without_scheme.replace("%20", " ")
 }
 
 async fn handle_slash_command(
@@ -847,7 +922,7 @@ async fn handle_template_command(
                 template.name
             )));
         }
-        return run_user_prompt(agent, expanded, action_tx, true).await;
+        return run_user_prompt(agent, context, expanded, action_tx, true).await;
     }
     let items = context
         .resources

@@ -2,7 +2,9 @@ use async_trait::async_trait;
 use futures::Stream;
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
-use pi::interactive::{format_agent_event, resume_session_from_path_for_tui};
+use pi::interactive::{
+    expand_submitted_content_for_tui, format_agent_event, resume_session_from_path_for_tui,
+};
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
 };
@@ -170,5 +172,57 @@ fn live_tool_progress_events_render_status_lines() {
     assert_eq!(
         format_agent_event(&end).as_deref(),
         Some(r#"tool: read 完成 {"bytes":1234}"#)
+    );
+}
+
+#[test]
+fn submitted_file_references_expand_into_text_content() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let file = temp.path().join("notes.txt");
+    std::fs::write(&file, "alpha beta").expect("write text file");
+
+    let content = expand_submitted_content_for_tui(
+        &format!("review @{}", file.display()),
+        temp.path(),
+        false,
+    )
+    .expect("expand file reference");
+
+    assert_eq!(content.len(), 1);
+    let ContentBlock::Text(text) = &content[0] else {
+        panic!("expected text content block");
+    };
+    assert!(text.text.contains("<file name="));
+    assert!(text.text.contains("alpha beta"));
+    assert!(text.text.ends_with("review"));
+}
+
+#[test]
+fn submitted_single_path_reference_expands_image_content() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let image = temp.path().join("tiny.png");
+    let png_header: Vec<u8> = vec![
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52,
+    ];
+    std::fs::write(&image, png_header).expect("write png file");
+
+    let content = expand_submitted_content_for_tui(&image.to_string_lossy(), temp.path(), false)
+        .expect("expand image reference");
+
+    assert_eq!(content.len(), 2);
+    assert!(matches!(&content[0], ContentBlock::Text(text) if text.text.contains("<file name=")));
+    assert!(matches!(&content[1], ContentBlock::Image(image) if image.mime_type == "image/png"));
+}
+
+#[test]
+fn ordinary_submitted_text_stays_plain_text() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let content = expand_submitted_content_for_tui("explain ./missing.txt", temp.path(), false)
+        .expect("plain text should not be expanded");
+
+    assert_eq!(content.len(), 1);
+    assert!(
+        matches!(&content[0], ContentBlock::Text(text) if text.text == "explain ./missing.txt")
     );
 }
