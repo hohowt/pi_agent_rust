@@ -1770,6 +1770,43 @@ mod tests {
     }
 
     #[test]
+    fn slash_prefix_filtering_matches_command_prefixes() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("/mo");
+
+        let commands = app
+            .filtered_slash_commands()
+            .into_iter()
+            .map(|item| item.command.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(commands, vec!["/model"]);
+    }
+
+    #[test]
+    fn tab_completes_first_matching_slash_command() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("/th");
+
+        let outcome = app.handle_key(key(KeyCode::Tab));
+
+        assert_eq!(outcome, EventOutcome::None);
+        assert_eq!(app.editor.text(), "/thinking ");
+    }
+
+    #[test]
+    fn enter_first_completes_slash_command_then_second_enter_submits() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("/thi");
+
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), EventOutcome::None);
+        assert_eq!(app.editor.text(), "/thinking ");
+
+        let outcome = app.handle_key(key(KeyCode::Enter));
+        assert_eq!(outcome, EventOutcome::Submit("/thinking".to_string()));
+    }
+
+    #[test]
     fn up_down_navigate_submitted_input_history() {
         let mut app = ChatApp::new(ChatOptions::new("model"));
         app.editor.set_text("first");
