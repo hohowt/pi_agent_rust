@@ -6,7 +6,7 @@ use pi_prompt::PromptCatalog;
 
 use crate::agent::{AgentEvent, AgentSession};
 use crate::config::{Config, Language, SettingsScope};
-use crate::model::ThinkingLevel;
+use crate::model::{Message, ThinkingLevel, UserContent};
 use crate::models::ModelEntry;
 use crate::package_manager::ResolvedResource;
 use crate::resources::{ResourceCliOptions, ResourceLoader, parse_command_args, substitute_args};
@@ -415,7 +415,9 @@ async fn handle_slash_command(
             pi_tui::ChatAction::Clear,
             status_action("已清空当前屏幕。要创建新的持久会话，请退出后使用 pi --new。"),
         ]),
-        SlashCommand::Resume | SlashCommand::History => handle_history_command(context, args),
+        SlashCommand::Resume | SlashCommand::History => {
+            handle_history_command(agent, context, args).await?
+        }
         SlashCommand::Theme => handle_theme_command(context, args).await?,
         SlashCommand::Template => {
             return handle_template_command(agent, context, args, action_tx).await;
@@ -443,6 +445,36 @@ fn content_blocks_to_text(content: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn user_content_to_text(content: &UserContent) -> String {
+    match content {
+        UserContent::Text(text) => text.clone(),
+        UserContent::Blocks(blocks) => content_blocks_to_text(blocks),
+    }
+}
+
+fn chat_lines_from_messages(messages: &[Message]) -> Vec<pi_tui::ChatLine> {
+    messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::User(user) => {
+                Some(pi_tui::ChatLine::user(user_content_to_text(&user.content)))
+            }
+            Message::Assistant(assistant) => Some(pi_tui::ChatLine::assistant(
+                content_blocks_to_text(&assistant.content),
+            )),
+            Message::ToolResult(result) => Some(pi_tui::ChatLine::status(format!(
+                "tool: {} {}",
+                result.tool_name,
+                if result.is_error { "失败" } else { "完成" }
+            ))),
+            Message::Custom(custom) if custom.display => {
+                Some(pi_tui::ChatLine::status(custom.content.clone()))
+            }
+            Message::Custom(_) => None,
+        })
+        .collect()
 }
 
 fn status_action(text: impl Into<String>) -> pi_tui::ChatAction {
@@ -898,18 +930,37 @@ fn handle_language_command(context: &mut InteractiveContext, args: &str) -> pi_t
     ])
 }
 
-fn handle_history_command(context: &InteractiveContext, args: &str) -> pi_tui::ChatAction {
+async fn handle_history_command(
+    agent: &mut AgentSession,
+    context: &InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
     if !args.trim().is_empty() {
-        return status_action(format!(
-            "已选择会话: {}\n会话加载将在 ratatui session switch 接入后执行。",
-            args.trim()
-        ));
+        let selected = args.trim();
+        let mut session = crate::session::Session::open(selected).await?;
+        let history = session.to_messages_for_current_path();
+        let visible_lines = chat_lines_from_messages(&history);
+        let cx = crate::agent_cx::AgentCx::for_request();
+        {
+            let mut active = agent
+                .session
+                .lock(cx.cx())
+                .await
+                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+            session.set_autosave_durability_mode(active.autosave_durability_mode());
+            *active = session;
+        }
+        agent.agent.replace_messages(history);
+        return Ok(pi_tui::ChatAction::Many(vec![
+            pi_tui::ChatAction::ReplaceLines(visible_lines),
+            status_action(format!("已恢复会话: {selected}")),
+        ]));
     }
     let index = crate::session_index::SessionIndex::new();
     let cwd = context.cwd.display().to_string();
     let sessions = index.list_sessions(Some(&cwd)).unwrap_or_default();
     if sessions.is_empty() {
-        return status_action("当前项目没有可恢复会话。");
+        return Ok(status_action("当前项目没有可恢复会话。"));
     }
     let items = sessions
         .into_iter()
@@ -924,7 +975,11 @@ fn handle_history_command(context: &InteractiveContext, args: &str) -> pi_tui::C
             pi_tui::PickerItem::new(label, session.path, description)
         })
         .collect::<Vec<_>>();
-    pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new("会话列表", "/resume", items))
+    Ok(pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
+        "会话列表",
+        "/resume",
+        items,
+    )))
 }
 
 fn parse_language_arg(value: &str) -> Option<Language> {

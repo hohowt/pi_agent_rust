@@ -148,6 +148,7 @@ impl ChatPicker {
 #[derive(Debug, Clone)]
 pub enum ChatAction {
     PushLine(ChatLine),
+    ReplaceLines(Vec<ChatLine>),
     Clear,
     Quit,
     SetOptions(Box<ChatOptions>),
@@ -200,6 +201,11 @@ impl ChatApp {
     fn apply_action(&mut self, action: ChatAction) {
         match action {
             ChatAction::PushLine(line) => self.push_line(line),
+            ChatAction::ReplaceLines(lines) => {
+                self.lines = lines;
+                self.scroll.scroll_to_bottom();
+                self.scroll.mark_content_changed();
+            }
             ChatAction::Clear => {
                 self.lines.clear();
                 self.scroll.scroll_to_bottom();

@@ -74,7 +74,7 @@
         selection parity.
 - [ ] Port session picker overlay.
   - [x] Open a generic session picker from `/history`, `/resume`, and double-Esc.
-  - [ ] Load selected sessions and replace active conversation state.
+  - [x] Load selected sessions and replace active conversation state.
   - [ ] Restore search, delete confirmation, empty/filter states, status
         messages, branch metadata, and cwd/all-session toggles.
 - [ ] Port settings UI.
@@ -109,7 +109,7 @@
 - [ ] `/settings`: restore full interactive settings overlay.
 - [x] `/theme`: apply selected theme, not just show/select the item.
 - [x] `/template`: apply selected prompt template content immediately.
-- [ ] `/history` and `/resume`: load selected session.
+- [x] `/history` and `/resume`: load selected session.
 - [ ] `/tree`: restore full tree UI instead of basic status text.
 - [ ] `/fork`: restore branch picker/fork flow.
 - [ ] `/compact`: show compaction progress/events and resulting summary.
