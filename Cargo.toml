@@ -58,6 +58,10 @@ name = "agent_cx_tokio"
 path = "tests/agent_cx_tokio.rs"
 
 [[test]]
+name = "interactive_session_resume"
+path = "tests/interactive_session_resume.rs"
+
+[[test]]
 name = "root_tokio_runtime"
 path = "tests/root_tokio_runtime.rs"
 

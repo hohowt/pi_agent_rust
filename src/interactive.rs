@@ -964,25 +964,7 @@ async fn handle_history_command(
     args: &str,
 ) -> Result<pi_tui::ChatAction> {
     if !args.trim().is_empty() {
-        let selected = args.trim();
-        let mut session = crate::session::Session::open(selected).await?;
-        let history = session.to_messages_for_current_path();
-        let visible_lines = chat_lines_from_messages(&history);
-        let cx = crate::agent_cx::AgentCx::for_request();
-        {
-            let mut active = agent
-                .session
-                .lock(cx.cx())
-                .await
-                .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-            session.set_autosave_durability_mode(active.autosave_durability_mode());
-            *active = session;
-        }
-        agent.agent.replace_messages(history);
-        return Ok(pi_tui::ChatAction::Many(vec![
-            pi_tui::ChatAction::ReplaceLines(visible_lines),
-            status_action(format!("已恢复会话: {selected}")),
-        ]));
+        return resume_session_from_path_for_tui(agent, args.trim()).await;
     }
     let index = crate::session_index::SessionIndex::new();
     let cwd = context.cwd.display().to_string();
@@ -1008,6 +990,31 @@ async fn handle_history_command(
         "/resume",
         items,
     )))
+}
+
+#[doc(hidden)]
+pub async fn resume_session_from_path_for_tui(
+    agent: &mut AgentSession,
+    selected: &str,
+) -> Result<pi_tui::ChatAction> {
+    let mut session = crate::session::Session::open(selected).await?;
+    let history = session.to_messages_for_current_path();
+    let visible_lines = chat_lines_from_messages(&history);
+    let cx = crate::agent_cx::AgentCx::for_request();
+    {
+        let mut active = agent
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        session.set_autosave_durability_mode(active.autosave_durability_mode());
+        *active = session;
+    }
+    agent.agent.replace_messages(history);
+    Ok(pi_tui::ChatAction::Many(vec![
+        pi_tui::ChatAction::ReplaceLines(visible_lines),
+        status_action(format!("已恢复会话: {selected}")),
+    ]))
 }
 
 fn parse_language_arg(value: &str) -> Option<Language> {

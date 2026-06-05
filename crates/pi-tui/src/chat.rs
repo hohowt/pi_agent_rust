@@ -51,6 +51,16 @@ impl ChatLine {
             text: text.into(),
         }
     }
+
+    #[must_use]
+    pub const fn role(&self) -> &str {
+        self.role
+    }
+
+    #[must_use]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
 }
 
 #[derive(Debug, Clone)]
