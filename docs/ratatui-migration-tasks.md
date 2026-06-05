@@ -44,10 +44,10 @@
 - [x] Port keyboard bindings to crossterm key events.
 - [x] Restore slash command prefix completion and Tab completion.
 - [x] Restore generic picker overlay skeleton.
-- [ ] Port streaming assistant updates to frame-request redraws.
+- [x] Port streaming assistant updates to frame-request redraws.
   - [x] Stream agent status/tool/retry/compaction events through frame-request redraws.
   - [x] Stream assistant text deltas into the active assistant message.
-- [ ] Render assistant text, thinking deltas, retry events, and compaction
+- [x] Render assistant text, thinking deltas, retry events, and compaction
       events incrementally instead of after the turn finishes.
   - [x] Render retry and compaction events incrementally.
   - [x] Render assistant text and thinking deltas incrementally.
