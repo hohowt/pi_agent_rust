@@ -5,13 +5,15 @@ use pi_core::model::{ContentBlock, TextContent};
 use pi_prompt::PromptCatalog;
 
 use crate::agent::{AgentEvent, AgentSession};
-use crate::config::{Config, Language};
+use crate::config::{Config, Language, SettingsScope};
 use crate::model::ThinkingLevel;
 use crate::models::ModelEntry;
 use crate::package_manager::ResolvedResource;
 use crate::resources::{ResourceCliOptions, ResourceLoader, parse_command_args, substitute_args};
 use crate::runtime::RuntimeHandle;
 use crate::session::SessionEntry;
+use pi_theme::Theme;
+use serde_json::json;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -188,6 +190,7 @@ impl InteractiveContext {
     ) -> Self {
         let mut options = pi_tui::ChatOptions::new(model_label(&current_model));
         options.status = "就绪".to_string();
+        options.theme = Theme::resolve(&config, &cwd);
         options.resource_summary = resource_summary(&resources);
         options.command_hints = vec![
             "/help".to_string(),
@@ -226,7 +229,12 @@ impl InteractiveContext {
     fn sync_footer_model(&mut self) -> pi_tui::ChatAction {
         self.options.model_label = model_label(&self.current_model);
         self.options.resource_summary = resource_summary(&self.resources);
-        pi_tui::ChatAction::SetOptions(self.options.clone())
+        pi_tui::ChatAction::SetOptions(Box::new(self.options.clone()))
+    }
+
+    fn sync_theme_options(&mut self, theme: Theme) -> pi_tui::ChatAction {
+        self.options.theme = theme;
+        pi_tui::ChatAction::SetOptions(Box::new(self.options.clone()))
     }
 }
 
@@ -408,7 +416,7 @@ async fn handle_slash_command(
             status_action("已清空当前屏幕。要创建新的持久会话，请退出后使用 pi --new。"),
         ]),
         SlashCommand::Resume | SlashCommand::History => handle_history_command(context, args),
-        SlashCommand::Theme => handle_theme_command(context, args),
+        SlashCommand::Theme => handle_theme_command(context, args).await?,
         SlashCommand::Template => {
             return handle_template_command(agent, context, args, action_tx).await;
         }
@@ -717,31 +725,54 @@ fn handle_codegraph_command(context: &InteractiveContext, args: &str) -> Result<
 
 fn format_theme_status(context: &InteractiveContext) -> String {
     let mut out = String::from("主题:\n");
+    out.push_str("- dark (built-in)\n- light (built-in)\n- solarized (built-in)\n");
     for theme in context.resources.themes().iter().take(50) {
         let _ = writeln!(out, "- {} ({})", theme.name, theme.source);
-    }
-    if context.resources.themes().is_empty() {
-        out.push_str("未加载主题。");
     }
     out
 }
 
-fn handle_theme_command(context: &InteractiveContext, args: &str) -> pi_tui::ChatAction {
+async fn handle_theme_command(
+    context: &mut InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
     if !args.trim().is_empty() {
-        return status_action(format!("主题切换待接入: {}", args.trim()));
+        let theme_name = args.trim();
+        let Some(theme) = resolve_interactive_theme(context, theme_name) else {
+            return Ok(status_action(format!("未找到主题: {theme_name}")));
+        };
+        Config::patch_settings_with_roots(
+            SettingsScope::Project,
+            &Config::global_dir(),
+            &context.cwd,
+            json!({ "theme": theme_name }),
+        )?;
+        context.config.theme = Some(theme_name.to_string());
+        return Ok(pi_tui::ChatAction::Many(vec![
+            status_action(format!("主题已切换为: {}", theme.name)),
+            context.sync_theme_options(theme),
+        ]));
     }
-    let items = context
-        .resources
-        .themes()
-        .iter()
-        .map(|theme| {
-            pi_tui::PickerItem::new(theme.name.clone(), theme.name.clone(), theme.source.clone())
-        })
-        .collect::<Vec<_>>();
-    if items.is_empty() {
-        return status_action("未加载主题。");
+    let mut items = vec![
+        pi_tui::PickerItem::new("dark", "dark", "built-in"),
+        pi_tui::PickerItem::new("light", "light", "built-in"),
+        pi_tui::PickerItem::new("solarized", "solarized", "built-in"),
+    ];
+    items.extend(context.resources.themes().iter().map(|theme| {
+        pi_tui::PickerItem::new(theme.name.clone(), theme.name.clone(), theme.source.clone())
+    }));
+    Ok(pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
+        "主题", "/theme", items,
+    )))
+}
+
+fn resolve_interactive_theme(context: &InteractiveContext, theme_name: &str) -> Option<Theme> {
+    match theme_name {
+        name if name.eq_ignore_ascii_case("dark") => Some(Theme::dark()),
+        name if name.eq_ignore_ascii_case("light") => Some(Theme::light()),
+        name if name.eq_ignore_ascii_case("solarized") => Some(Theme::solarized()),
+        name => context.resources.resolve_theme(Some(name)),
     }
-    pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new("主题", "/theme", items))
 }
 
 fn format_template_status(context: &InteractiveContext) -> String {
@@ -863,7 +894,7 @@ fn handle_language_command(context: &mut InteractiveContext, args: &str) -> pi_t
                 .ui_text()
                 .language_updated(language),
         ),
-        pi_tui::ChatAction::SetOptions(context.options.clone()),
+        pi_tui::ChatAction::SetOptions(Box::new(context.options.clone())),
     ])
 }
 

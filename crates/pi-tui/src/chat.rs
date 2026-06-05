@@ -4,6 +4,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use pi_theme::Theme;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -56,6 +57,7 @@ pub struct ChatOptions {
     pub title: String,
     pub model_label: String,
     pub status: String,
+    pub theme: Theme,
     pub resource_summary: String,
     pub command_hints: Vec<String>,
     pub key_hints: Vec<String>,
@@ -69,6 +71,7 @@ impl ChatOptions {
             title: "Pi".to_string(),
             model_label: model_label.into(),
             status: "就绪".to_string(),
+            theme: Theme::dark(),
             resource_summary: "资源: 0 技能, 0 提示, 0 主题".to_string(),
             command_hints: Vec::new(),
             key_hints: vec![
@@ -147,7 +150,7 @@ pub enum ChatAction {
     PushLine(ChatLine),
     Clear,
     Quit,
-    SetOptions(ChatOptions),
+    SetOptions(Box<ChatOptions>),
     OpenPicker(ChatPicker),
     Many(Vec<Self>),
 }
@@ -202,7 +205,7 @@ impl ChatApp {
                 self.scroll.scroll_to_bottom();
             }
             ChatAction::Quit => self.should_quit = true,
-            ChatAction::SetOptions(options) => self.options = options,
+            ChatAction::SetOptions(options) => self.options = *options,
             ChatAction::OpenPicker(picker) => self.picker = Some(PickerState::new(picker)),
             ChatAction::Many(actions) => {
                 for action in actions {
@@ -825,10 +828,11 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
     ])
     .areas(area);
 
-    let dim = Style::default().fg(Color::DarkGray);
-    let accent = Style::default().fg(Color::Cyan);
+    let palette = ChatPalette::from_theme(&app.options.theme);
+    let dim = Style::default().fg(palette.muted);
+    let accent = Style::default().fg(palette.accent);
 
-    let body_lines = conversation_lines(&app.lines);
+    let body_lines = conversation_lines(&app.lines, &palette);
     let conversation_height = body.height.saturating_sub(1);
     let scroll_offset = app.scroll.resolve(body_lines.len(), conversation_height);
     frame.render_widget(
@@ -873,9 +877,9 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
     frame.render_widget(Paragraph::new(footer_line(app, status)).style(dim), footer);
 
     if let Some(picker) = &app.picker {
-        render_picker(frame, app, picker, body);
+        render_picker(frame, app, picker, body, &palette);
     } else if app.editor.text().trim_start().starts_with('/') {
-        render_slash_completion(frame, app, input);
+        render_slash_completion(frame, app, input, &palette);
     }
 }
 
@@ -886,9 +890,57 @@ fn editor_height(editor: &EditorState) -> u16 {
         .clamp(3, 8)
 }
 
-fn conversation_lines(lines: &[ChatLine]) -> Vec<Line<'_>> {
-    let dim = Style::default().fg(Color::DarkGray);
-    let accent = Style::default().fg(Color::Cyan);
+#[derive(Debug, Clone, Copy)]
+struct ChatPalette {
+    foreground: Color,
+    muted: Color,
+    accent: Color,
+    success: Color,
+    border: Color,
+    selection: Color,
+}
+
+impl ChatPalette {
+    fn from_theme(theme: &Theme) -> Self {
+        let fallback = Self::default();
+        Self {
+            foreground: color_from_hex(&theme.colors.foreground).unwrap_or(fallback.foreground),
+            muted: color_from_hex(&theme.colors.muted).unwrap_or(fallback.muted),
+            accent: color_from_hex(&theme.colors.accent).unwrap_or(fallback.accent),
+            success: color_from_hex(&theme.colors.success).unwrap_or(fallback.success),
+            border: color_from_hex(&theme.ui.border).unwrap_or(fallback.border),
+            selection: color_from_hex(&theme.ui.selection).unwrap_or(fallback.selection),
+        }
+    }
+}
+
+impl Default for ChatPalette {
+    fn default() -> Self {
+        Self {
+            foreground: Color::Reset,
+            muted: Color::DarkGray,
+            accent: Color::Cyan,
+            success: Color::Green,
+            border: Color::DarkGray,
+            selection: Color::DarkGray,
+        }
+    }
+}
+
+fn color_from_hex(value: &str) -> Option<Color> {
+    let hex = value.trim().strip_prefix('#')?;
+    if hex.len() != 6 || !hex.is_ascii() {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(Color::Rgb(r, g, b))
+}
+
+fn conversation_lines<'a>(lines: &'a [ChatLine], palette: &ChatPalette) -> Vec<Line<'a>> {
+    let dim = Style::default().fg(palette.muted);
+    let accent = Style::default().fg(palette.accent);
     lines
         .iter()
         .map(|line| {
@@ -896,7 +948,7 @@ fn conversation_lines(lines: &[ChatLine]) -> Vec<Line<'_>> {
                 Span::styled(
                     format!("{}: ", line.role),
                     match line.role {
-                        "Assistant" => Style::default().fg(Color::Green),
+                        "Assistant" => Style::default().fg(palette.success),
                         "Status" => dim,
                         _ => accent,
                     }
@@ -935,7 +987,12 @@ fn footer_line(app: &ChatApp, status: &str) -> String {
     )
 }
 
-fn render_slash_completion(frame: &mut ratatui::Frame<'_>, app: &ChatApp, input_area: Rect) {
+fn render_slash_completion(
+    frame: &mut ratatui::Frame<'_>,
+    app: &ChatApp,
+    input_area: Rect,
+    palette: &ChatPalette,
+) {
     let items = app.filtered_slash_commands();
     if items.is_empty() {
         return;
@@ -954,7 +1011,7 @@ fn render_slash_completion(frame: &mut ratatui::Frame<'_>, app: &ChatApp, input_
         .map(|(idx, item)| {
             let style = if idx == 0 {
                 Style::default()
-                    .fg(Color::Cyan)
+                    .fg(palette.accent)
                     .add_modifier(Modifier::BOLD)
             } else {
                 Style::default()
@@ -964,7 +1021,7 @@ fn render_slash_completion(frame: &mut ratatui::Frame<'_>, app: &ChatApp, input_
                 Span::raw("  "),
                 Span::styled(
                     item.description.as_str(),
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(palette.muted),
                 ),
             ])
         })
@@ -974,14 +1031,20 @@ fn render_slash_completion(frame: &mut ratatui::Frame<'_>, app: &ChatApp, input_
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
+                .border_style(Style::default().fg(palette.border))
                 .title(" commands "),
         ),
         area,
     );
 }
 
-fn render_picker(frame: &mut ratatui::Frame<'_>, _app: &ChatApp, picker: &PickerState, body: Rect) {
+fn render_picker(
+    frame: &mut ratatui::Frame<'_>,
+    _app: &ChatApp,
+    picker: &PickerState,
+    body: Rect,
+    palette: &ChatPalette,
+) {
     let width = body.width.saturating_sub(4).min(110);
     let height = body.height.saturating_sub(2).clamp(6, 18);
     let area = Rect {
@@ -993,14 +1056,15 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, _app: &ChatApp, picker: &Picker
     let items = picker.filtered_items();
     let visible = usize::from(height.saturating_sub(4));
     let lines = std::iter::once(Line::from(vec![
-        Span::styled("filter: ", Style::default().fg(Color::DarkGray)),
+        Span::styled("filter: ", Style::default().fg(palette.muted)),
         Span::raw(picker.query.as_str()),
     ]))
     .chain(items.iter().take(visible).enumerate().map(|(idx, item)| {
         let selected = idx == picker.selected.min(items.len().saturating_sub(1));
         let style = if selected {
             Style::default()
-                .fg(Color::Cyan)
+                .fg(palette.foreground)
+                .bg(palette.selection)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default()
@@ -1011,7 +1075,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, _app: &ChatApp, picker: &Picker
             Span::raw("  "),
             Span::styled(
                 item.description.as_str(),
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(palette.muted),
             ),
         ])
     }))
@@ -1021,7 +1085,7 @@ fn render_picker(frame: &mut ratatui::Frame<'_>, _app: &ChatApp, picker: &Picker
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray))
+                .border_style(Style::default().fg(palette.border))
                 .title(format!(" {} ", picker.picker.title)),
         ),
         area,

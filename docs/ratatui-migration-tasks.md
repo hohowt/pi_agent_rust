@@ -83,7 +83,7 @@
   - [ ] Persist project/global settings through existing config paths.
 - [ ] Port theme picker.
   - [x] Open a generic theme picker.
-  - [ ] Apply selected themes immediately and persist project theme.
+  - [x] Apply selected themes immediately and persist project theme.
 - [ ] Port prompt template picker.
   - [x] Open a generic prompt template picker.
   - [x] Apply selected template content immediately.
@@ -107,7 +107,7 @@
 - [ ] `/login`: restore OAuth/API-key interactive login flows.
 - [ ] `/logout`: restore provider credential removal flow.
 - [ ] `/settings`: restore full interactive settings overlay.
-- [ ] `/theme`: apply selected theme, not just show/select the item.
+- [x] `/theme`: apply selected theme, not just show/select the item.
 - [x] `/template`: apply selected prompt template content immediately.
 - [ ] `/history` and `/resume`: load selected session.
 - [ ] `/tree`: restore full tree UI instead of basic status text.

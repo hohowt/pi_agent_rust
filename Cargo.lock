@@ -2551,6 +2551,7 @@ version = "0.1.16"
 dependencies = [
  "anyhow",
  "crossterm",
+ "pi-theme",
  "ratatui",
  "tokio",
  "tokio-stream",
