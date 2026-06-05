@@ -160,7 +160,7 @@
       markdown regressions.
 - [x] Add regression tests for single Esc, double Esc, picker Esc, and Ctrl+C.
 - [x] Add regression tests for slash prefix filtering and Tab completion.
-- [ ] Add regression tests for model/session/theme/template picker selection.
+- [x] Add regression tests for model/session/theme/template picker selection.
 - [ ] Add regression tests for session load after picker selection.
 - [ ] Add regression tests for live tool progress rendering.
 - [ ] Run `cargo fmt --all --check`.

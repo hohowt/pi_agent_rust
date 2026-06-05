@@ -1963,4 +1963,27 @@ mod tests {
         assert_eq!(app.editor.text(), "");
         assert!(app.picker.is_none());
     }
+
+    #[test]
+    fn picker_selection_submits_theme_template_and_session_commands() {
+        for (prefix, value) in [
+            ("/theme", "solarized"),
+            ("/template", "review"),
+            ("/resume", "/tmp/session.jsonl"),
+        ] {
+            let mut app = ChatApp::new(ChatOptions::new("model"));
+            app.editor.set_text(prefix);
+            app.apply_action(ChatAction::OpenPicker(ChatPicker::new(
+                "picker",
+                prefix,
+                vec![PickerItem::new(value, value, "item")],
+            )));
+
+            let outcome = app.handle_key(key(KeyCode::Enter));
+
+            assert_eq!(outcome, EventOutcome::Submit(format!("{prefix} {value}")));
+            assert_eq!(app.editor.text(), "");
+            assert!(app.picker.is_none());
+        }
+    }
 }
