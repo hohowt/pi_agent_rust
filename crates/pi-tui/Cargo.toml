@@ -8,13 +8,14 @@ license-file = "../../LICENSE"
 [lib]
 name = "pi_tui"
 path = "src/lib.rs"
-test = false
+test = true
 doctest = false
 
 [dependencies]
 anyhow = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 pi-theme = { workspace = true }
+pulldown-cmark = { workspace = true }
 ratatui = { workspace = true, features = [
     "scrolling-regions",
     "unstable-backend-writer",

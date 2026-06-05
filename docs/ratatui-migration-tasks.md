@@ -30,10 +30,11 @@
   - [ ] Mouse wheel routing with terminal mouse-mode/native selection policy.
 - [x] Replace `bubbles::TextArea` with a local editor state.
 - [ ] Restore multi-line editing, cursor left/right/up/down, word movement,
-      delete, history navigation, and Shift+Enter newline insertion.
-  - [x] Multi-line editing and Shift+Enter newline insertion.
+      delete, history navigation, and Ctrl+J newline insertion.
+  - [x] Multi-line editing and Ctrl+J newline insertion.
   - [x] Cursor left/right/up/down movement.
   - [x] Word movement and delete/backspace behavior.
+  - [x] Ctrl+W word deletion and Ctrl+U line-start deletion parity.
   - [ ] Editing history navigation.
 - [ ] Restore paste, bracketed paste, drag/drop file paths, quoted paths, and
       file/image reference expansion.
@@ -57,12 +58,16 @@
   - [x] Live tool progress state.
   - [ ] Collapsed previews, expansion, error styling, and Shift+Tab thinking visibility.
 - [ ] Restore startup OAuth hint and startup changelog rendering.
+- [x] Keep the composer and footer directly below the rendered conversation
+      content instead of pinning them to the terminal bottom when content is short.
+- [x] Render a Codex-style single-line footer with left status/model context and
+      right key hints.
 
 ## 4. Markdown Rendering
 
-- [ ] Replace `glamour` rendering with `pulldown-cmark` to ratatui lines.
-- [ ] Preserve code block indentation and wrapping settings.
-- [ ] Add markdown fixtures for headings, lists, code blocks, links, and CJK text.
+- [x] Replace `glamour` rendering with `pulldown-cmark` to ratatui lines.
+- [x] Preserve code block indentation and wrapping settings.
+- [x] Add markdown fixtures for headings, lists, code blocks, links, and CJK text.
 - [ ] Evaluate useful pieces from `markdown-tui-explorer` before adding new code.
 
 ## 5. Overlays And Secondary UIs
@@ -151,6 +156,8 @@
 - [ ] Add resize tests for compact terminals.
 - [ ] Add scroll/input fairness tests.
 - [ ] Add paste and IME-adjacent input tests where possible.
+- [x] Enable and run `pi-tui` unit tests for editor, picker, layout, footer, and
+      markdown regressions.
 - [ ] Add regression tests for single Esc, double Esc, picker Esc, and Ctrl+C.
 - [ ] Add regression tests for slash prefix filtering and Tab completion.
 - [ ] Add regression tests for model/session/theme/template picker selection.

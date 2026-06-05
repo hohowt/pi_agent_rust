@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use pi_theme::Theme;
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -76,7 +77,7 @@ impl ChatOptions {
             command_hints: Vec::new(),
             key_hints: vec![
                 "Enter: 发送".to_string(),
-                "Shift+Enter: newline".to_string(),
+                "Ctrl+J: newline".to_string(),
                 "Ctrl+C/Esc: 退出".to_string(),
                 "/help".to_string(),
             ],
@@ -270,10 +271,6 @@ impl ChatApp {
                 }
             }
             KeyCode::Enter => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    self.editor.insert_char('\n');
-                    return EventOutcome::None;
-                }
                 if self.editor.text().trim_start().starts_with('/') {
                     if let Some(item) = self.filtered_slash_commands().first() {
                         let current_command = slash_command_token(self.editor.text());
@@ -290,10 +287,12 @@ impl ChatApp {
             KeyCode::Char(ch) => {
                 self.last_escape = None;
                 if key.modifiers.contains(KeyModifiers::CONTROL) {
-                    match ch {
+                    match ch.to_ascii_lowercase() {
                         'a' => self.editor.move_to_line_start(),
                         'e' => self.editor.move_to_line_end(),
+                        'j' => self.editor.insert_char('\n'),
                         'u' => self.editor.delete_to_line_start(),
+                        'w' => self.editor.delete_word_backward(),
                         'k' => self.editor.delete_to_line_end(),
                         _ => {}
                     }
@@ -826,19 +825,17 @@ pub async fn run_minimal_chat_loop(
 
 fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
     let area = frame.area();
-    let input_height = editor_height(&app.editor);
-    let [body, input, footer] = Layout::vertical([
-        Constraint::Min(3),
-        Constraint::Length(input_height),
-        Constraint::Length(1),
-    ])
-    .areas(area);
-
     let palette = ChatPalette::from_theme(&app.options.theme);
     let dim = Style::default().fg(palette.muted);
     let accent = Style::default().fg(palette.accent);
 
     let body_lines = conversation_lines(&app.lines, &palette);
+    let layout = chat_layout(area, body_lines.len(), editor_height(&app.editor));
+    frame.render_widget(Clear, area);
+
+    let body = layout.body;
+    let input = layout.input;
+    let footer = layout.footer;
     let conversation_height = body.height.saturating_sub(1);
     let scroll_offset = app.scroll.resolve(body_lines.len(), conversation_height);
     frame.render_widget(
@@ -880,12 +877,59 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
     } else {
         app.options.status.as_str()
     };
-    frame.render_widget(Paragraph::new(footer_line(app, status)).style(dim), footer);
+    frame.render_widget(
+        Paragraph::new(footer_line(app, status, footer.width, &palette)).style(dim),
+        footer,
+    );
 
     if let Some(picker) = &app.picker {
-        render_picker(frame, app, picker, body, &palette);
+        render_picker(frame, app, picker, area, &palette);
     } else if app.editor.text().trim_start().starts_with('/') {
         render_slash_completion(frame, app, input, &palette);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ChatLayout {
+    body: Rect,
+    input: Rect,
+    footer: Rect,
+}
+
+fn chat_layout(
+    area: Rect,
+    conversation_line_count: usize,
+    desired_input_height: u16,
+) -> ChatLayout {
+    let footer_height = u16::from(area.height > 1);
+    let input_height = desired_input_height
+        .max(1)
+        .min(area.height.saturating_sub(footer_height));
+    let max_body_height = area
+        .height
+        .saturating_sub(input_height)
+        .saturating_sub(footer_height);
+    let desired_body_height = u16::try_from(conversation_line_count.saturating_add(1))
+        .unwrap_or(u16::MAX)
+        .clamp(u16::from(max_body_height > 0), max_body_height);
+    let used_height = desired_body_height
+        .saturating_add(input_height)
+        .saturating_add(footer_height)
+        .min(area.height);
+    let used = Rect {
+        height: used_height,
+        ..area
+    };
+    let [body, input, footer] = Layout::vertical([
+        Constraint::Length(desired_body_height),
+        Constraint::Length(input_height),
+        Constraint::Length(footer_height),
+    ])
+    .areas(used);
+    ChatLayout {
+        body,
+        input,
+        footer,
     }
 }
 
@@ -944,29 +988,315 @@ fn color_from_hex(value: &str) -> Option<Color> {
     Some(Color::Rgb(r, g, b))
 }
 
-fn conversation_lines<'a>(lines: &'a [ChatLine], palette: &ChatPalette) -> Vec<Line<'a>> {
+fn conversation_lines(lines: &[ChatLine], palette: &ChatPalette) -> Vec<Line<'static>> {
     let dim = Style::default().fg(palette.muted);
     let accent = Style::default().fg(palette.accent);
-    lines
-        .iter()
-        .map(|line| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{}: ", line.role),
-                    match line.role {
-                        "Assistant" => Style::default().fg(palette.success),
-                        "Status" => dim,
-                        _ => accent,
-                    }
-                    .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(line.text.as_str()),
-            ])
-        })
+    let mut rendered = Vec::new();
+    for line in lines {
+        let role_style = match line.role {
+            "Assistant" => Style::default().fg(palette.success),
+            "Status" => dim,
+            _ => accent,
+        }
+        .add_modifier(Modifier::BOLD);
+        let body = if line.role == "Assistant" {
+            markdown_lines(&line.text, palette)
+        } else {
+            plain_text_lines(&line.text)
+        };
+        append_role_lines(&mut rendered, line.role, role_style, body);
+    }
+    rendered
+}
+
+fn plain_text_lines(text: &str) -> Vec<Line<'static>> {
+    if text.is_empty() {
+        return vec![Line::from("")];
+    }
+    text.split('\n')
+        .map(|line| Line::from(line.to_string()))
         .collect()
 }
 
-fn footer_line(app: &ChatApp, status: &str) -> String {
+fn append_role_lines(
+    output: &mut Vec<Line<'static>>,
+    role: &str,
+    role_style: Style,
+    mut body: Vec<Line<'static>>,
+) {
+    let prefix = format!("{role}: ");
+    let continuation = " ".repeat(prefix.width());
+    if body.is_empty() {
+        body.push(Line::from(""));
+    }
+    for (idx, mut line) in body.into_iter().enumerate() {
+        let mut spans = Vec::with_capacity(line.spans.len() + 1);
+        if idx == 0 {
+            spans.push(Span::styled(prefix.clone(), role_style));
+        } else {
+            spans.push(Span::raw(continuation.clone()));
+        }
+        spans.append(&mut line.spans);
+        output.push(Line::from(spans));
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MarkdownRenderState {
+    style: Style,
+    quote_depth: usize,
+    in_code_block: bool,
+}
+
+struct MarkdownRenderer<'a> {
+    lines: Vec<Line<'static>>,
+    spans: Vec<Span<'static>>,
+    state: MarkdownRenderState,
+    style_stack: Vec<Style>,
+    list_stack: Vec<Option<u64>>,
+    link_stack: Vec<String>,
+    palette: &'a ChatPalette,
+}
+
+impl<'a> MarkdownRenderer<'a> {
+    fn new(palette: &'a ChatPalette) -> Self {
+        Self {
+            lines: Vec::new(),
+            spans: Vec::new(),
+            state: MarkdownRenderState {
+                style: Style::default().fg(palette.foreground),
+                quote_depth: 0,
+                in_code_block: false,
+            },
+            style_stack: vec![Style::default().fg(palette.foreground)],
+            list_stack: Vec::new(),
+            link_stack: Vec::new(),
+            palette,
+        }
+    }
+
+    fn into_lines(mut self) -> Vec<Line<'static>> {
+        self.flush_line();
+        if self.lines.is_empty() {
+            self.lines.push(Line::from(""));
+        }
+        self.lines
+    }
+
+    fn handle_start(&mut self, tag: Tag<'_>) {
+        match tag {
+            Tag::Heading { level, .. } => {
+                self.flush_line();
+                let marker = heading_marker(level);
+                self.spans.push(Span::styled(
+                    marker,
+                    Style::default()
+                        .fg(self.palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                ));
+                self.push_style(
+                    Style::default()
+                        .fg(self.palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
+            Tag::BlockQuote(_) => {
+                self.flush_line();
+                self.state.quote_depth = self.state.quote_depth.saturating_add(1);
+            }
+            Tag::CodeBlock(kind) => {
+                self.flush_line();
+                self.state.in_code_block = true;
+                if let CodeBlockKind::Fenced(info) = kind
+                    && !info.is_empty()
+                {
+                    self.lines.push(Line::from(vec![Span::styled(
+                        format!("```{info}"),
+                        Style::default().fg(self.palette.muted),
+                    )]));
+                }
+            }
+            Tag::List(start) => self.list_stack.push(start),
+            Tag::Item => {
+                self.flush_line();
+                let indent = "  ".repeat(self.list_stack.len().saturating_sub(1));
+                let marker = if let Some(Some(next)) = self.list_stack.last_mut() {
+                    let marker = format!("{indent}{next}. ");
+                    *next = next.saturating_add(1);
+                    marker
+                } else {
+                    format!("{indent}- ")
+                };
+                self.spans.push(Span::styled(
+                    marker,
+                    Style::default().fg(self.palette.muted),
+                ));
+            }
+            Tag::Emphasis => self.push_style(self.state.style.add_modifier(Modifier::ITALIC)),
+            Tag::Strong => self.push_style(self.state.style.add_modifier(Modifier::BOLD)),
+            Tag::Strikethrough => {
+                self.push_style(self.state.style.add_modifier(Modifier::CROSSED_OUT));
+            }
+            Tag::Link { dest_url, .. } => {
+                self.link_stack.push(dest_url.to_string());
+                self.push_style(
+                    self.state
+                        .style
+                        .fg(self.palette.accent)
+                        .add_modifier(Modifier::UNDERLINED),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_end(&mut self, tag: TagEnd) {
+        match tag {
+            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::Item => {
+                self.flush_line();
+                if matches!(tag, TagEnd::Heading(_)) {
+                    self.pop_style();
+                }
+            }
+            TagEnd::BlockQuote(_) => {
+                self.flush_line();
+                self.state.quote_depth = self.state.quote_depth.saturating_sub(1);
+            }
+            TagEnd::CodeBlock => {
+                self.state.in_code_block = false;
+            }
+            TagEnd::List(_) => {
+                self.flush_line();
+                self.list_stack.pop();
+            }
+            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
+                self.pop_style();
+            }
+            TagEnd::Link => {
+                if let Some(dest) = self.link_stack.pop()
+                    && !dest.is_empty()
+                {
+                    self.spans.push(Span::styled(
+                        format!(" ({dest})"),
+                        Style::default().fg(self.palette.muted),
+                    ));
+                }
+                self.pop_style();
+            }
+            _ => {}
+        }
+    }
+
+    fn append_text(&mut self, text: &str) {
+        if self.state.in_code_block {
+            self.append_code_block_lines(text);
+        } else {
+            append_text_spans(&mut self.spans, text, self.state.style);
+        }
+    }
+
+    fn append_code_block_lines(&mut self, text: &str) {
+        let style = Style::default()
+            .fg(self.palette.foreground)
+            .bg(self.palette.selection);
+        for line in text.split_inclusive('\n') {
+            let line = line.strip_suffix('\n').unwrap_or(line);
+            self.lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(line.to_string(), style),
+            ]));
+        }
+    }
+
+    fn flush_line(&mut self) {
+        flush_markdown_line(&mut self.lines, &mut self.spans, self.state.quote_depth);
+    }
+
+    fn push_style(&mut self, style: Style) {
+        self.style_stack.push(style);
+        self.state.style = style;
+    }
+
+    fn pop_style(&mut self) {
+        if self.style_stack.len() > 1 {
+            self.style_stack.pop();
+        }
+        self.state.style = self.style_stack.last().copied().unwrap_or_default();
+    }
+}
+
+fn markdown_lines(text: &str, palette: &ChatPalette) -> Vec<Line<'static>> {
+    let mut options = Options::empty();
+    options.insert(Options::ENABLE_STRIKETHROUGH);
+    options.insert(Options::ENABLE_TABLES);
+    let mut renderer = MarkdownRenderer::new(palette);
+
+    for event in Parser::new_ext(text, options) {
+        match event {
+            Event::Start(tag) => renderer.handle_start(tag),
+            Event::End(tag) => renderer.handle_end(tag),
+            Event::Text(value) => renderer.append_text(value.as_ref()),
+            Event::Code(value) => renderer.spans.push(Span::styled(
+                format!("`{value}`"),
+                Style::default()
+                    .fg(palette.accent)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Event::SoftBreak => renderer.spans.push(Span::raw(" ")),
+            Event::HardBreak => renderer.flush_line(),
+            Event::Rule => {
+                renderer.flush_line();
+                renderer.lines.push(Line::from(Span::styled(
+                    "─".repeat(16),
+                    Style::default().fg(palette.muted),
+                )));
+            }
+            _ => {}
+        }
+    }
+    renderer.into_lines()
+}
+
+fn heading_marker(level: HeadingLevel) -> String {
+    let level = match level {
+        HeadingLevel::H1 => 1,
+        HeadingLevel::H2 => 2,
+        HeadingLevel::H3 => 3,
+        HeadingLevel::H4 => 4,
+        HeadingLevel::H5 => 5,
+        HeadingLevel::H6 => 6,
+    };
+    format!("{} ", "#".repeat(level))
+}
+
+fn append_text_spans(spans: &mut Vec<Span<'static>>, text: &str, style: Style) {
+    for (idx, part) in text.split('\n').enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw(" "));
+        }
+        if !part.is_empty() {
+            spans.push(Span::styled(part.to_string(), style));
+        }
+    }
+}
+
+fn flush_markdown_line(
+    lines: &mut Vec<Line<'static>>,
+    spans: &mut Vec<Span<'static>>,
+    quote_depth: usize,
+) {
+    if spans.is_empty() {
+        return;
+    }
+    let mut line_spans = Vec::new();
+    if quote_depth > 0 {
+        line_spans.push(Span::raw(format!("{} ", ">".repeat(quote_depth))));
+    }
+    line_spans.append(spans);
+    lines.push(Line::from(line_spans));
+}
+
+fn footer_line(app: &ChatApp, status: &str, width: u16, palette: &ChatPalette) -> Line<'static> {
     if app.editor.text().trim_start().starts_with('/') {
         let hints = if app.options.command_hints.is_empty() {
             vec![
@@ -980,17 +1310,27 @@ fn footer_line(app: &ChatApp, status: &str) -> String {
         } else {
             app.options.command_hints.clone()
         };
-        return format!("commands: {}", hints.join("  "));
+        return Line::from(vec![
+            Span::styled("› ", Style::default().fg(palette.accent)),
+            Span::styled("commands", Style::default().fg(palette.accent)),
+            Span::raw("  "),
+            Span::styled(hints.join("  "), Style::default().fg(palette.muted)),
+        ]);
     }
-    let hints = if app.options.key_hints.is_empty() {
-        String::new()
-    } else {
-        format!("  |  {}", app.options.key_hints.join("  |  "))
-    };
-    format!(
-        "{}  |  {}  |  模型: {}  |  {}{}",
-        app.options.title, status, app.options.model_label, app.options.resource_summary, hints
-    )
+    let left = format!(
+        "{}  {}  模型: {}  {}",
+        app.options.title, status, app.options.model_label, app.options.resource_summary
+    );
+    let right = app.options.key_hints.join("  ");
+    let gap = usize::from(width)
+        .saturating_sub(left.width())
+        .saturating_sub(right.width())
+        .max(2);
+    Line::from(vec![
+        Span::styled(left, Style::default().fg(palette.foreground)),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(right, Style::default().fg(palette.muted)),
+    ])
 }
 
 fn render_slash_completion(
@@ -1125,10 +1465,13 @@ fn default_slash_commands() -> Vec<SlashCommandItem> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChatAction, ChatApp, ChatOptions, ChatPicker, ConversationScroll, EditorState,
-        EventOutcome, PickerItem, normalize_pasted_text,
+        ChatAction, ChatApp, ChatLine, ChatOptions, ChatPalette, ChatPicker, ConversationScroll,
+        EditorState, EventOutcome, PickerItem, chat_layout, conversation_lines, footer_line,
+        normalize_pasted_text,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::layout::Rect;
+    use ratatui::style::Modifier;
     use unicode_width::UnicodeWidthStr;
 
     fn key(code: KeyCode) -> KeyEvent {
@@ -1254,11 +1597,105 @@ mod tests {
         app.handle_key(key(KeyCode::Left));
         app.handle_key(key(KeyCode::Char('b')));
         app.handle_key(modified_key(KeyCode::Char('e'), KeyModifiers::CONTROL));
-        app.handle_key(modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.handle_key(modified_key(KeyCode::Char('j'), KeyModifiers::CONTROL));
         app.handle_key(key(KeyCode::Char('d')));
 
         assert_eq!(app.editor.text(), "abc\nd");
         assert_eq!(app.editor.cursor_position(), (1, 1));
+    }
+
+    #[test]
+    fn chat_app_ctrl_w_deletes_previous_word() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("alpha beta gamma");
+
+        app.handle_key(modified_key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+
+        assert_eq!(app.editor.text(), "alpha beta ");
+        assert_eq!(app.editor.cursor_position(), (0, "alpha beta ".width()));
+    }
+
+    #[test]
+    fn shift_enter_submits_instead_of_inserting_newline() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("send me");
+
+        let outcome = app.handle_key(modified_key(KeyCode::Enter, KeyModifiers::SHIFT));
+
+        assert_eq!(outcome, EventOutcome::Submit("send me".to_string()));
+        assert_eq!(app.editor.text(), "");
+    }
+
+    #[test]
+    fn chat_layout_keeps_composer_below_content_not_screen_bottom() {
+        let area = Rect::new(0, 0, 80, 30);
+
+        let layout = chat_layout(area, 2, 3);
+
+        assert_eq!(layout.body, Rect::new(0, 0, 80, 3));
+        assert_eq!(layout.input, Rect::new(0, 3, 80, 3));
+        assert_eq!(layout.footer, Rect::new(0, 6, 80, 1));
+        assert!(layout.footer.bottom() < area.bottom());
+    }
+
+    #[test]
+    fn chat_layout_uses_full_height_when_content_overflows() {
+        let area = Rect::new(0, 0, 80, 12);
+
+        let layout = chat_layout(area, 100, 3);
+
+        assert_eq!(layout.body.height, 8);
+        assert_eq!(layout.input.y, 8);
+        assert_eq!(layout.footer.y, 11);
+    }
+
+    #[test]
+    fn assistant_markdown_renders_core_blocks() {
+        let palette = ChatPalette::default();
+        let lines = conversation_lines(
+            &[ChatLine::assistant(
+                "# 标题\n- item\n[link](https://example.com)\n```rust\nlet x = 1;\n```",
+            )],
+            &palette,
+        );
+        let rendered = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("Assistant: # 标题"));
+        assert!(rendered.contains("- item"));
+        assert!(rendered.contains("link (https://example.com)"));
+        assert!(rendered.contains("  let x = 1;"));
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style.add_modifier.contains(Modifier::BOLD))
+        );
+    }
+
+    #[test]
+    fn footer_line_uses_statusline_shape_and_ctrl_j_hint() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.options.key_hints = vec!["Enter: 发送".to_string(), "Ctrl+J: newline".to_string()];
+
+        let line = footer_line(&app, "就绪", 80, &ChatPalette::default());
+        let rendered = line
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("Pi  就绪  模型: model"));
+        assert!(rendered.contains("Ctrl+J: newline"));
+        assert!(!rendered.contains("Shift+Enter"));
     }
 
     #[test]

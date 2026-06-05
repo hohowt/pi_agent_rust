@@ -2552,6 +2552,7 @@ dependencies = [
  "anyhow",
  "crossterm",
  "pi-theme",
+ "pulldown-cmark",
  "ratatui",
  "tokio",
  "tokio-stream",

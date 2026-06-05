@@ -206,7 +206,7 @@ impl InteractiveContext {
             "Ctrl+L: 模型".to_string(),
             "Ctrl+O: 工具".to_string(),
             "Shift+Tab: 思考".to_string(),
-            "Shift+Enter: newline".to_string(),
+            "Ctrl+J: newline".to_string(),
             "Ctrl+C: quit".to_string(),
             "Esc Esc: 会话".to_string(),
             "/help".to_string(),
