@@ -9,7 +9,7 @@ use crate::config::{Config, Language};
 use crate::model::ThinkingLevel;
 use crate::models::ModelEntry;
 use crate::package_manager::ResolvedResource;
-use crate::resources::{ResourceCliOptions, ResourceLoader};
+use crate::resources::{ResourceCliOptions, ResourceLoader, parse_command_args, substitute_args};
 use crate::runtime::RuntimeHandle;
 use crate::session::SessionEntry;
 use std::fmt::Write as _;
@@ -339,13 +339,22 @@ async fn handle_submitted_input(
     action_tx: pi_tui::ChatActionSender,
 ) -> Result<pi_tui::ChatAction> {
     if let Some((command, args)) = SlashCommand::parse(&input) {
-        return handle_slash_command(agent, context, command, args).await;
+        return handle_slash_command(agent, context, command, args, action_tx).await;
     }
 
+    run_user_prompt(agent, input, action_tx, false).await
+}
+
+async fn run_user_prompt(
+    agent: &mut AgentSession,
+    input: String,
+    action_tx: pi_tui::ChatActionSender,
+    echo_user: bool,
+) -> Result<pi_tui::ChatAction> {
     let event_sink = action_tx.clone();
     let assistant = agent
         .run_with_content(
-            vec![ContentBlock::Text(TextContent::new(input))],
+            vec![ContentBlock::Text(TextContent::new(input.clone()))],
             move |event| {
                 if let Some(line) = format_agent_event(&event) {
                     let _ = event_sink
@@ -363,9 +372,15 @@ async fn handle_submitted_input(
         })
         .collect::<Vec<_>>()
         .join("\n");
-    Ok(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::assistant(
-        answer,
-    )))
+    let assistant_line = pi_tui::ChatAction::PushLine(pi_tui::ChatLine::assistant(answer));
+    if echo_user {
+        Ok(pi_tui::ChatAction::Many(vec![
+            pi_tui::ChatAction::PushLine(pi_tui::ChatLine::user(input)),
+            assistant_line,
+        ]))
+    } else {
+        Ok(assistant_line)
+    }
 }
 
 async fn handle_slash_command(
@@ -373,6 +388,7 @@ async fn handle_slash_command(
     context: &mut InteractiveContext,
     command: SlashCommand,
     args: &str,
+    action_tx: pi_tui::ChatActionSender,
 ) -> Result<pi_tui::ChatAction> {
     let action = match command {
         SlashCommand::Help => status_action(SlashCommand::help_text(context.language())),
@@ -393,7 +409,9 @@ async fn handle_slash_command(
         ]),
         SlashCommand::Resume | SlashCommand::History => handle_history_command(context, args),
         SlashCommand::Theme => handle_theme_command(context, args),
-        SlashCommand::Template => handle_template_command(context, args),
+        SlashCommand::Template => {
+            return handle_template_command(agent, context, args, action_tx).await;
+        }
         SlashCommand::Compact => handle_compact_command(agent).await?,
         SlashCommand::Name => handle_name_command(agent, args).await?,
         SlashCommand::Language => handle_language_command(context, args),
@@ -737,9 +755,35 @@ fn format_template_status(context: &InteractiveContext) -> String {
     out
 }
 
-fn handle_template_command(context: &InteractiveContext, args: &str) -> pi_tui::ChatAction {
+async fn handle_template_command(
+    agent: &mut AgentSession,
+    context: &InteractiveContext,
+    args: &str,
+    action_tx: pi_tui::ChatActionSender,
+) -> Result<pi_tui::ChatAction> {
     if !args.trim().is_empty() {
-        return status_action(format!("Prompt template 待插入: {}", args.trim()));
+        let mut parsed = parse_command_args(args);
+        let Some(name) = parsed.first().cloned() else {
+            return Ok(status_action("Prompt template 名称不能为空。"));
+        };
+        let Some(template) = context
+            .resources
+            .prompts()
+            .iter()
+            .find(|prompt| prompt.name == name)
+        else {
+            return Ok(status_action(format!("未找到 prompt template: {name}")));
+        };
+        parsed.remove(0);
+        let expanded = substitute_args(&template.content, &parsed);
+        let expanded = expanded.trim().to_string();
+        if expanded.is_empty() {
+            return Ok(status_action(format!(
+                "Prompt template 展开为空: {}",
+                template.name
+            )));
+        }
+        return run_user_prompt(agent, expanded, action_tx, true).await;
     }
     let items = context
         .resources
@@ -754,13 +798,13 @@ fn handle_template_command(context: &InteractiveContext, args: &str) -> pi_tui::
         })
         .collect::<Vec<_>>();
     if items.is_empty() {
-        return status_action("未加载 prompt template。");
+        return Ok(status_action("未加载 prompt template。"));
     }
-    pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
+    Ok(pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
         "Prompt templates",
         "/template",
         items,
-    ))
+    )))
 }
 
 async fn handle_compact_command(agent: &mut AgentSession) -> Result<pi_tui::ChatAction> {

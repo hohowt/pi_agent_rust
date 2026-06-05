@@ -86,7 +86,7 @@
   - [ ] Apply selected themes immediately and persist project theme.
 - [ ] Port prompt template picker.
   - [x] Open a generic prompt template picker.
-  - [ ] Insert/apply selected template content to the editor.
+  - [x] Apply selected template content immediately.
 - [ ] Port language picker.
   - [x] Open a generic language picker.
   - [ ] Persist language changes and refresh all UI/prompt text consistently.
@@ -108,7 +108,7 @@
 - [ ] `/logout`: restore provider credential removal flow.
 - [ ] `/settings`: restore full interactive settings overlay.
 - [ ] `/theme`: apply selected theme, not just show/select the item.
-- [ ] `/template`: insert selected prompt template content.
+- [x] `/template`: apply selected prompt template content immediately.
 - [ ] `/history` and `/resume`: load selected session.
 - [ ] `/tree`: restore full tree UI instead of basic status text.
 - [ ] `/fork`: restore branch picker/fork flow.
