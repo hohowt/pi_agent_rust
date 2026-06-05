@@ -11,14 +11,31 @@ from the current ratatui chat surface.
 ## Summary
 
 The current ratatui main flow is functional for basic chat, slash parsing, model
-switching by explicit argument, thinking-level changes, basic session status,
-codegraph init/sync/status, and basic tool/status event streaming.
+switching, thinking-level changes, basic session status, codegraph
+init/sync/status, basic tool/status event streaming, session resume, theme
+selection, prompt template execution, language selection, file/image reference
+expansion, assistant text streaming, and thinking delta streaming.
 
-The highest-impact regressions are session switching, settings/theme/template
-application, credential flows, export/copy/share, full tree/fork flows, and live
-assistant/thinking rendering. Most affected features are not hard failures; they
-show compatibility messages, open generic pickers without applying the selected
-object, or display read-only status where the previous UI performed an action.
+The highest-impact remaining regressions are credential flows, export/copy/share,
+full tree/fork flows, the editable settings overlay, reload diagnostics, compact
+progress details, and richer model/session picker parity. Most affected features
+are not hard failures; they show compatibility messages, open generic pickers
+without the full codex/pi-tui affordances, or display read-only status where the
+previous UI performed a richer action.
+
+## Now Available In Ratatui Main Flow
+
+| Feature | Current behavior | Evidence |
+|---|---|---|
+| `/history`, `/resume`, double-Esc session picker | Opens a generic picker. Selecting a session submits `/resume <path>` and replaces active visible conversation and agent history. | `src/interactive.rs:1077-1142`, `tests/interactive_session_resume.rs:48-111` |
+| `/theme` | Opens a generic picker. Selecting a theme applies it immediately and persists the project theme. | `src/interactive.rs:884-929` |
+| `/template` | Opens a generic picker. Selecting a template expands it and submits the resulting prompt immediately. | `src/interactive.rs:938-988` |
+| `/language` | Opens a generic picker or accepts an explicit language, persists the setting, and refreshes footer/options text. | `src/interactive.rs:1013-1075` |
+| Assistant streaming | Assistant text deltas stream into the active assistant message; thinking deltas stream into a Thinking line. | `src/interactive.rs:361-436`, `crates/pi-tui/src/chat.rs:170-265` |
+| File/image reference expansion | Submitted `@path`, single path, and `file://` references are expanded into text/image content blocks. | `src/interactive.rs:438-520`, `tests/interactive_session_resume.rs:177-223` |
+| Markdown rendering | Assistant messages are rendered through the ratatui markdown path for headings, lists, links, code fences, and CJK text. | `crates/pi-tui/src/chat.rs:1144-1352`, `crates/pi-tui/src/chat.rs:1959-1989` |
+| Editing history | Up/down navigation restores previous prompts and the current draft. | `crates/pi-tui/src/chat.rs:318-435`, `crates/pi-tui/src/chat.rs:1811-1855` |
+| Mouse wheel | Mouse wheel routing is wired through the terminal mouse capture policy. | `crates/pi-tui/src/chat.rs:289-303`, `crates/pi-tui/src/terminal.rs:29-77` |
 
 ## Unavailable In Ratatui Main Flow
 
@@ -35,11 +52,7 @@ object, or display read-only status where the previous UI performed an action.
 
 | Feature | Current behavior | Evidence | Missing behavior |
 |---|---|---|---|
-| `/history`, `/resume`, double-Esc session picker | Opens a generic picker. Selecting a session submits `/resume <path>`, but the handler only prints “session load will run after ratatui session switch is wired.” | `crates/pi-tui/src/chat.rs:247-255`, `src/interactive.rs:826-852` | Load selected session, replace active conversation state, restore branch metadata and search/delete/filter behavior. |
 | `/settings` | Displays a read-only settings summary. | `src/interactive.rs:384`, `src/interactive.rs:625-633` | Editable settings overlay, queue/compaction/double-Esc/editor/autocomplete settings, project/global persistence. |
-| `/theme` | Opens a generic picker. Selecting a theme submits `/theme <name>`, but the handler returns “theme switch pending.” | `src/interactive.rs:395`, `src/interactive.rs:711-727` | Immediate theme application and project theme persistence. |
-| `/template` | Opens a generic picker. Selecting a template submits `/template <name>`, but the handler returns “prompt template pending insertion.” | `src/interactive.rs:396`, `src/interactive.rs:740-764` | Insert/apply selected template content into the editor. |
-| `/language` | Picker exists and explicit `zh|en` changes in-memory UI labels/status. | `src/interactive.rs:399`, `src/interactive.rs:789-823` | Persist language changes and refresh all UI/prompt text consistently through config paths. |
 | `/tree` | Displays basic leaf/path counts. | `src/interactive.rs:389`, `src/interactive.rs:610-622` | Full tree navigation, branch selection, summary prompts, and custom fork prompt flow. |
 | `/compact` | Runs compaction and returns only “completed”; event callback is discarded. | `src/interactive.rs:397`, `src/interactive.rs:766-768` | Progress/events and resulting summary in the TUI. |
 | `/reload` | Displays current resource counts. It does not reload resources. | `src/interactive.rs:385`, `src/interactive.rs:636-642` | Reload models/resources, refresh autocomplete catalog, show diagnostics. |
@@ -51,12 +64,7 @@ object, or display read-only status where the previous UI performed an action.
 
 | Area | Current behavior | Evidence | Missing behavior |
 |---|---|---|---|
-| Assistant streaming | Tool/status/retry/compaction lines can stream via frame redraws, but assistant text is only appended after the provider call completes. | `src/interactive.rs:345-368`, `docs/ratatui-migration-tasks.md:46-52` | Stream assistant text deltas into the active assistant message; render thinking deltas incrementally. |
 | Tool rendering | Live tool progress appears as status lines. | `src/interactive.rs:888-966`, `docs/ratatui-migration-tasks.md:53-58` | Collapsed previews, full output expansion, per-tool error styling, thinking visibility toggle. |
-| Markdown rendering | Conversation lines are ratatui spans/paragraphs, but assistant markdown is still plain text. | `docs/ratatui-migration-tasks.md:61-66` | Headings, lists, code fences, links, CJK wrapping, code-like presentation via pulldown-cmark. |
-| File/image reference expansion | Paste and quoted `file://` path normalization exist, but submitted content is still sent as a single text block. | `src/interactive.rs:347-349`, `docs/ratatui-migration-tasks.md:38-42` | Expand file references and attach image content blocks. |
-| Editing history | Local editor supports multiline/cursor/word/delete editing, but there is no input history source. | `docs/ratatui-migration-tasks.md:31-37` | Up/down history navigation for prior prompts. |
-| Mouse wheel | Keyboard scrollback exists. Mouse wheel policy is not fully restored because native selection/copy and mouse-mode routing remain unresolved. | `docs/ratatui-migration-tasks.md:26-30` | Mouse wheel routing with terminal mouse-mode/native selection policy. |
 
 ## Secondary UI Gaps
 
@@ -69,15 +77,15 @@ object, or display read-only status where the previous UI performed an action.
 
 ## Priority Order
 
-1. Session switching: `/history`, `/resume`, and double-Esc currently look
-   usable but do not load the selected session.
-2. Settings/theme/template application: pickers create a strong expectation of
-   an applied change, but selection currently returns a placeholder/status.
-3. Credential and data egress flows: `/login`, `/logout`, `/export`, `/copy`,
+1. Credential and data egress flows: `/login`, `/logout`, `/export`, `/copy`,
    `/share` are explicit unavailable-command paths.
-4. Tree/fork parity: `/tree` is read-only summary; `/fork` is unavailable.
-5. Live assistant/thinking rendering and markdown: affects the core chat
-   experience even when commands are not used.
+2. Tree/fork parity: `/tree` is read-only summary; `/fork` is unavailable.
+3. Settings/reload/compact parity: these commands exist but still lack the full
+   interactive flows and diagnostics.
+4. Picker richness: model/session pickers work, but still lack grouping,
+   metadata, delete confirmation, filter states, and cwd/all-session toggles.
+5. Tool presentation: live progress exists, but collapsed previews, expansion,
+   per-tool error styling, and Shift+Tab thinking visibility remain open.
 
 ## Audit Commands
 
