@@ -45,6 +45,14 @@ impl ChatLine {
     }
 
     #[must_use]
+    pub fn thinking(text: impl Into<String>) -> Self {
+        Self {
+            role: "Thinking",
+            text: text.into(),
+        }
+    }
+
+    #[must_use]
     pub fn status(text: impl Into<String>) -> Self {
         Self {
             role: "Status",
@@ -162,6 +170,7 @@ impl ChatPicker {
 pub enum ChatAction {
     PushLine(ChatLine),
     AppendAssistantText(String),
+    AppendThinkingText(String),
     ReplaceLines(Vec<ChatLine>),
     Clear,
     Quit,
@@ -220,6 +229,7 @@ impl ChatApp {
             .lines
             .iter_mut()
             .rev()
+            .take_while(|line| line.role != "You")
             .find(|line| line.role == "Assistant")
         {
             line.text.push_str(text);
@@ -229,10 +239,26 @@ impl ChatApp {
         self.scroll.mark_content_changed();
     }
 
+    fn append_thinking_text(&mut self, text: &str) {
+        if let Some(line) = self
+            .lines
+            .iter_mut()
+            .rev()
+            .take_while(|line| line.role != "You")
+            .find(|line| line.role == "Thinking")
+        {
+            line.text.push_str(text);
+        } else {
+            self.lines.push(ChatLine::thinking(text.to_string()));
+        }
+        self.scroll.mark_content_changed();
+    }
+
     fn apply_action(&mut self, action: ChatAction) {
         match action {
             ChatAction::PushLine(line) => self.push_line(line),
             ChatAction::AppendAssistantText(text) => self.append_assistant_text(&text),
+            ChatAction::AppendThinkingText(text) => self.append_thinking_text(&text),
             ChatAction::ReplaceLines(lines) => {
                 self.lines = lines;
                 self.scroll.scroll_to_bottom();
@@ -1114,6 +1140,7 @@ fn conversation_lines(lines: &[ChatLine], palette: &ChatPalette) -> Vec<Line<'st
     for line in lines {
         let role_style = match line.role {
             "Assistant" => Style::default().fg(palette.success),
+            "Thinking" => Style::default().fg(palette.muted),
             "Status" => dim,
             _ => accent,
         }
@@ -2023,5 +2050,33 @@ mod tests {
         assert_eq!(app.lines.len(), 1);
         assert_eq!(app.lines[0].role(), "Assistant");
         assert_eq!(app.lines[0].text(), "hello world");
+    }
+
+    #[test]
+    fn assistant_text_delta_starts_new_line_after_user_prompt() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.apply_action(ChatAction::AppendAssistantText(
+            "previous answer".to_string(),
+        ));
+        app.push_line(ChatLine::user("next prompt"));
+
+        app.apply_action(ChatAction::AppendAssistantText("new answer".to_string()));
+
+        assert_eq!(app.lines.len(), 3);
+        assert_eq!(app.lines[0].text(), "previous answer");
+        assert_eq!(app.lines[2].role(), "Assistant");
+        assert_eq!(app.lines[2].text(), "new answer");
+    }
+
+    #[test]
+    fn thinking_delta_appends_to_active_thinking_line() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+
+        app.apply_action(ChatAction::AppendThinkingText("reason".to_string()));
+        app.apply_action(ChatAction::AppendThinkingText("ing".to_string()));
+
+        assert_eq!(app.lines.len(), 1);
+        assert_eq!(app.lines[0].role(), "Thinking");
+        assert_eq!(app.lines[0].text(), "reasoning");
     }
 }

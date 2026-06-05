@@ -50,7 +50,7 @@
 - [ ] Render assistant text, thinking deltas, retry events, and compaction
       events incrementally instead of after the turn finishes.
   - [x] Render retry and compaction events incrementally.
-  - [ ] Render assistant text and thinking deltas incrementally.
+  - [x] Render assistant text and thinking deltas incrementally.
 - [ ] Port tool rendering and thinking visibility.
   - [x] Render live tool progress state as status lines.
 - [ ] Restore collapsed tool previews, full tool output expansion, tool

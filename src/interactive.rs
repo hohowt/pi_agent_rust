@@ -378,6 +378,10 @@ async fn run_user_prompt(
                 let _ = event_sink.send(pi_tui::ChatAction::AppendAssistantText(delta.to_string()));
                 return;
             }
+            if let Some(delta) = assistant_thinking_delta(&event) {
+                let _ = event_sink.send(pi_tui::ChatAction::AppendThinkingText(delta.to_string()));
+                return;
+            }
             if let Some(line) = format_agent_event(&event) {
                 let _ =
                     event_sink.send(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::status(line)));
@@ -417,6 +421,16 @@ fn assistant_text_delta(event: &AgentEvent) -> Option<&str> {
     match event {
         AgentEvent::MessageUpdate {
             assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
+            ..
+        } if !delta.is_empty() => Some(delta.as_str()),
+        _ => None,
+    }
+}
+
+fn assistant_thinking_delta(event: &AgentEvent) -> Option<&str> {
+    match event {
+        AgentEvent::MessageUpdate {
+            assistant_message_event: AssistantMessageEvent::ThinkingDelta { delta, .. },
             ..
         } if !delta.is_empty() => Some(delta.as_str()),
         _ => None,
