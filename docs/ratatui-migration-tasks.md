@@ -74,9 +74,10 @@
 
 - [ ] Port model selector overlay.
   - [x] Open a generic model picker for `/model`.
-  - [ ] Restore model details, auth/credential warnings, provider grouping,
-        current-model marker, thinking suffix handling, and direct Enter
-        selection parity.
+  - [x] Show model details, provider label, current-model marker, thinking
+        levels, and direct Enter selection parity without command backfill.
+  - [ ] Restore full provider grouping UI and auth/credential warnings for
+        unavailable models.
 - [ ] Port session picker overlay.
   - [x] Open a generic session picker from `/history`, `/resume`, and double-Esc.
   - [x] Load selected sessions and replace active conversation state.

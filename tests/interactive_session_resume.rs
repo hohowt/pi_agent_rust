@@ -3,16 +3,19 @@ use futures::Stream;
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::interactive::{
-    expand_submitted_content_for_tui, format_agent_event, resume_session_from_path_for_tui,
+    build_model_picker_items, expand_submitted_content_for_tui, format_agent_event,
+    resume_session_from_path_for_tui,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
 };
-use pi::provider::{Context, Provider, StreamOptions};
+use pi::models::ModelEntry;
+use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
 use pi::session::{Session, SessionMessage};
 use pi::sync::Mutex;
 use pi::tools::{ToolOutput, ToolRegistry};
 use serde_json::json;
+use std::collections::HashMap;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -63,6 +66,33 @@ fn empty_agent_session(cwd: &Path) -> AgentSession {
         false,
         ResolvedCompactionSettings::default(),
     )
+}
+
+fn model_entry(provider: &str, id: &str, reasoning: bool, api_key: Option<&str>) -> ModelEntry {
+    ModelEntry {
+        model: Model {
+            id: id.to_string(),
+            name: format!("{provider} {id}"),
+            api: "openai-chat".to_string(),
+            provider: provider.to_string(),
+            base_url: String::new(),
+            reasoning,
+            input: vec![InputType::Text, InputType::Image],
+            cost: ModelCost {
+                input: 0.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+            context_window: 128_000,
+            max_tokens: 4096,
+            headers: HashMap::new(),
+        },
+        api_key: api_key.map(ToString::to_string),
+        headers: HashMap::new(),
+        auth_header: true,
+        compat: None,
+    }
 }
 
 #[test]
@@ -130,6 +160,32 @@ fn picker_selected_resume_session_replaces_visible_and_agent_history() {
         }
         other => panic!("expected restored user message, got {other:?}"),
     }
+}
+
+#[test]
+fn model_picker_items_include_current_marker_and_details_without_changing_submit_value() {
+    let current = model_entry("anthropic", "claude-sonnet-4-5", true, Some("key"));
+    let other = model_entry("openai", "gpt-4o", false, None);
+
+    let items = build_model_picker_items(&current, &[current.clone(), other]);
+
+    assert_eq!(items[0].value, "anthropic/claude-sonnet-4-5");
+    assert!(
+        items[0]
+            .label
+            .starts_with("* anthropic / claude-sonnet-4-5")
+    );
+    assert!(items[0].description.contains("auth: configured"));
+    assert!(items[0].description.contains("input: text,image"));
+    assert!(
+        items[0]
+            .description
+            .contains("thinking: off,minimal,low,medium,high")
+    );
+    assert_eq!(items[1].value, "openai/gpt-4o");
+    assert!(items[1].label.starts_with("  openai / gpt-4o"));
+    assert!(items[1].description.contains("auth: missing"));
+    assert!(items[1].description.contains("thinking: off"));
 }
 
 #[test]

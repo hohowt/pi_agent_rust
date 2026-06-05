@@ -641,19 +641,72 @@ async fn handle_model_command(
 }
 
 fn model_picker_items(context: &InteractiveContext) -> Vec<pi_tui::PickerItem> {
-    context
-        .available_models
+    build_model_picker_items(&context.current_model, &context.available_models)
+}
+
+#[doc(hidden)]
+pub fn build_model_picker_items(
+    current_model: &ModelEntry,
+    available_models: &[ModelEntry],
+) -> Vec<pi_tui::PickerItem> {
+    let current = model_label(current_model);
+    available_models
         .iter()
         .map(|entry| {
-            let label = model_label(entry);
-            let reasoning = if entry.model.reasoning {
-                "thinking"
-            } else {
-                "no-thinking"
-            };
-            pi_tui::PickerItem::new(label.clone(), label, reasoning)
+            let value = model_label(entry);
+            let marker = if value == current { "* " } else { "  " };
+            let label = format!("{marker}{} / {}", entry.model.provider, entry.model.id);
+            pi_tui::PickerItem::new(label, value, model_picker_description(entry))
         })
         .collect()
+}
+
+fn model_picker_description(entry: &ModelEntry) -> String {
+    format!(
+        "{} | auth: {} | input: {} | ctx: {} | max: {} | thinking: {}",
+        entry.model.name,
+        model_auth_status(entry),
+        model_input_summary(entry),
+        entry.model.context_window,
+        entry.model.max_tokens,
+        entry
+            .available_thinking_levels()
+            .into_iter()
+            .map(|level| level.to_string())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn model_auth_status(entry: &ModelEntry) -> &'static str {
+    if !entry.auth_header {
+        return "keyless";
+    }
+    if entry
+        .api_key
+        .as_ref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        "configured"
+    } else {
+        "missing"
+    }
+}
+
+fn model_input_summary(entry: &ModelEntry) -> String {
+    if entry.model.input.is_empty() {
+        return "text".to_string();
+    }
+    entry
+        .model
+        .input
+        .iter()
+        .map(|input| match input {
+            crate::provider::InputType::Text => "text",
+            crate::provider::InputType::Image => "image",
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 async fn handle_thinking_command(
