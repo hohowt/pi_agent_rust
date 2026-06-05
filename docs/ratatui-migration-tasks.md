@@ -164,6 +164,6 @@
 - [x] Add regression tests for model/session/theme/template picker selection.
 - [x] Add regression tests for session load after picker selection.
 - [x] Add regression tests for live tool progress rendering.
-- [ ] Run `cargo fmt --all --check`.
-- [ ] Run `cargo check --all-targets`.
-- [ ] Run `cargo clippy --all-targets -- -D warnings`.
+- [x] Run `cargo fmt --all --check`.
+- [x] Run `cargo check --all-targets`.
+- [x] Run `cargo clippy --all-targets -- -D warnings`.
