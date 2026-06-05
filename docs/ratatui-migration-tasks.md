@@ -35,7 +35,7 @@
   - [x] Cursor left/right/up/down movement.
   - [x] Word movement and delete/backspace behavior.
   - [x] Ctrl+W word deletion and Ctrl+U line-start deletion parity.
-  - [ ] Editing history navigation.
+  - [x] Editing history navigation.
 - [ ] Restore paste, bracketed paste, drag/drop file paths, quoted paths, and
       file/image reference expansion.
   - [x] Paste and bracketed paste insertion through editor state.

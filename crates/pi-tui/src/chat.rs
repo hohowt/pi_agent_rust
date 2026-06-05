@@ -167,6 +167,7 @@ struct ChatApp {
     picker: Option<PickerState>,
     last_escape: Option<Instant>,
     scroll: ConversationScroll,
+    history: InputHistory,
 }
 
 impl ChatApp {
@@ -180,6 +181,7 @@ impl ChatApp {
             picker: None,
             last_escape: None,
             scroll: ConversationScroll::new(),
+            history: InputHistory::new(),
         }
     }
 
@@ -189,6 +191,7 @@ impl ChatApp {
             return None;
         }
         self.editor.clear();
+        self.history.record(input.clone());
         self.lines.push(ChatLine::user(input.clone()));
         self.scroll.mark_content_changed();
         Some(input)
@@ -330,8 +333,12 @@ impl ChatApp {
                     self.editor.move_right();
                 }
             }
-            KeyCode::Up => self.editor.move_up(),
-            KeyCode::Down => self.editor.move_down(),
+            KeyCode::Up => {
+                self.handle_up();
+            }
+            KeyCode::Down => {
+                self.handle_down();
+            }
             KeyCode::PageUp => self.scroll.scroll_up(10),
             KeyCode::PageDown => self.scroll.scroll_down(10),
             KeyCode::Home => self.scroll.scroll_to_top(),
@@ -339,6 +346,26 @@ impl ChatApp {
             _ => {}
         }
         EventOutcome::None
+    }
+
+    fn handle_up(&mut self) {
+        if self.editor.is_first_line() {
+            if let Some(value) = self.history.previous(self.editor.text()) {
+                self.editor.set_text(value);
+            }
+        } else {
+            self.editor.move_up();
+        }
+    }
+
+    fn handle_down(&mut self) {
+        if self.editor.is_last_line() {
+            if let Some(value) = self.history.next() {
+                self.editor.set_text(value);
+            }
+        } else {
+            self.editor.move_down();
+        }
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent) -> EventOutcome {
@@ -539,6 +566,14 @@ impl EditorState {
         (row, column)
     }
 
+    fn is_first_line(&self) -> bool {
+        self.line_start_before(self.cursor) == 0
+    }
+
+    fn is_last_line(&self) -> bool {
+        self.line_end_from(self.cursor) == self.text.len()
+    }
+
     fn prev_boundary(&self, at: usize) -> Option<usize> {
         if at == 0 {
             return None;
@@ -585,6 +620,62 @@ impl EditorState {
             width = next_width;
         }
         end
+    }
+}
+
+#[derive(Debug)]
+struct InputHistory {
+    entries: Vec<String>,
+    cursor: Option<usize>,
+    draft: String,
+}
+
+impl Default for InputHistory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl InputHistory {
+    const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            cursor: None,
+            draft: String::new(),
+        }
+    }
+
+    fn record(&mut self, input: String) {
+        if self.entries.last() != Some(&input) {
+            self.entries.push(input);
+        }
+        self.cursor = None;
+        self.draft.clear();
+    }
+
+    fn previous(&mut self, current: &str) -> Option<String> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let next_cursor = if let Some(cursor) = self.cursor {
+            cursor.saturating_sub(1)
+        } else {
+            self.draft = current.to_string();
+            self.entries.len().saturating_sub(1)
+        };
+        self.cursor = Some(next_cursor);
+        self.entries.get(next_cursor).cloned()
+    }
+
+    fn next(&mut self) -> Option<String> {
+        let cursor = self.cursor?;
+        if cursor + 1 >= self.entries.len() {
+            self.cursor = None;
+            return Some(std::mem::take(&mut self.draft));
+        }
+        let next_cursor = cursor + 1;
+        self.cursor = Some(next_cursor);
+        self.entries.get(next_cursor).cloned()
     }
 }
 
@@ -1624,6 +1715,68 @@ mod tests {
 
         assert_eq!(outcome, EventOutcome::Submit("send me".to_string()));
         assert_eq!(app.editor.text(), "");
+    }
+
+    #[test]
+    fn up_down_navigate_submitted_input_history() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("first");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            EventOutcome::Submit("first".to_string())
+        );
+        app.editor.set_text("second");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            EventOutcome::Submit("second".to_string())
+        );
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.editor.text(), "second");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.editor.text(), "first");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.editor.text(), "first");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.editor.text(), "second");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.editor.text(), "");
+    }
+
+    #[test]
+    fn history_navigation_restores_current_draft() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("previous");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            EventOutcome::Submit("previous".to_string())
+        );
+        app.editor.set_text("draft");
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.editor.text(), "previous");
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.editor.text(), "draft");
+    }
+
+    #[test]
+    fn multiline_up_down_prefer_vertical_cursor_movement_inside_editor() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("history");
+        assert_eq!(
+            app.handle_key(key(KeyCode::Enter)),
+            EventOutcome::Submit("history".to_string())
+        );
+        app.editor.set_text("top\nbottom");
+        app.editor.move_to_line_start();
+
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(app.editor.text(), "top\nbottom");
+        assert_eq!(app.editor.cursor_position(), (0, 0));
+
+        app.handle_key(key(KeyCode::Down));
+        assert_eq!(app.editor.text(), "top\nbottom");
+        assert_eq!(app.editor.cursor_position(), (1, 0));
     }
 
     #[test]
