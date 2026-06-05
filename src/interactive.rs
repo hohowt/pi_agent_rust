@@ -1050,7 +1050,8 @@ fn format_command_unavailable(command: SlashCommand) -> String {
     }
 }
 
-fn format_agent_event(event: &AgentEvent) -> Option<String> {
+#[doc(hidden)]
+pub fn format_agent_event(event: &AgentEvent) -> Option<String> {
     match event {
         AgentEvent::TurnStart { turn_index, .. } => Some(format!("turn {turn_index}: 开始")),
         AgentEvent::TurnEnd {

@@ -2,14 +2,15 @@ use async_trait::async_trait;
 use futures::Stream;
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
-use pi::interactive::resume_session_from_path_for_tui;
+use pi::interactive::{format_agent_event, resume_session_from_path_for_tui};
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
 };
 use pi::provider::{Context, Provider, StreamOptions};
 use pi::session::{Session, SessionMessage};
 use pi::sync::Mutex;
-use pi::tools::ToolRegistry;
+use pi::tools::{ToolOutput, ToolRegistry};
+use serde_json::json;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -127,4 +128,47 @@ fn picker_selected_resume_session_replaces_visible_and_agent_history() {
         }
         other => panic!("expected restored user message, got {other:?}"),
     }
+}
+
+#[test]
+fn live_tool_progress_events_render_status_lines() {
+    let start = pi::agent::AgentEvent::ToolExecutionStart {
+        tool_call_id: "call-1".to_string(),
+        tool_name: "read".to_string(),
+        args: json!({ "path": "Cargo.toml" }),
+    };
+    assert_eq!(
+        format_agent_event(&start).as_deref(),
+        Some(r#"tool: read 开始 {"path":"Cargo.toml"}"#)
+    );
+
+    let update = pi::agent::AgentEvent::ToolExecutionUpdate {
+        tool_call_id: "call-1".to_string(),
+        tool_name: "read".to_string(),
+        args: json!({ "path": "Cargo.toml" }),
+        partial_result: ToolOutput {
+            content: vec![ContentBlock::Text(TextContent::new("loaded 32 lines"))],
+            details: None,
+            is_error: false,
+        },
+    };
+    assert_eq!(
+        format_agent_event(&update).as_deref(),
+        Some("tool: read 更新 loaded 32 lines")
+    );
+
+    let end = pi::agent::AgentEvent::ToolExecutionEnd {
+        tool_call_id: "call-1".to_string(),
+        tool_name: "read".to_string(),
+        result: ToolOutput {
+            content: Vec::new(),
+            details: Some(json!({ "bytes": 1234 })),
+            is_error: false,
+        },
+        is_error: false,
+    };
+    assert_eq!(
+        format_agent_event(&end).as_deref(),
+        Some(r#"tool: read 完成 {"bytes":1234}"#)
+    );
 }
