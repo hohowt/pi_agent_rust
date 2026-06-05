@@ -6,7 +6,7 @@ use pi_prompt::PromptCatalog;
 
 use crate::agent::{AgentEvent, AgentSession};
 use crate::config::{Config, Language, SettingsScope};
-use crate::model::{Message, ThinkingLevel, UserContent};
+use crate::model::{AssistantMessageEvent, Message, ThinkingLevel, UserContent};
 use crate::models::ModelEntry;
 use crate::package_manager::ResolvedResource;
 use crate::resources::{ResourceCliOptions, ResourceLoader, parse_command_args, substitute_args};
@@ -18,6 +18,7 @@ use serde_json::json;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Debug, Clone)]
 pub enum PendingInput {
@@ -365,17 +366,33 @@ async fn run_user_prompt(
     echo_user: bool,
 ) -> Result<pi_tui::ChatAction> {
     let event_sink = action_tx.clone();
+    let streamed_assistant_text = Arc::new(AtomicBool::new(false));
+    let streamed_assistant_text_for_events = Arc::clone(&streamed_assistant_text);
     let content =
         expand_submitted_content_for_tui(&input, &context.cwd, context.config.image_auto_resize())?;
     let user_line = content_blocks_to_text(&content);
     let assistant = agent
         .run_with_content(content, move |event| {
+            if let Some(delta) = assistant_text_delta(&event) {
+                streamed_assistant_text_for_events.store(true, Ordering::SeqCst);
+                let _ = event_sink.send(pi_tui::ChatAction::AppendAssistantText(delta.to_string()));
+                return;
+            }
             if let Some(line) = format_agent_event(&event) {
                 let _ =
                     event_sink.send(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::status(line)));
             }
         })
         .await?;
+    if streamed_assistant_text.load(Ordering::SeqCst) {
+        return if echo_user {
+            Ok(pi_tui::ChatAction::PushLine(pi_tui::ChatLine::user(
+                user_line,
+            )))
+        } else {
+            Ok(pi_tui::ChatAction::Many(Vec::new()))
+        };
+    }
     let answer = assistant
         .content
         .iter()
@@ -393,6 +410,16 @@ async fn run_user_prompt(
         ]))
     } else {
         Ok(assistant_line)
+    }
+}
+
+fn assistant_text_delta(event: &AgentEvent) -> Option<&str> {
+    match event {
+        AgentEvent::MessageUpdate {
+            assistant_message_event: AssistantMessageEvent::TextDelta { delta, .. },
+            ..
+        } if !delta.is_empty() => Some(delta.as_str()),
+        _ => None,
     }
 }
 

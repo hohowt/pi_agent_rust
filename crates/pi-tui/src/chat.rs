@@ -161,6 +161,7 @@ impl ChatPicker {
 #[derive(Debug, Clone)]
 pub enum ChatAction {
     PushLine(ChatLine),
+    AppendAssistantText(String),
     ReplaceLines(Vec<ChatLine>),
     Clear,
     Quit,
@@ -214,9 +215,24 @@ impl ChatApp {
         self.scroll.mark_content_changed();
     }
 
+    fn append_assistant_text(&mut self, text: &str) {
+        if let Some(line) = self
+            .lines
+            .iter_mut()
+            .rev()
+            .find(|line| line.role == "Assistant")
+        {
+            line.text.push_str(text);
+        } else {
+            self.lines.push(ChatLine::assistant(text.to_string()));
+        }
+        self.scroll.mark_content_changed();
+    }
+
     fn apply_action(&mut self, action: ChatAction) {
         match action {
             ChatAction::PushLine(line) => self.push_line(line),
+            ChatAction::AppendAssistantText(text) => self.append_assistant_text(&text),
             ChatAction::ReplaceLines(lines) => {
                 self.lines = lines;
                 self.scroll.scroll_to_bottom();
@@ -1995,5 +2011,17 @@ mod tests {
             assert_eq!(app.editor.text(), "");
             assert!(app.picker.is_none());
         }
+    }
+
+    #[test]
+    fn assistant_text_delta_appends_to_active_assistant_line() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+
+        app.apply_action(ChatAction::AppendAssistantText("hello".to_string()));
+        app.apply_action(ChatAction::AppendAssistantText(" world".to_string()));
+
+        assert_eq!(app.lines.len(), 1);
+        assert_eq!(app.lines[0].role(), "Assistant");
+        assert_eq!(app.lines[0].text(), "hello world");
     }
 }
