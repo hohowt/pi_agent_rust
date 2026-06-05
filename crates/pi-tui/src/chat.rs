@@ -375,7 +375,7 @@ impl ChatApp {
                 });
                 self.picker = None;
                 if let Some(command) = command {
-                    self.editor.set_text(command.clone());
+                    self.editor.clear();
                     return EventOutcome::Submit(command);
                 }
             }
@@ -1124,7 +1124,10 @@ fn default_slash_commands() -> Vec<SlashCommandItem> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConversationScroll, EditorState, normalize_pasted_text};
+    use super::{
+        ChatAction, ChatApp, ChatOptions, ChatPicker, ConversationScroll, EditorState,
+        EventOutcome, PickerItem, normalize_pasted_text,
+    };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use unicode_width::UnicodeWidthStr;
 
@@ -1256,5 +1259,29 @@ mod tests {
 
         assert_eq!(app.editor.text(), "abc\nd");
         assert_eq!(app.editor.cursor_position(), (1, 1));
+    }
+
+    #[test]
+    fn picker_selection_submits_without_leaving_command_in_editor() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("/model");
+        app.apply_action(ChatAction::OpenPicker(ChatPicker::new(
+            "模型",
+            "/model",
+            vec![PickerItem::new(
+                "deepseek/deepseek-reasoner",
+                "deepseek/deepseek-reasoner",
+                "reasoning",
+            )],
+        )));
+
+        let outcome = app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(
+            outcome,
+            EventOutcome::Submit("/model deepseek/deepseek-reasoner".to_string())
+        );
+        assert_eq!(app.editor.text(), "");
+        assert!(app.picker.is_none());
     }
 }
