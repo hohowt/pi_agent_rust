@@ -43,6 +43,8 @@
   - [x] File/image reference expansion into submitted content.
 - [x] Port keyboard bindings to crossterm key events.
 - [x] Restore slash command prefix completion and Tab completion.
+- [x] Keep slash command completion above the composer without covering the
+      live input row.
 - [x] Restore generic picker overlay skeleton.
 - [x] Port streaming assistant updates to frame-request redraws.
   - [x] Stream agent status/tool/retry/compaction events through frame-request redraws.

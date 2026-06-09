@@ -1547,19 +1547,13 @@ fn render_slash_completion(
     palette: &ChatPalette,
 ) {
     let items = app.filtered_slash_commands();
-    if items.is_empty() {
+    let Some(area) = slash_completion_area(input_area, items.len()) else {
         return;
-    }
-    let height = u16::try_from(items.len().min(8) + 2).unwrap_or(10);
-    let area = Rect {
-        x: input_area.x,
-        y: input_area.y.saturating_sub(height),
-        width: input_area.width.min(96),
-        height,
     };
+    let visible_items = usize::from(area.height.saturating_sub(2));
     let lines = items
         .iter()
-        .take(8)
+        .take(visible_items)
         .enumerate()
         .map(|(idx, item)| {
             let style = if idx == 0 {
@@ -1589,6 +1583,29 @@ fn render_slash_completion(
         ),
         area,
     );
+}
+
+fn slash_completion_area(input_area: Rect, item_count: usize) -> Option<Rect> {
+    if item_count == 0 {
+        return None;
+    }
+    let max_rows_above_input = input_area.y;
+    if max_rows_above_input < 3 {
+        return None;
+    }
+    let visible_items = item_count
+        .min(8)
+        .min(usize::from(max_rows_above_input.saturating_sub(2)));
+    if visible_items == 0 {
+        return None;
+    }
+    let height = u16::try_from(visible_items.saturating_add(2)).unwrap_or(max_rows_above_input);
+    Some(Rect {
+        x: input_area.x,
+        y: input_area.y - height,
+        width: input_area.width.min(96),
+        height,
+    })
 }
 
 fn render_picker(
@@ -1674,7 +1691,7 @@ mod tests {
     use super::{
         ChatAction, ChatApp, ChatLine, ChatOptions, ChatPalette, ChatPicker, ConversationScroll,
         EditorState, EventOutcome, PickerItem, chat_layout, composer_height, composer_layout,
-        conversation_lines, footer_line, normalize_pasted_text,
+        conversation_lines, footer_line, normalize_pasted_text, slash_completion_area,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -2021,6 +2038,23 @@ mod tests {
 
         app.editor.set_text("one\ntwo\nthree");
         assert_eq!(composer_height(&app.editor, &footer), 6);
+    }
+
+    #[test]
+    fn slash_completion_area_stays_above_textarea() {
+        let input = Rect::new(2, 4, 77, 1);
+
+        let area = slash_completion_area(input, 20).expect("completion area");
+
+        assert_eq!(area, Rect::new(2, 0, 77, 4));
+        assert!(area.bottom() <= input.y);
+    }
+
+    #[test]
+    fn slash_completion_area_hides_when_it_would_cover_input() {
+        let input = Rect::new(2, 2, 77, 1);
+
+        assert!(slash_completion_area(input, 20).is_none());
     }
 
     #[test]
