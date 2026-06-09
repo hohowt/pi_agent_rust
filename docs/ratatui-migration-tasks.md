@@ -62,6 +62,8 @@
       content instead of pinning them to the terminal bottom when content is short.
 - [x] Render a Codex-style single-line footer with left status/model context and
       right key hints.
+- [x] Replace the bordered input box with a Codex-style composer shell: live
+      `›` prompt, inset textarea, and indented footer layout.
 
 ## 4. Markdown Rendering
 

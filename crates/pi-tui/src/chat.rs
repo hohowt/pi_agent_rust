@@ -972,15 +972,28 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
     let area = frame.area();
     let palette = ChatPalette::from_theme(&app.options.theme);
     let dim = Style::default().fg(palette.muted);
-    let accent = Style::default().fg(palette.accent);
 
     let body_lines = conversation_lines(&app.lines, &palette);
-    let layout = chat_layout(area, body_lines.len(), editor_height(&app.editor));
+    let footer_status = if app.busy {
+        "运行中"
+    } else {
+        app.options.status.as_str()
+    };
+    let footer = footer_line(
+        app,
+        footer_status,
+        area.width.saturating_sub(FOOTER_INDENT_COLS),
+        &palette,
+    );
+    let footer_height = u16::from(!footer.spans.is_empty());
+    let layout = chat_layout(
+        area,
+        body_lines.len(),
+        composer_height(&app.editor, &footer),
+    );
     frame.render_widget(Clear, area);
 
     let body = layout.body;
-    let input = layout.input;
-    let footer = layout.footer;
     let conversation_height = body.height.saturating_sub(1);
     let scroll_offset = app.scroll.resolve(body_lines.len(), conversation_height);
     frame.render_widget(
@@ -996,93 +1009,141 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
         body,
     );
 
-    frame.render_widget(
-        Paragraph::new(app.editor.text()).block(
-            Block::default()
-                .borders(Borders::TOP)
-                .border_style(dim)
-                .title(Span::styled(" 输入 ", accent)),
-        ),
-        input,
-    );
-    let (cursor_row, cursor_column) = app.editor.cursor_position();
-    let input_cursor_x = input
-        .x
-        .saturating_add(u16::try_from(cursor_column).unwrap_or(u16::MAX))
-        .min(input.right().saturating_sub(1));
-    let input_cursor_y = input
-        .y
-        .saturating_add(1)
-        .saturating_add(u16::try_from(cursor_row).unwrap_or(u16::MAX))
-        .min(input.bottom().saturating_sub(1));
-    frame.set_cursor_position(Position::new(input_cursor_x, input_cursor_y));
-
-    let status = if app.busy {
-        "运行中"
-    } else {
-        app.options.status.as_str()
-    };
-    frame.render_widget(
-        Paragraph::new(footer_line(app, status, footer.width, &palette)).style(dim),
-        footer,
-    );
+    let composer = composer_layout(layout.composer, footer_height);
+    render_composer(frame, app, composer, footer, &palette);
 
     if let Some(picker) = &app.picker {
         render_picker(frame, app, picker, area, &palette);
     } else if app.editor.text().trim_start().starts_with('/') {
-        render_slash_completion(frame, app, input, &palette);
+        render_slash_completion(frame, app, composer.textarea, &palette);
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatLayout {
     body: Rect,
-    input: Rect,
+    composer: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ComposerLayout {
+    prompt: Rect,
+    textarea: Rect,
     footer: Rect,
 }
+
+const LIVE_PREFIX_COLS: u16 = 2;
+const FOOTER_INDENT_COLS: u16 = LIVE_PREFIX_COLS;
+const COMPOSER_MAX_HEIGHT: u16 = 8;
 
 fn chat_layout(
     area: Rect,
     conversation_line_count: usize,
-    desired_input_height: u16,
+    desired_composer_height: u16,
 ) -> ChatLayout {
-    let footer_height = u16::from(area.height > 1);
-    let input_height = desired_input_height
-        .max(1)
-        .min(area.height.saturating_sub(footer_height));
-    let max_body_height = area
-        .height
-        .saturating_sub(input_height)
-        .saturating_sub(footer_height);
+    let composer_height = desired_composer_height.max(1).min(area.height);
+    let max_body_height = area.height.saturating_sub(composer_height);
     let desired_body_height = u16::try_from(conversation_line_count.saturating_add(1))
         .unwrap_or(u16::MAX)
         .clamp(u16::from(max_body_height > 0), max_body_height);
     let used_height = desired_body_height
-        .saturating_add(input_height)
-        .saturating_add(footer_height)
+        .saturating_add(composer_height)
         .min(area.height);
     let used = Rect {
         height: used_height,
         ..area
     };
-    let [body, input, footer] = Layout::vertical([
+    let [body, composer] = Layout::vertical([
         Constraint::Length(desired_body_height),
-        Constraint::Length(input_height),
-        Constraint::Length(footer_height),
+        Constraint::Length(composer_height),
     ])
     .areas(used);
-    ChatLayout {
-        body,
-        input,
+    ChatLayout { body, composer }
+}
+
+fn composer_height(editor: &EditorState, footer: &Line<'_>) -> u16 {
+    let footer_height = u16::from(!footer.spans.is_empty());
+    editor_visual_height(editor)
+        .saturating_add(2)
+        .saturating_add(footer_height)
+        .clamp(3, COMPOSER_MAX_HEIGHT)
+}
+
+fn editor_visual_height(editor: &EditorState) -> u16 {
+    let rows = editor.text().bytes().filter(|byte| *byte == b'\n').count() + 1;
+    u16::try_from(rows).unwrap_or(COMPOSER_MAX_HEIGHT)
+}
+
+fn composer_layout(area: Rect, footer_height: u16) -> ComposerLayout {
+    let footer_height = footer_height.min(area.height.saturating_sub(2));
+    let footer_spacing = u16::from(footer_height > 0);
+    let reserved_bottom = footer_height.saturating_add(footer_spacing);
+    let textarea = Rect {
+        x: area.x.saturating_add(LIVE_PREFIX_COLS),
+        y: area.y.saturating_add(1),
+        width: area
+            .width
+            .saturating_sub(LIVE_PREFIX_COLS)
+            .saturating_sub(1),
+        height: area
+            .height
+            .saturating_sub(1)
+            .saturating_sub(reserved_bottom),
+    };
+    let prompt = Rect {
+        x: textarea.x.saturating_sub(LIVE_PREFIX_COLS),
+        y: textarea.y,
+        width: LIVE_PREFIX_COLS.min(area.width),
+        height: 1.min(area.height),
+    };
+    let footer = Rect {
+        x: area.x.saturating_add(FOOTER_INDENT_COLS),
+        y: area.bottom().saturating_sub(footer_height),
+        width: area.width.saturating_sub(FOOTER_INDENT_COLS),
+        height: footer_height,
+    };
+    ComposerLayout {
+        prompt,
+        textarea,
         footer,
     }
 }
 
-fn editor_height(editor: &EditorState) -> u16 {
-    let rows = editor.text().bytes().filter(|byte| *byte == b'\n').count() + 1;
-    u16::try_from(rows.saturating_add(2))
-        .unwrap_or(8)
-        .clamp(3, 8)
+fn render_composer(
+    frame: &mut ratatui::Frame<'_>,
+    app: &ChatApp,
+    layout: ComposerLayout,
+    footer: Line<'static>,
+    palette: &ChatPalette,
+) {
+    frame.render_widget(Clear, layout.prompt);
+    frame.render_widget(Clear, layout.textarea);
+    frame.render_widget(Clear, layout.footer);
+    frame.render_widget(
+        Paragraph::new("›").style(Style::default().fg(palette.accent)),
+        layout.prompt,
+    );
+    frame.render_widget(
+        Paragraph::new(app.editor.text()).wrap(Wrap { trim: false }),
+        layout.textarea,
+    );
+    frame.render_widget(
+        Paragraph::new(footer).style(Style::default().fg(palette.muted)),
+        layout.footer,
+    );
+
+    let (cursor_row, cursor_column) = app.editor.cursor_position();
+    let cursor_x = layout
+        .textarea
+        .x
+        .saturating_add(u16::try_from(cursor_column).unwrap_or(u16::MAX))
+        .min(layout.textarea.right().saturating_sub(1));
+    let cursor_y = layout
+        .textarea
+        .y
+        .saturating_add(u16::try_from(cursor_row).unwrap_or(u16::MAX))
+        .min(layout.textarea.bottom().saturating_sub(1));
+    frame.set_cursor_position(Position::new(cursor_x, cursor_y));
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1612,8 +1673,8 @@ fn default_slash_commands() -> Vec<SlashCommandItem> {
 mod tests {
     use super::{
         ChatAction, ChatApp, ChatLine, ChatOptions, ChatPalette, ChatPicker, ConversationScroll,
-        EditorState, EventOutcome, PickerItem, chat_layout, conversation_lines, footer_line,
-        normalize_pasted_text,
+        EditorState, EventOutcome, PickerItem, chat_layout, composer_height, composer_layout,
+        conversation_lines, footer_line, normalize_pasted_text,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -1928,9 +1989,8 @@ mod tests {
         let layout = chat_layout(area, 2, 3);
 
         assert_eq!(layout.body, Rect::new(0, 0, 80, 3));
-        assert_eq!(layout.input, Rect::new(0, 3, 80, 3));
-        assert_eq!(layout.footer, Rect::new(0, 6, 80, 1));
-        assert!(layout.footer.bottom() < area.bottom());
+        assert_eq!(layout.composer, Rect::new(0, 3, 80, 3));
+        assert!(layout.composer.bottom() < area.bottom());
     }
 
     #[test]
@@ -1939,9 +1999,28 @@ mod tests {
 
         let layout = chat_layout(area, 100, 3);
 
-        assert_eq!(layout.body.height, 8);
-        assert_eq!(layout.input.y, 8);
-        assert_eq!(layout.footer.y, 11);
+        assert_eq!(layout.body.height, 9);
+        assert_eq!(layout.composer, Rect::new(0, 9, 80, 3));
+    }
+
+    #[test]
+    fn composer_layout_matches_codex_prompt_textarea_footer_shape() {
+        let layout = composer_layout(Rect::new(0, 3, 80, 4), 1);
+
+        assert_eq!(layout.prompt, Rect::new(0, 4, 2, 1));
+        assert_eq!(layout.textarea, Rect::new(2, 4, 77, 1));
+        assert_eq!(layout.footer, Rect::new(2, 6, 78, 1));
+    }
+
+    #[test]
+    fn composer_height_tracks_editor_rows_and_footer_without_input_title_border() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        let footer = footer_line(&app, "就绪", 80, &ChatPalette::default());
+
+        assert_eq!(composer_height(&app.editor, &footer), 4);
+
+        app.editor.set_text("one\ntwo\nthree");
+        assert_eq!(composer_height(&app.editor, &footer), 6);
     }
 
     #[test]
