@@ -171,11 +171,8 @@ fn model_picker_items_include_current_marker_and_details_without_changing_submit
     let items = build_model_picker_items(&current, &[current.clone(), other]);
 
     assert_eq!(items[0].value, "anthropic/claude-sonnet-4-5");
-    assert!(
-        items[0]
-            .label
-            .starts_with("* anthropic / claude-sonnet-4-5")
-    );
+    assert_eq!(items[0].group.as_deref(), Some("anthropic provider"));
+    assert!(items[0].label.starts_with("* claude-sonnet-4-5"));
     assert!(items[0].description.contains("auth: configured"));
     assert!(items[0].description.contains("input: text,image"));
     assert!(
@@ -184,9 +181,26 @@ fn model_picker_items_include_current_marker_and_details_without_changing_submit
             .contains("thinking: off,minimal,low,medium,high")
     );
     assert_eq!(items[1].value, "openai/gpt-4o");
-    assert!(items[1].label.starts_with("  openai / gpt-4o"));
+    assert_eq!(items[1].group.as_deref(), Some("openai provider"));
+    assert!(items[1].label.starts_with("  gpt-4o"));
     assert!(items[1].description.contains("auth: missing"));
+    assert_eq!(
+        items[1].disabled_reason.as_deref(),
+        Some("missing credentials")
+    );
     assert!(items[1].description.contains("thinking: off"));
+}
+
+#[test]
+fn model_picker_items_group_rows_by_provider() {
+    let current = model_entry("openai", "gpt-5", true, Some("key"));
+    let other = model_entry("anthropic", "claude-sonnet-4", true, Some("key"));
+
+    let items = build_model_picker_items(&current, &[other, current.clone()]);
+
+    assert_eq!(items[0].group.as_deref(), Some("anthropic provider"));
+    assert_eq!(items[1].group.as_deref(), Some("openai provider"));
+    assert!(items[1].label.starts_with("* gpt-5"));
 }
 
 #[test]

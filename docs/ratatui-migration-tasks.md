@@ -76,11 +76,11 @@
 
 ## 5. Overlays And Secondary UIs
 
-- [ ] Port model selector overlay.
+- [x] Port model selector overlay.
   - [x] Open a generic model picker for `/model`.
   - [x] Show model details, provider label, current-model marker, thinking
         levels, and direct Enter selection parity without command backfill.
-  - [ ] Restore full provider grouping UI and auth/credential warnings for
+  - [x] Restore full provider grouping UI and auth/credential warnings for
         unavailable models.
 - [ ] Port session picker overlay.
   - [x] Open a generic session picker from `/history`, `/resume`, and double-Esc.

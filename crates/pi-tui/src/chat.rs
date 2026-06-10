@@ -127,6 +127,8 @@ pub struct PickerItem {
     pub label: String,
     pub value: String,
     pub description: String,
+    pub group: Option<String>,
+    pub disabled_reason: Option<String>,
 }
 
 impl PickerItem {
@@ -140,7 +142,26 @@ impl PickerItem {
             label: label.into(),
             value: value.into(),
             description: description.into(),
+            group: None,
+            disabled_reason: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_group(mut self, group: impl Into<String>) -> Self {
+        self.group = Some(group.into());
+        self
+    }
+
+    #[must_use]
+    pub fn disabled(mut self, reason: impl Into<String>) -> Self {
+        self.disabled_reason = Some(reason.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn is_disabled(&self) -> bool {
+        self.disabled_reason.is_some()
     }
 }
 
@@ -448,16 +469,18 @@ impl ChatApp {
                 picker.selected = 0;
             }
             KeyCode::Tab | KeyCode::Enter => {
-                let command = picker.selected_item().map(|item| {
-                    format!("{} {}", picker.picker.prompt_prefix, item.value)
-                        .trim()
-                        .to_string()
-                });
-                self.picker = None;
-                if let Some(command) = command {
-                    self.editor.clear();
-                    return EventOutcome::Submit(command);
+                let Some(item) = picker.selected_item() else {
+                    return EventOutcome::None;
+                };
+                if item.is_disabled() {
+                    return EventOutcome::None;
                 }
+                let command = format!("{} {}", picker.picker.prompt_prefix, item.value)
+                    .trim()
+                    .to_string();
+                self.picker = None;
+                self.editor.clear();
+                return EventOutcome::Submit(command);
             }
             _ => {}
         }
@@ -1636,26 +1659,12 @@ fn render_picker(
         Span::styled("filter: ", Style::default().fg(palette.muted)),
         Span::raw(picker.query.as_str()),
     ]))
-    .chain(items.iter().take(visible).enumerate().map(|(idx, item)| {
-        let selected = idx == picker.selected.min(items.len().saturating_sub(1));
-        let style = if selected {
-            Style::default()
-                .fg(palette.foreground)
-                .bg(palette.selection)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default()
-        };
-        Line::from(vec![
-            Span::styled(if selected { "> " } else { "  " }, style),
-            Span::styled(item.label.as_str(), style),
-            Span::raw("  "),
-            Span::styled(
-                item.description.as_str(),
-                Style::default().fg(palette.muted),
-            ),
-        ])
-    }))
+    .chain(picker_lines(
+        &items,
+        picker.selected.min(items.len().saturating_sub(1)),
+        visible,
+        palette,
+    ))
     .collect::<Vec<_>>();
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -1667,6 +1676,72 @@ fn render_picker(
         ),
         area,
     );
+}
+
+fn picker_lines(
+    items: &[&PickerItem],
+    selected_index: usize,
+    visible_rows: usize,
+    palette: &ChatPalette,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut last_group: Option<&str> = None;
+    for (idx, item) in items.iter().enumerate() {
+        if lines.len() >= visible_rows {
+            break;
+        }
+        if item.group.as_deref() != last_group {
+            if let Some(group) = item.group.as_deref() {
+                if lines.len() >= visible_rows {
+                    break;
+                }
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  {group}"),
+                    Style::default()
+                        .fg(palette.accent)
+                        .add_modifier(Modifier::BOLD),
+                )]));
+            }
+            last_group = item.group.as_deref();
+        }
+        if lines.len() >= visible_rows {
+            break;
+        }
+        lines.push(picker_item_line(item, idx == selected_index, palette));
+    }
+    lines
+}
+
+fn picker_item_line(item: &PickerItem, selected: bool, palette: &ChatPalette) -> Line<'static> {
+    let mut style = if selected {
+        Style::default()
+            .fg(palette.foreground)
+            .bg(palette.selection)
+            .add_modifier(Modifier::BOLD)
+    } else if item.is_disabled() {
+        Style::default().fg(palette.muted)
+    } else {
+        Style::default()
+    };
+    if item.is_disabled() {
+        style = style.fg(palette.muted);
+    }
+    let mut spans = vec![
+        Span::styled(if selected { "> " } else { "  " }, style),
+        Span::styled(item.label.clone(), style),
+        Span::raw("  "),
+        Span::styled(item.description.clone(), Style::default().fg(palette.muted)),
+    ];
+    if let Some(reason) = item.disabled_reason.as_deref() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            reason.to_string(),
+            Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
+    Line::from(spans)
 }
 
 fn default_slash_commands() -> Vec<SlashCommandItem> {
@@ -2148,6 +2223,26 @@ mod tests {
         );
         assert_eq!(app.editor.text(), "");
         assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn picker_disabled_selection_stays_open_without_submitting() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+        app.editor.set_text("/model");
+        app.apply_action(ChatAction::OpenPicker(ChatPicker::new(
+            "模型",
+            "/model",
+            vec![
+                PickerItem::new("missing", "provider/model", "model")
+                    .disabled("missing credentials"),
+            ],
+        )));
+
+        let outcome = app.handle_key(key(KeyCode::Enter));
+
+        assert_eq!(outcome, EventOutcome::None);
+        assert_eq!(app.editor.text(), "/model");
+        assert!(app.picker.is_some());
     }
 
     #[test]

@@ -688,10 +688,19 @@ pub fn build_model_picker_items(
         .map(|entry| {
             let value = model_label(entry);
             let marker = if value == current { "* " } else { "  " };
-            let label = format!("{marker}{} / {}", entry.model.provider, entry.model.id);
-            pi_tui::PickerItem::new(label, value, model_picker_description(entry))
+            let label = format!("{marker}{}", entry.model.id);
+            let mut item = pi_tui::PickerItem::new(label, value, model_picker_description(entry))
+                .with_group(provider_picker_group(entry));
+            if let Some(reason) = model_unavailable_reason(entry) {
+                item = item.disabled(reason);
+            }
+            item
         })
         .collect()
+}
+
+fn provider_picker_group(entry: &ModelEntry) -> String {
+    format!("{} provider", entry.model.provider)
 }
 
 fn model_picker_description(entry: &ModelEntry) -> String {
@@ -724,6 +733,10 @@ fn model_auth_status(entry: &ModelEntry) -> &'static str {
     } else {
         "missing"
     }
+}
+
+fn model_unavailable_reason(entry: &ModelEntry) -> Option<&'static str> {
+    (model_auth_status(entry) == "missing").then_some("missing credentials")
 }
 
 fn model_input_summary(entry: &ModelEntry) -> String {
