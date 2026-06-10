@@ -986,9 +986,15 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
         &palette,
     );
     let footer_height = u16::from(!footer.spans.is_empty());
+    let slash_completion_height = if app.editor.text().trim_start().starts_with('/') {
+        slash_completion_height(app.filtered_slash_commands().len())
+    } else {
+        0
+    };
     let layout = chat_layout(
         area,
         body_lines.len(),
+        slash_completion_height,
         composer_height(&app.editor, &footer),
     );
     frame.render_widget(Clear, area);
@@ -1015,13 +1021,14 @@ fn render(frame: &mut ratatui::Frame<'_>, app: &mut ChatApp) {
     if let Some(picker) = &app.picker {
         render_picker(frame, app, picker, area, &palette);
     } else if app.editor.text().trim_start().starts_with('/') {
-        render_slash_completion(frame, app, composer.textarea, &palette);
+        render_slash_completion(frame, app, layout.slash_completion, &palette);
     }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ChatLayout {
     body: Rect,
+    slash_completion: Rect,
     composer: Rect,
 }
 
@@ -1035,30 +1042,45 @@ struct ComposerLayout {
 const LIVE_PREFIX_COLS: u16 = 2;
 const FOOTER_INDENT_COLS: u16 = LIVE_PREFIX_COLS;
 const COMPOSER_MAX_HEIGHT: u16 = 8;
+const MAX_SLASH_COMPLETION_ITEMS: usize = 8;
+const MAX_SLASH_COMPLETION_HEIGHT: u16 = 10;
 
 fn chat_layout(
     area: Rect,
     conversation_line_count: usize,
+    desired_slash_completion_height: u16,
     desired_composer_height: u16,
 ) -> ChatLayout {
     let composer_height = desired_composer_height.max(1).min(area.height);
-    let max_body_height = area.height.saturating_sub(composer_height);
+    let slash_completion_height = desired_slash_completion_height
+        .min(area.height.saturating_sub(composer_height))
+        .min(MAX_SLASH_COMPLETION_HEIGHT);
+    let max_body_height = area
+        .height
+        .saturating_sub(composer_height)
+        .saturating_sub(slash_completion_height);
     let desired_body_height = u16::try_from(conversation_line_count.saturating_add(1))
         .unwrap_or(u16::MAX)
         .clamp(u16::from(max_body_height > 0), max_body_height);
     let used_height = desired_body_height
+        .saturating_add(slash_completion_height)
         .saturating_add(composer_height)
         .min(area.height);
     let used = Rect {
         height: used_height,
         ..area
     };
-    let [body, composer] = Layout::vertical([
+    let [body, slash_completion, composer] = Layout::vertical([
         Constraint::Length(desired_body_height),
+        Constraint::Length(slash_completion_height),
         Constraint::Length(composer_height),
     ])
     .areas(used);
-    ChatLayout { body, composer }
+    ChatLayout {
+        body,
+        slash_completion,
+        composer,
+    }
 }
 
 fn composer_height(editor: &EditorState, footer: &Line<'_>) -> u16 {
@@ -1543,13 +1565,13 @@ fn footer_line(app: &ChatApp, status: &str, width: u16, palette: &ChatPalette) -
 fn render_slash_completion(
     frame: &mut ratatui::Frame<'_>,
     app: &ChatApp,
-    input_area: Rect,
+    area: Rect,
     palette: &ChatPalette,
 ) {
     let items = app.filtered_slash_commands();
-    let Some(area) = slash_completion_area(input_area, items.len()) else {
+    if area.is_empty() || items.is_empty() {
         return;
-    };
+    }
     let visible_items = usize::from(area.height.saturating_sub(2));
     let lines = items
         .iter()
@@ -1585,27 +1607,12 @@ fn render_slash_completion(
     );
 }
 
-fn slash_completion_area(input_area: Rect, item_count: usize) -> Option<Rect> {
+fn slash_completion_height(item_count: usize) -> u16 {
     if item_count == 0 {
-        return None;
+        return 0;
     }
-    let max_rows_above_input = input_area.y;
-    if max_rows_above_input < 3 {
-        return None;
-    }
-    let visible_items = item_count
-        .min(8)
-        .min(usize::from(max_rows_above_input.saturating_sub(2)));
-    if visible_items == 0 {
-        return None;
-    }
-    let height = u16::try_from(visible_items.saturating_add(2)).unwrap_or(max_rows_above_input);
-    Some(Rect {
-        x: input_area.x,
-        y: input_area.y - height,
-        width: input_area.width.min(96),
-        height,
-    })
+    u16::try_from(item_count.min(MAX_SLASH_COMPLETION_ITEMS).saturating_add(2))
+        .unwrap_or(MAX_SLASH_COMPLETION_HEIGHT)
 }
 
 fn render_picker(
@@ -1691,7 +1698,7 @@ mod tests {
     use super::{
         ChatAction, ChatApp, ChatLine, ChatOptions, ChatPalette, ChatPicker, ConversationScroll,
         EditorState, EventOutcome, PickerItem, chat_layout, composer_height, composer_layout,
-        conversation_lines, footer_line, normalize_pasted_text, slash_completion_area,
+        conversation_lines, footer_line, normalize_pasted_text, slash_completion_height,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -2003,9 +2010,10 @@ mod tests {
     fn chat_layout_keeps_composer_below_content_not_screen_bottom() {
         let area = Rect::new(0, 0, 80, 30);
 
-        let layout = chat_layout(area, 2, 3);
+        let layout = chat_layout(area, 2, 0, 3);
 
         assert_eq!(layout.body, Rect::new(0, 0, 80, 3));
+        assert_eq!(layout.slash_completion, Rect::new(0, 3, 80, 0));
         assert_eq!(layout.composer, Rect::new(0, 3, 80, 3));
         assert!(layout.composer.bottom() < area.bottom());
     }
@@ -2014,10 +2022,22 @@ mod tests {
     fn chat_layout_uses_full_height_when_content_overflows() {
         let area = Rect::new(0, 0, 80, 12);
 
-        let layout = chat_layout(area, 100, 3);
+        let layout = chat_layout(area, 100, 0, 3);
 
         assert_eq!(layout.body.height, 9);
         assert_eq!(layout.composer, Rect::new(0, 9, 80, 3));
+    }
+
+    #[test]
+    fn chat_layout_reserves_slash_completion_above_composer() {
+        let area = Rect::new(0, 0, 80, 12);
+
+        let layout = chat_layout(area, 100, slash_completion_height(20), 4);
+
+        assert_eq!(layout.body, Rect::new(0, 0, 80, 0));
+        assert_eq!(layout.slash_completion, Rect::new(0, 0, 80, 8));
+        assert_eq!(layout.composer, Rect::new(0, 8, 80, 4));
+        assert!(layout.slash_completion.bottom() <= layout.composer.y);
     }
 
     #[test]
@@ -2041,20 +2061,20 @@ mod tests {
     }
 
     #[test]
-    fn slash_completion_area_stays_above_textarea() {
-        let input = Rect::new(2, 4, 77, 1);
-
-        let area = slash_completion_area(input, 20).expect("completion area");
-
-        assert_eq!(area, Rect::new(2, 0, 77, 4));
-        assert!(area.bottom() <= input.y);
+    fn slash_completion_height_caps_visible_command_rows() {
+        assert_eq!(slash_completion_height(0), 0);
+        assert_eq!(slash_completion_height(1), 3);
+        assert_eq!(slash_completion_height(20), 10);
     }
 
     #[test]
-    fn slash_completion_area_hides_when_it_would_cover_input() {
-        let input = Rect::new(2, 2, 77, 1);
+    fn chat_layout_drops_slash_completion_before_composer_on_short_screens() {
+        let area = Rect::new(0, 0, 80, 3);
 
-        assert!(slash_completion_area(input, 20).is_none());
+        let layout = chat_layout(area, 10, slash_completion_height(20), 3);
+
+        assert_eq!(layout.slash_completion.height, 0);
+        assert_eq!(layout.composer, Rect::new(0, 0, 80, 3));
     }
 
     #[test]
