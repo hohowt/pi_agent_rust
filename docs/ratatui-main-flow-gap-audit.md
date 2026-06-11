@@ -40,6 +40,7 @@ read-only status where the previous UI performed a richer action.
 | `/changelog` | Shows startup changelog status when appropriate and opens a version picker for current changelog entries. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | `/logout` | Opens a provider picker for saved credentials; selecting a provider removes that credential immediately and refreshes auth/model state. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | Startup auth hint | Shows startup credential guidance for the current model when auth is missing, while respecting quiet startup. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
+| `/tree` | Opens a branch leaf picker; selecting a leaf switches the current conversation branch and replaces visible history immediately. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | Markdown rendering | Assistant messages are rendered through the ratatui markdown path for headings, lists, links, code fences, and CJK text. | `crates/pi-tui/src/chat.rs:1144-1352`, `crates/pi-tui/src/chat.rs:1959-1989` |
 | Editing history | Up/down navigation restores previous prompts and the current draft. | `crates/pi-tui/src/chat.rs:318-435`, `crates/pi-tui/src/chat.rs:1811-1855` |
 | Mouse wheel | Mouse wheel routing is wired through the terminal mouse capture policy. | `crates/pi-tui/src/chat.rs:289-303`, `crates/pi-tui/src/terminal.rs:29-77` |
@@ -56,7 +57,6 @@ read-only status where the previous UI performed a richer action.
 | Feature | Current behavior | Evidence | Missing behavior |
 |---|---|---|---|
 | `/settings` | Displays a read-only settings summary. | `src/interactive.rs:384`, `src/interactive.rs:625-633` | Editable settings overlay, queue/compaction/double-Esc/editor/autocomplete settings, project/global persistence. |
-| `/tree` | Displays basic leaf/path counts. | `src/interactive.rs:389`, `src/interactive.rs:610-622` | Full tree navigation, branch selection, summary prompts, and custom fork prompt flow. |
 | `/model` picker | Generic picker can switch model by selected value. | `src/interactive.rs:381`, `src/interactive.rs:438-484` | Provider grouping, auth warnings, current marker, richer details, thinking suffix parity, direct Enter selection parity. |
 | `/name` | Sets name and prints confirmation. | `src/interactive.rs:398`, `src/interactive.rs:771-786` | Old status-bar style confirmation/error parity. |
 
@@ -78,7 +78,7 @@ read-only status where the previous UI performed a richer action.
 ## Priority Order
 
 1. Credential flow: `/login` is an explicit unavailable-command path.
-2. Tree/fork parity: `/tree` is read-only summary; `/fork` is unavailable.
+2. Fork parity: `/fork` is unavailable.
 3. Settings parity: `/settings` exists but still lacks the full editable
    interactive flow and persistence controls.
 4. Picker richness: model/session pickers work, but still lack grouping,

@@ -122,7 +122,7 @@
 - [x] `/theme`: apply selected theme, not just show/select the item.
 - [x] `/template`: apply selected prompt template content immediately.
 - [x] `/history` and `/resume`: load selected session.
-- [ ] `/tree`: restore full tree UI instead of basic status text.
+- [x] `/tree`: restore full tree UI instead of basic status text.
 - [ ] `/fork`: restore branch picker/fork flow.
 - [x] `/compact`: show compaction progress/events and resulting summary.
 - [x] `/reload`: reload models/resources, update autocomplete catalog, and show

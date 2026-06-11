@@ -9,8 +9,9 @@ use pi::interactive::{
     export_current_session_for_tui, format_agent_event, format_changelog_entry,
     format_compaction_status, format_reload_status, format_session_name_status,
     last_assistant_text_for_tui, logout_picker_items, logout_provider_for_tui,
-    resume_session_from_path_for_tui, session_picker_items, share_current_session_for_tui,
-    startup_changelog_lines, startup_oauth_hint_lines,
+    resume_session_from_path_for_tui, select_tree_leaf_for_tui, session_picker_items,
+    share_current_session_for_tui, startup_changelog_lines, startup_oauth_hint_lines,
+    tree_picker_items,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -295,6 +296,116 @@ fn session_picker_items_include_scope_group_and_metadata() {
     assert!(items[0].description.contains("7 messages"));
     assert!(items[0].description.contains("3 KiB"));
     assert!(items[0].description.contains("session-a.jsonl"));
+}
+
+#[test]
+fn tree_picker_items_list_leaves_with_current_marker_and_preview() {
+    let mut session = Session::in_memory();
+    let root = session.append_message(SessionMessage::User {
+        content: UserContent::Text("root prompt".to_string()),
+        timestamp: Some(1),
+    });
+    let first_leaf = session.append_message(SessionMessage::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("first answer"))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            timestamp: 2,
+            ..Default::default()
+        },
+    });
+    assert!(session.create_branch_from(&root));
+    let second_leaf = session.append_message(SessionMessage::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("second answer"))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            timestamp: 3,
+            ..Default::default()
+        },
+    });
+
+    let items = tree_picker_items(&session);
+
+    assert_eq!(items.len(), 2);
+    let current = items
+        .iter()
+        .find(|item| item.value == second_leaf)
+        .expect("current branch item");
+    assert!(current.label.starts_with("* "));
+    assert_eq!(current.disabled_reason.as_deref(), Some("current branch"));
+    let other = items
+        .iter()
+        .find(|item| item.value == first_leaf)
+        .expect("other branch item");
+    assert!(other.label.starts_with("  "));
+    assert!(other.description.contains("2 messages"));
+    assert!(other.description.contains("root prompt"));
+}
+
+#[test]
+fn selecting_tree_leaf_replaces_visible_and_agent_history() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = SessionMessage::User {
+        content: UserContent::Text("root prompt".to_string()),
+        timestamp: Some(1),
+    };
+    let mut session = Session::in_memory();
+    let root_id = session.append_message(root);
+    let first_leaf = session.append_message(SessionMessage::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("first answer"))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            timestamp: 2,
+            ..Default::default()
+        },
+    });
+    assert!(session.create_branch_from(&root_id));
+    session.append_message(SessionMessage::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("second answer"))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            timestamp: 3,
+            ..Default::default()
+        },
+    });
+
+    let mut agent = empty_agent_session(temp.path());
+    run_async(async {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let mut active = agent.session.lock(cx.cx()).await.expect("session lock");
+        *active = session;
+    });
+
+    let action =
+        run_async(select_tree_leaf_for_tui(&mut agent, &first_leaf)).expect("select tree leaf");
+
+    let pi_tui::ChatAction::Many(actions) = action else {
+        panic!("expected replace/status actions");
+    };
+    let pi_tui::ChatAction::ReplaceLines(lines) = &actions[0] else {
+        panic!("expected visible line replacement");
+    };
+    assert_eq!(lines.len(), 2);
+    assert_eq!(lines[0].text(), "root prompt");
+    assert_eq!(lines[1].text(), "first answer");
+    let messages = agent.agent.messages();
+    assert_eq!(messages.len(), 2);
+    match &messages[1] {
+        Message::Assistant(assistant) => {
+            let ContentBlock::Text(text) = &assistant.content[0] else {
+                panic!("expected text content");
+            };
+            assert_eq!(text.text, "first answer");
+        }
+        other => panic!("expected assistant message, got {other:?}"),
+    }
 }
 
 #[test]

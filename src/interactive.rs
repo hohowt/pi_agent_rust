@@ -577,7 +577,7 @@ async fn handle_slash_command(
         SlashCommand::ScopedModels => status_action(format_scoped_models(context, args)),
         SlashCommand::Codegraph => status_action(handle_codegraph_command(context, args)?),
         SlashCommand::Hotkeys => status_action(context.options.key_hints.join("\n")),
-        SlashCommand::Tree => status_action(format_tree_status(agent).await?),
+        SlashCommand::Tree => handle_tree_command(agent, args).await?,
         SlashCommand::New => pi_tui::ChatAction::Many(vec![
             pi_tui::ChatAction::Clear,
             status_action("已清空当前屏幕。要创建新的持久会话，请退出后使用 pi --new。"),
@@ -922,6 +922,116 @@ async fn format_tree_status(agent: &AgentSession) -> Result<String> {
         session.entries.len(),
         session.entries_for_current_path().len()
     ))
+}
+
+async fn handle_tree_command(agent: &mut AgentSession, args: &str) -> Result<pi_tui::ChatAction> {
+    let selected = args.trim();
+    if !selected.is_empty() {
+        return select_tree_leaf_for_tui(agent, selected).await;
+    }
+
+    let cx = crate::agent_cx::AgentCx::for_request();
+    let session = agent
+        .session
+        .lock(cx.cx())
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let items = tree_picker_items(&session);
+    if items.is_empty() {
+        return Ok(status_action("当前会话没有可选择的对话分支。"));
+    }
+    Ok(pi_tui::ChatAction::OpenPicker(
+        pi_tui::ChatPicker::new("对话树", "/tree", items)
+            .with_subtitle("选择一个 leaf 切换当前分支")
+            .with_empty_message("没有匹配的分支"),
+    ))
+}
+
+#[doc(hidden)]
+pub fn tree_picker_items(session: &crate::session::Session) -> Vec<pi_tui::PickerItem> {
+    let current_leaf = session.leaf_id();
+    session
+        .branch_summary()
+        .leaves
+        .into_iter()
+        .take(100)
+        .map(|leaf_id| tree_picker_item(session, &leaf_id, current_leaf))
+        .collect()
+}
+
+fn tree_picker_item(
+    session: &crate::session::Session,
+    leaf_id: &str,
+    current_leaf: Option<&str>,
+) -> pi_tui::PickerItem {
+    let path_ids = session.get_path_to_entry(leaf_id);
+    let message_count = path_ids
+        .iter()
+        .filter_map(|id| session.get_entry(id))
+        .filter(|entry| matches!(entry, SessionEntry::Message(_)))
+        .count();
+    let preview = path_ids
+        .iter()
+        .filter_map(|id| session.get_entry(id))
+        .find_map(entry_user_preview)
+        .unwrap_or_else(|| "(empty branch)".to_string());
+    let current = current_leaf.is_some_and(|current| current == leaf_id);
+    let label = if current {
+        format!("* {leaf_id}")
+    } else {
+        format!("  {leaf_id}")
+    };
+    let depth = path_ids.len();
+    let description = format!("{message_count} messages  depth {depth}  {preview}");
+    let item = pi_tui::PickerItem::new(label, leaf_id.to_string(), description);
+    if current {
+        item.disabled("current branch")
+    } else {
+        item
+    }
+}
+
+fn entry_user_preview(entry: &SessionEntry) -> Option<String> {
+    let SessionEntry::Message(message_entry) = entry else {
+        return None;
+    };
+    let crate::session::SessionMessage::User { content, .. } = &message_entry.message else {
+        return None;
+    };
+    let text = user_content_to_text(content);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(truncate_line(trimmed, 80))
+}
+
+#[doc(hidden)]
+pub async fn select_tree_leaf_for_tui(
+    agent: &mut AgentSession,
+    leaf_id: &str,
+) -> Result<pi_tui::ChatAction> {
+    let cx = crate::agent_cx::AgentCx::for_request();
+    let (history, visible_lines, current_leaf) = {
+        let mut session = agent
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        if !session.navigate_to(leaf_id) {
+            return Ok(status_action(format!("未找到对话分支: {leaf_id}")));
+        }
+        let history = session.to_messages_for_current_path();
+        let visible_lines = chat_lines_from_messages(&history);
+        let current_leaf = session.leaf_id().unwrap_or(leaf_id).to_string();
+        (history, visible_lines, current_leaf)
+    };
+    agent.agent.replace_messages(history);
+    agent.persist_session().await?;
+    Ok(pi_tui::ChatAction::Many(vec![
+        pi_tui::ChatAction::ReplaceLines(visible_lines),
+        status_action(format!("已切换对话分支: {current_leaf}")),
+    ]))
 }
 
 fn format_settings_status(context: &InteractiveContext) -> String {
