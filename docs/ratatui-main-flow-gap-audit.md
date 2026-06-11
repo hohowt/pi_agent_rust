@@ -16,11 +16,11 @@ init/sync/status, basic tool/status event streaming, session resume, theme
 selection, prompt template execution, language selection, file/image reference
 expansion, assistant text streaming, and thinking delta streaming.
 
-The highest-impact remaining regressions are credential flows, share, full
-tree/fork flows, the editable settings overlay, and richer model/session picker
-parity. Most affected features are not hard failures; they show compatibility
-messages, open generic pickers without the full codex/pi-tui affordances, or
-display read-only status where the previous UI performed a richer action.
+The highest-impact remaining regressions are credential flows, full tree/fork
+flows, the editable settings overlay, and richer model/session picker parity.
+Most affected features are not hard failures; they show compatibility messages,
+open generic pickers without the full codex/pi-tui affordances, or display
+read-only status where the previous UI performed a richer action.
 
 ## Now Available In Ratatui Main Flow
 
@@ -36,6 +36,7 @@ display read-only status where the previous UI performed a richer action.
 | `/compact` | Runs compaction, surfaces lifecycle events, shows failure/no-op status, and includes resulting summary/tokens/file counts when available. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | `/export` | Exports the current session from the TUI with a default HTML path; `.json` paths export the current-path messages as JSON. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | `/copy` | Copies the latest assistant text when built with `clipboard`; default builds show a clear feature-gated failure status. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
+| `/share` | Creates a private/public GitHub gist through `gh`, uploads exported session HTML, and displays the Pi share viewer URL. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | `/changelog` | Shows startup changelog status when appropriate and opens a version picker for current changelog entries. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | Markdown rendering | Assistant messages are rendered through the ratatui markdown path for headings, lists, links, code fences, and CJK text. | `crates/pi-tui/src/chat.rs:1144-1352`, `crates/pi-tui/src/chat.rs:1959-1989` |
 | Editing history | Up/down navigation restores previous prompts and the current draft. | `crates/pi-tui/src/chat.rs:318-435`, `crates/pi-tui/src/chat.rs:1811-1855` |
@@ -47,7 +48,6 @@ display read-only status where the previous UI performed a richer action.
 |---|---|---|---|
 | `/login` | Returns a status message telling the user to use non-interactive setup. No OAuth/API-key interactive flow runs. | `src/interactive.rs:400-406`, `src/interactive.rs:863-867` | Users cannot authenticate from the interactive TUI. |
 | `/logout` | Returns a status message. No provider credential removal or confirmation flow runs. | `src/interactive.rs:400-406`, `src/interactive.rs:868-870` | Users cannot remove credentials from the interactive TUI. |
-| `/share` | Returns a status message. No upload/share flow runs. | `src/interactive.rs:400-406`, `src/interactive.rs:876-878` | Interactive sharing is unavailable. |
 | `/fork` | Returns a status message pointing users to `/tree`. No branch picker or fork is performed. | `src/interactive.rs:400-406`, `src/interactive.rs:873-875` | Conversation branching from TUI is unavailable. |
 
 ## Present But Degraded
@@ -76,8 +76,8 @@ display read-only status where the previous UI performed a richer action.
 
 ## Priority Order
 
-1. Credential and remaining data egress flows: `/login`, `/logout`, and
-   `/share` are explicit unavailable-command paths.
+1. Credential flows: `/login` and `/logout` are explicit unavailable-command
+   paths.
 2. Tree/fork parity: `/tree` is read-only summary; `/fork` is unavailable.
 3. Settings parity: `/settings` exists but still lacks the full editable
    interactive flow and persistence controls.

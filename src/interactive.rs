@@ -21,6 +21,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use tokio::process::Command;
 
 #[derive(Debug, Clone)]
 pub enum PendingInput {
@@ -276,6 +277,7 @@ fn slash_command_items(language: Language) -> Vec<pi_tui::SlashCommandItem> {
             ("/history", "打开会话列表"),
             ("/export", "导出会话"),
             ("/copy", "复制上一条 assistant 消息"),
+            ("/share", "分享会话"),
             ("/tree", "显示对话树信息"),
             ("/compact", "压缩上下文"),
             ("/clear", "清屏"),
@@ -297,6 +299,7 @@ fn slash_command_items(language: Language) -> Vec<pi_tui::SlashCommandItem> {
             ("/history", "Open session list"),
             ("/export", "Export session"),
             ("/copy", "Copy last assistant message"),
+            ("/share", "Share session"),
             ("/tree", "Show conversation tree info"),
             ("/compact", "Compact context"),
             ("/clear", "Clear screen"),
@@ -585,7 +588,8 @@ async fn handle_slash_command(
         SlashCommand::Name => handle_name_command(agent, args).await?,
         SlashCommand::Changelog => handle_changelog_command(args),
         SlashCommand::Language => handle_language_command(context, args)?,
-        SlashCommand::Login | SlashCommand::Logout | SlashCommand::Fork | SlashCommand::Share => {
+        SlashCommand::Share => handle_share_command(agent, context, args).await?,
+        SlashCommand::Login | SlashCommand::Logout | SlashCommand::Fork => {
             status_action(format_command_unavailable(command))
         }
     };
@@ -1249,6 +1253,106 @@ async fn handle_export_command(
     )))
 }
 
+async fn handle_share_command(
+    agent: &AgentSession,
+    context: &InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
+    let public = parse_share_public_arg(args);
+    match share_current_session_for_tui(agent, &context.config, &context.cwd, public).await {
+        Ok(result) => Ok(status_action(format!(
+            "Created {} gist.\nShare URL: {}",
+            if result.public { "public" } else { "private" },
+            result.viewer_url
+        ))),
+        Err(err) => Ok(status_action(format!("分享失败: {err}"))),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiShareResult {
+    pub gist_url: String,
+    pub viewer_url: String,
+    pub public: bool,
+}
+
+#[doc(hidden)]
+pub async fn share_current_session_for_tui(
+    agent: &AgentSession,
+    config: &Config,
+    cwd: &Path,
+    public: bool,
+) -> Result<TuiShareResult> {
+    let export = export_current_session_for_tui(agent, cwd, "").await?;
+    let gh_path = config.gh_path.as_deref().unwrap_or("gh");
+    ensure_gh_available(gh_path).await?;
+
+    let description = format!(
+        "Pi session share {}",
+        export
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("session")
+    );
+    let output = Command::new(gh_path)
+        .arg("gist")
+        .arg("create")
+        .arg(&export.path)
+        .arg("--desc")
+        .arg(description)
+        .arg(format!("--public={public}"))
+        .output()
+        .await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("gh gist create failed: {}", stderr.trim());
+    }
+
+    let gist_url = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let gist_id = gist_id_from_url(&gist_url).unwrap_or(gist_url.as_str());
+    let viewer_url = crate::session::get_share_viewer_url(gist_id);
+    Ok(TuiShareResult {
+        gist_url,
+        viewer_url,
+        public,
+    })
+}
+
+async fn ensure_gh_available(gh_path: &str) -> Result<()> {
+    let output = Command::new(gh_path)
+        .arg("auth")
+        .arg("status")
+        .output()
+        .await;
+    match output {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("GitHub CLI auth failed: {}", stderr.trim());
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!(
+                "gh not found. Install GitHub CLI from https://cli.github.com/ and run `gh auth login`."
+            )
+        }
+        Err(err) => Err(err.into()),
+    }
+}
+
+fn parse_share_public_arg(args: &str) -> bool {
+    args.split_whitespace()
+        .any(|arg| matches!(arg, "public" | "--public" | "--public=true"))
+}
+
+fn gist_id_from_url(url: &str) -> Option<&str> {
+    url.trim()
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|value| !value.is_empty())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TuiExportResult {
     pub path: PathBuf,
@@ -1712,19 +1816,9 @@ fn format_command_unavailable(command: SlashCommand) -> String {
         SlashCommand::Logout => {
             "/logout 需要认证状态写入确认；当前请使用配置/auth 文件管理命令。".to_string()
         }
-        SlashCommand::Export => "/export 需要选择导出目标；当前请使用会话导出 CLI。".to_string(),
-        SlashCommand::Copy => "/copy 需要剪贴板接入；当前请用终端选择文本复制。".to_string(),
         SlashCommand::Fork => {
             "/fork 需要分支选择器；当前请使用 /tree 查看当前路径信息。".to_string()
         }
-        SlashCommand::Share => {
-            "/share 需要分享后端/浏览器流程；当前 TUI 不自动上传会话。".to_string()
-        }
-        SlashCommand::Changelog => include_str!("../CHANGELOG.md")
-            .lines()
-            .take(80)
-            .collect::<Vec<_>>()
-            .join("\n"),
         _ => format!("/{command:?} 当前不可用。"),
     }
 }

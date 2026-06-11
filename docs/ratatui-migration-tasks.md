@@ -129,7 +129,7 @@
       diagnostics.
 - [x] `/export`: restore default export path, HTML/JSON export, and status.
 - [x] `/copy`: restore clipboard support behind the clipboard feature.
-- [ ] `/share`: restore share flow.
+- [x] `/share`: restore share flow.
 - [x] `/changelog`: restore startup/current changelog UI.
 - [x] `/name`: keep current naming behavior and add visible confirmation/error
       parity with the old status bar.

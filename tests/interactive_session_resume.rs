@@ -8,7 +8,7 @@ use pi::interactive::{
     export_current_session_for_tui, format_agent_event, format_changelog_entry,
     format_compaction_status, format_reload_status, format_session_name_status,
     last_assistant_text_for_tui, resume_session_from_path_for_tui, session_picker_items,
-    startup_changelog_lines,
+    share_current_session_for_tui, startup_changelog_lines,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -423,6 +423,93 @@ fn export_current_session_for_tui_writes_html_and_json() {
     assert_eq!(json.format, "JSON");
     assert!(json_body.contains("export this"));
     assert!(json_body.contains("exported answer"));
+}
+
+#[test]
+fn share_current_session_for_tui_uses_gh_and_returns_viewer_url() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mock_bin = temp.path().join("bin");
+    std::fs::create_dir_all(&mock_bin).expect("create mock bin");
+    let gh_path = mock_bin.join("gh");
+    let args_log = mock_bin.join("args.log");
+    let script = format!(
+        r#"#!/bin/sh
+echo "$@" >> "{args_log}"
+if [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  exit 0
+fi
+if [ "$1" = "gist" ] && [ "$2" = "create" ]; then
+  echo "https://gist.github.com/testuser/share_id_789"
+  exit 0
+fi
+exit 2
+"#,
+        args_log = args_log.display()
+    );
+    std::fs::write(&gh_path, script).expect("write mock gh");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&gh_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod mock gh");
+    }
+
+    let agent = empty_agent_session(temp.path());
+    run_async(async {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let mut session = agent.session.lock(cx.cx()).await.expect("session lock");
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("share this".to_string()),
+            timestamp: Some(1),
+        });
+    });
+
+    let config = Config {
+        gh_path: Some(gh_path.display().to_string()),
+        ..Config::default()
+    };
+    let result = run_async(share_current_session_for_tui(
+        &agent,
+        &config,
+        temp.path(),
+        true,
+    ))
+    .expect("share session");
+
+    assert!(result.public);
+    assert_eq!(
+        result.gist_url,
+        "https://gist.github.com/testuser/share_id_789"
+    );
+    assert_eq!(
+        result.viewer_url,
+        "https://buildwithpi.ai/session/#share_id_789"
+    );
+    let args = std::fs::read_to_string(args_log).expect("read gh args");
+    assert!(args.contains("auth status"));
+    assert!(args.contains("gist create"));
+    assert!(args.contains("--public=true"));
+    assert!(args.contains("--desc"));
+}
+
+#[test]
+fn share_current_session_for_tui_reports_missing_gh() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let agent = empty_agent_session(temp.path());
+    let config = Config {
+        gh_path: Some(temp.path().join("missing-gh").display().to_string()),
+        ..Config::default()
+    };
+
+    let err = run_async(share_current_session_for_tui(
+        &agent,
+        &config,
+        temp.path(),
+        false,
+    ))
+    .expect_err("missing gh should fail");
+
+    assert!(err.to_string().contains("cli.github.com"));
 }
 
 #[test]
