@@ -5,7 +5,7 @@ use pi::compaction::ResolvedCompactionSettings;
 use pi::interactive::{
     build_model_picker_items, expand_submitted_content_for_tui, format_agent_event,
     format_compaction_status, format_reload_status, format_session_name_status,
-    resume_session_from_path_for_tui, session_picker_items,
+    last_assistant_text_for_tui, resume_session_from_path_for_tui, session_picker_items,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -337,6 +337,43 @@ fn compaction_events_render_progress_summary_and_errors() {
         format_compaction_status(&failed).as_deref(),
         Some("上下文压缩失败: aborted=false retry=false error=Missing API key")
     );
+}
+
+#[test]
+fn last_assistant_text_for_tui_returns_latest_text_message() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let agent = empty_agent_session(temp.path());
+    run_async(async {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let mut session = agent.session.lock(cx.cx()).await.expect("session lock");
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("older answer"))],
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                timestamp: 1,
+                ..Default::default()
+            },
+        });
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![
+                    ContentBlock::Text(TextContent::new("latest")),
+                    ContentBlock::Text(TextContent::new("answer")),
+                ],
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                timestamp: 2,
+                ..Default::default()
+            },
+        });
+    });
+
+    let text = run_async(last_assistant_text_for_tui(&agent)).expect("last assistant");
+
+    assert_eq!(text.as_deref(), Some("latest\nanswer"));
 }
 
 #[test]

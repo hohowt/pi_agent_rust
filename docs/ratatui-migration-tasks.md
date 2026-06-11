@@ -128,7 +128,7 @@
 - [x] `/reload`: reload models/resources, update autocomplete catalog, and show
       diagnostics.
 - [ ] `/export`: restore default export path, HTML/JSON export, and status.
-- [ ] `/copy`: restore clipboard support behind the clipboard feature.
+- [x] `/copy`: restore clipboard support behind the clipboard feature.
 - [ ] `/share`: restore share flow.
 - [ ] `/changelog`: restore startup/current changelog UI.
 - [x] `/name`: keep current naming behavior and add visible confirmation/error

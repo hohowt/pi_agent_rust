@@ -573,12 +573,12 @@ async fn handle_slash_command(
             return handle_template_command(agent, context, args, action_tx).await;
         }
         SlashCommand::Compact => handle_compact_command(agent).await?,
+        SlashCommand::Copy => handle_copy_command(agent).await?,
         SlashCommand::Name => handle_name_command(agent, args).await?,
         SlashCommand::Language => handle_language_command(context, args)?,
         SlashCommand::Login
         | SlashCommand::Logout
         | SlashCommand::Export
-        | SlashCommand::Copy
         | SlashCommand::Fork
         | SlashCommand::Share
         | SlashCommand::Changelog => status_action(format_command_unavailable(command)),
@@ -1214,6 +1214,57 @@ async fn handle_compact_command(agent: &mut AgentSession) -> Result<pi_tui::Chat
             Ok(pi_tui::ChatAction::Many(actions))
         }
     }
+}
+
+async fn handle_copy_command(agent: &AgentSession) -> Result<pi_tui::ChatAction> {
+    let Some(text) = last_assistant_text_for_tui(agent).await? else {
+        return Ok(status_action("没有可复制的 assistant 消息。"));
+    };
+
+    match copy_text_to_clipboard(&text) {
+        Ok(()) => Ok(status_action(format!(
+            "已复制上一条 assistant 消息到剪贴板（{} chars）。",
+            text.chars().count()
+        ))),
+        Err(err) => Ok(status_action(format!("复制失败: {err}"))),
+    }
+}
+
+#[doc(hidden)]
+pub async fn last_assistant_text_for_tui(agent: &AgentSession) -> Result<Option<String>> {
+    let cx = crate::agent_cx::AgentCx::for_request();
+    let session = agent
+        .session
+        .lock(cx.cx())
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+
+    for entry in session.entries_for_current_path().into_iter().rev() {
+        let crate::session::SessionEntry::Message(message_entry) = entry else {
+            continue;
+        };
+        let crate::session::SessionMessage::Assistant { message } = &message_entry.message else {
+            continue;
+        };
+        let text = content_blocks_to_text(&message.content);
+        if !text.trim().is_empty() {
+            return Ok(Some(text));
+        }
+    }
+
+    Ok(None)
+}
+
+#[cfg(feature = "clipboard")]
+fn copy_text_to_clipboard(text: &str) -> Result<()> {
+    let mut clipboard = arboard::Clipboard::new()?;
+    clipboard.set_text(text.to_string())?;
+    Ok(())
+}
+
+#[cfg(not(feature = "clipboard"))]
+fn copy_text_to_clipboard(_text: &str) -> Result<()> {
+    anyhow::bail!("当前构建未启用 clipboard feature，无法写入系统剪贴板。")
 }
 
 async fn handle_name_command(agent: &mut AgentSession, args: &str) -> Result<pi_tui::ChatAction> {
