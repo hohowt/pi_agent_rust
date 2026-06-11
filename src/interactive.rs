@@ -4,7 +4,7 @@ use anyhow::Result;
 use pi_core::model::{ContentBlock, TextContent};
 use pi_prompt::PromptCatalog;
 
-use crate::agent::{AgentEvent, AgentSession};
+use crate::agent::{AgentEvent, AgentSession, QueueMode};
 use crate::auth::AuthStorage;
 use crate::config::{Config, Language, SettingsScope};
 use crate::model::{AssistantMessageEvent, Message, ThinkingLevel, UserContent};
@@ -572,7 +572,7 @@ async fn handle_slash_command(
         SlashCommand::Model => handle_model_command(agent, context, args).await?,
         SlashCommand::Thinking => handle_thinking_command(agent, context, args).await?,
         SlashCommand::Session => status_action(format_session_status(agent).await?),
-        SlashCommand::Settings => status_action(format_settings_status(context)),
+        SlashCommand::Settings => handle_settings_command(agent, context, args).await?,
         SlashCommand::Reload => handle_reload_command(agent, context).await?,
         SlashCommand::ScopedModels => status_action(format_scoped_models(context, args)),
         SlashCommand::Codegraph => status_action(handle_codegraph_command(context, args)?),
@@ -1151,12 +1151,302 @@ pub async fn fork_from_user_message_for_tui(
 
 fn format_settings_status(context: &InteractiveContext) -> String {
     format!(
-        "设置\n语言: {:?}\ncodegraph.autoInit: {}\ncodegraph.watch: {}\ncodegraph.debounceMs: {}",
+        "设置\n语言: {:?}\ntheme: {}\nqueue: steering={}, follow-up={}\ncompaction: enabled={}, reserve={}, keepRecent={}\ndoubleEsc: {}\neditorPaddingX: {}\nautocompleteMaxVisible: {}\ncodegraph.autoInit: {}\ncodegraph.watch: {}\ncodegraph.debounceMs: {}",
         context.config.language(),
+        context.config.theme.as_deref().unwrap_or("dark"),
+        queue_mode_label(context.config.steering_queue_mode()),
+        queue_mode_label(context.config.follow_up_queue_mode()),
+        context.config.compaction_enabled(),
+        context.config.compaction_reserve_tokens(),
+        context.config.compaction_keep_recent_tokens(),
+        context
+            .config
+            .double_escape_action
+            .as_deref()
+            .unwrap_or("tree"),
+        context.config.editor_padding_x.unwrap_or(0),
+        context.config.autocomplete_max_visible.unwrap_or(5),
         context.config.codegraph_auto_init(),
         context.config.codegraph_watch(),
         context.config.codegraph_watch_debounce_ms()
     )
+}
+
+async fn handle_settings_command(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
+    let selected = args.trim();
+    if selected.is_empty() {
+        return Ok(pi_tui::ChatAction::OpenPicker(
+            pi_tui::ChatPicker::new("设置", "/settings", settings_picker_items(context))
+                .with_subtitle("选择一项立即编辑或切换")
+                .with_empty_message("没有匹配的设置项"),
+        ));
+    }
+
+    match selected {
+        "theme" => handle_theme_command(context, "").await,
+        "language" => handle_language_command(context, ""),
+        "queue.steering" => apply_queue_setting(
+            agent,
+            context,
+            "steering_mode",
+            next_queue_mode(context.config.steering_queue_mode()),
+        ),
+        "queue.followup" => apply_queue_setting(
+            agent,
+            context,
+            "follow_up_mode",
+            next_queue_mode(context.config.follow_up_queue_mode()),
+        ),
+        "compaction.enabled" | "compaction.reserve" | "compaction.keep" => {
+            apply_compaction_setting(context, selected)
+        }
+        "double_escape" | "editor.padding" | "autocomplete.max" => {
+            apply_terminal_setting(context, selected)
+        }
+        _ => Ok(status_action(format!("未知设置项: {selected}"))),
+    }
+}
+
+fn settings_picker_items(context: &InteractiveContext) -> Vec<pi_tui::PickerItem> {
+    settings_picker_items_for_config(&context.config)
+}
+
+#[doc(hidden)]
+pub fn settings_picker_items_for_config(config: &Config) -> Vec<pi_tui::PickerItem> {
+    vec![
+        pi_tui::PickerItem::new("Theme", "theme", config.theme.as_deref().unwrap_or("dark")),
+        pi_tui::PickerItem::new("Language", "language", format!("{:?}", config.language())),
+        pi_tui::PickerItem::new(
+            "Steering queue",
+            "queue.steering",
+            queue_mode_label(config.steering_queue_mode()),
+        ),
+        pi_tui::PickerItem::new(
+            "Follow-up queue",
+            "queue.followup",
+            queue_mode_label(config.follow_up_queue_mode()),
+        ),
+        pi_tui::PickerItem::new(
+            "Compaction",
+            "compaction.enabled",
+            bool_label(config.compaction_enabled()),
+        ),
+        pi_tui::PickerItem::new(
+            "Compaction reserve",
+            "compaction.reserve",
+            config.compaction_reserve_tokens().to_string(),
+        ),
+        pi_tui::PickerItem::new(
+            "Keep recent tokens",
+            "compaction.keep",
+            config.compaction_keep_recent_tokens().to_string(),
+        ),
+        pi_tui::PickerItem::new(
+            "Double Esc",
+            "double_escape",
+            config.double_escape_action.as_deref().unwrap_or("tree"),
+        ),
+        pi_tui::PickerItem::new(
+            "Editor padding",
+            "editor.padding",
+            config.editor_padding_x.unwrap_or(0).to_string(),
+        ),
+        pi_tui::PickerItem::new(
+            "Autocomplete rows",
+            "autocomplete.max",
+            config.autocomplete_max_visible.unwrap_or(5).to_string(),
+        ),
+    ]
+}
+
+fn patch_project_setting(
+    context: &mut InteractiveContext,
+    patch: serde_json::Value,
+    apply: impl FnOnce(&mut Config),
+) -> Result<()> {
+    Config::patch_settings_with_roots(
+        SettingsScope::Project,
+        &Config::global_dir(),
+        &context.cwd,
+        patch,
+    )?;
+    apply(&mut context.config);
+    Ok(())
+}
+
+fn settings_updated_action(context: &InteractiveContext, name: &str) -> pi_tui::ChatAction {
+    pi_tui::ChatAction::Many(vec![
+        status_action(format!(
+            "设置已更新: {name}\n{}",
+            format_settings_status(context)
+        )),
+        pi_tui::ChatAction::SetOptions(Box::new(context.options.clone())),
+    ])
+}
+
+fn apply_queue_setting(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+    key: &'static str,
+    mode: QueueMode,
+) -> Result<pi_tui::ChatAction> {
+    let value = queue_mode_label(mode);
+    match key {
+        "steering_mode" => {
+            patch_project_setting(context, json!({ "steering_mode": value }), |config| {
+                config.steering_mode = Some(value.to_string());
+            })?;
+        }
+        "follow_up_mode" => {
+            patch_project_setting(context, json!({ "follow_up_mode": value }), |config| {
+                config.follow_up_mode = Some(value.to_string());
+            })?;
+        }
+        _ => {}
+    }
+    agent.set_queue_modes(
+        context.config.steering_queue_mode(),
+        context.config.follow_up_queue_mode(),
+    );
+    Ok(settings_updated_action(context, key))
+}
+
+fn apply_compaction_setting(
+    context: &mut InteractiveContext,
+    selected: &str,
+) -> Result<pi_tui::ChatAction> {
+    match selected {
+        "compaction.enabled" => {
+            let enabled = !context.config.compaction_enabled();
+            patch_project_setting(
+                context,
+                json!({ "compaction": { "enabled": enabled } }),
+                |config| {
+                    config
+                        .compaction
+                        .get_or_insert_with(Default::default)
+                        .enabled = Some(enabled);
+                },
+            )?;
+            Ok(settings_updated_action(context, "compaction.enabled"))
+        }
+        "compaction.reserve" => {
+            let value = next_token_setting(
+                context.config.compaction_reserve_tokens(),
+                &[8192, 16384, 32768, 65536],
+            );
+            patch_project_setting(
+                context,
+                json!({ "compaction": { "reserve_tokens": value } }),
+                |config| {
+                    config
+                        .compaction
+                        .get_or_insert_with(Default::default)
+                        .reserve_tokens = Some(value);
+                },
+            )?;
+            Ok(settings_updated_action(
+                context,
+                "compaction.reserve_tokens",
+            ))
+        }
+        "compaction.keep" => {
+            let value = next_token_setting(
+                context.config.compaction_keep_recent_tokens(),
+                &[10000, 20000, 40000, 80000],
+            );
+            patch_project_setting(
+                context,
+                json!({ "compaction": { "keep_recent_tokens": value } }),
+                |config| {
+                    config
+                        .compaction
+                        .get_or_insert_with(Default::default)
+                        .keep_recent_tokens = Some(value);
+                },
+            )?;
+            Ok(settings_updated_action(
+                context,
+                "compaction.keep_recent_tokens",
+            ))
+        }
+        _ => Ok(status_action(format!("未知设置项: {selected}"))),
+    }
+}
+
+fn apply_terminal_setting(
+    context: &mut InteractiveContext,
+    selected: &str,
+) -> Result<pi_tui::ChatAction> {
+    match selected {
+        "double_escape" => {
+            let value = next_double_escape_action(context.config.double_escape_action.as_deref());
+            patch_project_setting(
+                context,
+                json!({ "double_escape_action": value }),
+                |config| config.double_escape_action = Some(value.to_string()),
+            )?;
+            Ok(settings_updated_action(context, "double_escape_action"))
+        }
+        "editor.padding" => {
+            let value = (context.config.editor_padding_x.unwrap_or(0) + 1) % 4;
+            patch_project_setting(context, json!({ "editor_padding_x": value }), |config| {
+                config.editor_padding_x = Some(value);
+            })?;
+            Ok(settings_updated_action(context, "editor_padding_x"))
+        }
+        "autocomplete.max" => {
+            let value = next_token_setting(
+                context.config.autocomplete_max_visible.unwrap_or(5),
+                &[3, 5, 8, 12, 20],
+            );
+            patch_project_setting(
+                context,
+                json!({ "autocomplete_max_visible": value }),
+                |config| config.autocomplete_max_visible = Some(value),
+            )?;
+            Ok(settings_updated_action(context, "autocomplete_max_visible"))
+        }
+        _ => Ok(status_action(format!("未知设置项: {selected}"))),
+    }
+}
+
+fn next_queue_mode(mode: QueueMode) -> QueueMode {
+    match mode {
+        QueueMode::OneAtATime => QueueMode::All,
+        QueueMode::All => QueueMode::OneAtATime,
+    }
+}
+
+fn queue_mode_label(mode: QueueMode) -> &'static str {
+    match mode {
+        QueueMode::OneAtATime => "one-at-a-time",
+        QueueMode::All => "all",
+    }
+}
+
+fn bool_label(value: bool) -> &'static str {
+    if value { "enabled" } else { "disabled" }
+}
+
+fn next_double_escape_action(current: Option<&str>) -> &'static str {
+    match current.unwrap_or("tree") {
+        "tree" => "fork",
+        "fork" => "none",
+        _ => "tree",
+    }
+}
+
+fn next_token_setting(current: u32, values: &[u32]) -> u32 {
+    values
+        .iter()
+        .copied()
+        .find(|value| *value > current)
+        .unwrap_or_else(|| values[0])
 }
 
 fn format_resource_status(context: &InteractiveContext) -> String {

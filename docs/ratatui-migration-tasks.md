@@ -89,10 +89,10 @@
         scope hints, and session metadata rows.
   - [ ] Restore delete confirmation, branch metadata, and in-picker cwd/all-session
         toggles.
-- [ ] Port settings UI.
-  - [ ] Restore editable settings rows for theme, language, queue mode,
+- [x] Port settings UI.
+  - [x] Restore editable settings rows for theme, language, queue mode,
         compaction, double-Esc action, editor padding, and autocomplete size.
-  - [ ] Persist project/global settings through existing config paths.
+  - [x] Persist project/global settings through existing config paths.
 - [x] Port theme picker.
   - [x] Open a generic theme picker.
   - [x] Apply selected themes immediately and persist project theme.
@@ -118,7 +118,7 @@
 - [x] `/codegraph init|sync|status`: call the codegraph index API.
 - [ ] `/login`: restore OAuth/API-key interactive login flows.
 - [x] `/logout`: restore provider credential removal flow.
-- [ ] `/settings`: restore full interactive settings overlay.
+- [x] `/settings`: restore full interactive settings overlay.
 - [x] `/theme`: apply selected theme, not just show/select the item.
 - [x] `/template`: apply selected prompt template content immediately.
 - [x] `/history` and `/resume`: load selected session.

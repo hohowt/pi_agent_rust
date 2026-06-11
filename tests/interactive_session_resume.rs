@@ -10,8 +10,8 @@ use pi::interactive::{
     format_agent_event, format_changelog_entry, format_compaction_status, format_reload_status,
     format_session_name_status, last_assistant_text_for_tui, logout_picker_items,
     logout_provider_for_tui, resume_session_from_path_for_tui, select_tree_leaf_for_tui,
-    session_picker_items, share_current_session_for_tui, startup_changelog_lines,
-    startup_oauth_hint_lines, tree_picker_items,
+    session_picker_items, settings_picker_items_for_config, share_current_session_for_tui,
+    startup_changelog_lines, startup_oauth_hint_lines, tree_picker_items,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -501,6 +501,87 @@ fn fork_from_user_message_prefills_editor_and_installs_new_session() {
         }
         other => panic!("expected assistant message, got {other:?}"),
     }
+}
+
+#[test]
+fn settings_picker_items_cover_editable_rows() {
+    let config = Config {
+        theme: Some("solarized".to_string()),
+        language: Some("en".to_string()),
+        steering_mode: Some("all".to_string()),
+        follow_up_mode: Some("one-at-a-time".to_string()),
+        compaction: Some(pi::config::CompactionSettings {
+            enabled: Some(false),
+            reserve_tokens: Some(32768),
+            keep_recent_tokens: Some(40000),
+        }),
+        double_escape_action: Some("fork".to_string()),
+        editor_padding_x: Some(2),
+        autocomplete_max_visible: Some(12),
+        ..Config::default()
+    };
+
+    let items = settings_picker_items_for_config(&config);
+    let values = items
+        .iter()
+        .map(|item| item.value.as_str())
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        values,
+        vec![
+            "theme",
+            "language",
+            "queue.steering",
+            "queue.followup",
+            "compaction.enabled",
+            "compaction.reserve",
+            "compaction.keep",
+            "double_escape",
+            "editor.padding",
+            "autocomplete.max",
+        ]
+    );
+    assert!(items.iter().any(|item| item.description == "solarized"));
+    assert!(items.iter().any(|item| item.description == "disabled"));
+    assert!(items.iter().any(|item| item.description == "32768"));
+    assert!(items.iter().any(|item| item.description == "fork"));
+    assert!(items.iter().any(|item| item.description == "12"));
+}
+
+#[test]
+fn settings_fields_persist_through_project_settings_patch() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    Config::patch_settings_with_roots(
+        pi::config::SettingsScope::Project,
+        temp.path(),
+        temp.path(),
+        json!({
+            "steering_mode": "all",
+            "follow_up_mode": "one-at-a-time",
+            "compaction": {
+                "enabled": false,
+                "reserve_tokens": 32768,
+                "keep_recent_tokens": 40000
+            },
+            "double_escape_action": "fork",
+            "editor_padding_x": 2,
+            "autocomplete_max_visible": 12
+        }),
+    )
+    .expect("patch settings");
+
+    let loaded =
+        Config::load_with_roots(None, temp.path(), temp.path()).expect("load patched settings");
+
+    assert_eq!(loaded.steering_mode.as_deref(), Some("all"));
+    assert_eq!(loaded.follow_up_mode.as_deref(), Some("one-at-a-time"));
+    assert!(!loaded.compaction_enabled());
+    assert_eq!(loaded.compaction_reserve_tokens(), 32768);
+    assert_eq!(loaded.compaction_keep_recent_tokens(), 40000);
+    assert_eq!(loaded.double_escape_action.as_deref(), Some("fork"));
+    assert_eq!(loaded.editor_padding_x, Some(2));
+    assert_eq!(loaded.autocomplete_max_visible, Some(12));
 }
 
 #[test]
