@@ -6,12 +6,12 @@ use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
 use pi::interactive::{
     build_model_picker_items, changelog_picker_items, expand_submitted_content_for_tui,
-    export_current_session_for_tui, format_agent_event, format_changelog_entry,
-    format_compaction_status, format_reload_status, format_session_name_status,
-    last_assistant_text_for_tui, logout_picker_items, logout_provider_for_tui,
-    resume_session_from_path_for_tui, select_tree_leaf_for_tui, session_picker_items,
-    share_current_session_for_tui, startup_changelog_lines, startup_oauth_hint_lines,
-    tree_picker_items,
+    export_current_session_for_tui, fork_from_user_message_for_tui, fork_picker_items,
+    format_agent_event, format_changelog_entry, format_compaction_status, format_reload_status,
+    format_session_name_status, last_assistant_text_for_tui, logout_picker_items,
+    logout_provider_for_tui, resume_session_from_path_for_tui, select_tree_leaf_for_tui,
+    session_picker_items, share_current_session_for_tui, startup_changelog_lines,
+    startup_oauth_hint_lines, tree_picker_items,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -403,6 +403,101 @@ fn selecting_tree_leaf_replaces_visible_and_agent_history() {
                 panic!("expected text content");
             };
             assert_eq!(text.text, "first answer");
+        }
+        other => panic!("expected assistant message, got {other:?}"),
+    }
+}
+
+#[test]
+fn fork_picker_items_list_current_path_user_messages() {
+    let mut session = Session::in_memory();
+    let first = session.append_message(SessionMessage::User {
+        content: UserContent::Text("first prompt".to_string()),
+        timestamp: Some(1),
+    });
+    session.append_message(SessionMessage::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("answer"))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            timestamp: 2,
+            ..Default::default()
+        },
+    });
+    let second = session.append_message(SessionMessage::User {
+        content: UserContent::Text("second prompt".to_string()),
+        timestamp: Some(3),
+    });
+
+    let items = fork_picker_items(&session);
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].value, first);
+    assert!(items[0].label.contains("first prompt"));
+    assert_eq!(items[1].value, second);
+    assert!(items[1].label.contains("second prompt"));
+}
+
+#[test]
+fn fork_from_user_message_prefills_editor_and_installs_new_session() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut session = Session::in_memory();
+    session.append_message(SessionMessage::User {
+        content: UserContent::Text("root prompt".to_string()),
+        timestamp: Some(1),
+    });
+    session.append_message(SessionMessage::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("root answer"))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            timestamp: 2,
+            ..Default::default()
+        },
+    });
+    let fork_target = session.append_message(SessionMessage::User {
+        content: UserContent::Text("redo this".to_string()),
+        timestamp: Some(3),
+    });
+    session.append_message(SessionMessage::Assistant {
+        message: AssistantMessage {
+            content: vec![ContentBlock::Text(TextContent::new("old answer"))],
+            api: "test-api".to_string(),
+            provider: "test-provider".to_string(),
+            model: "test-model".to_string(),
+            timestamp: 4,
+            ..Default::default()
+        },
+    });
+
+    let mut agent = empty_agent_session(temp.path());
+    run_async(async {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let mut active = agent.session.lock(cx.cx()).await.expect("session lock");
+        *active = session;
+    });
+
+    let action = run_async(fork_from_user_message_for_tui(&mut agent, &fork_target))
+        .expect("fork from user message");
+
+    let pi_tui::ChatAction::Many(actions) = action else {
+        panic!("expected fork actions");
+    };
+    assert!(matches!(actions[0], pi_tui::ChatAction::ReplaceLines(_)));
+    let pi_tui::ChatAction::SetEditorText(text) = &actions[1] else {
+        panic!("expected editor prefill");
+    };
+    assert_eq!(text, "redo this");
+    let messages = agent.agent.messages();
+    assert_eq!(messages.len(), 2);
+    match &messages[1] {
+        Message::Assistant(assistant) => {
+            let ContentBlock::Text(text) = &assistant.content[0] else {
+                panic!("expected text content");
+            };
+            assert_eq!(text.text, "root answer");
         }
         other => panic!("expected assistant message, got {other:?}"),
     }

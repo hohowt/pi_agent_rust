@@ -209,6 +209,7 @@ pub enum ChatAction {
     AppendAssistantText(String),
     AppendThinkingText(String),
     ReplaceLines(Vec<ChatLine>),
+    SetEditorText(String),
     Clear,
     Quit,
     SetOptions(Box<ChatOptions>),
@@ -301,6 +302,7 @@ impl ChatApp {
                 self.scroll.scroll_to_bottom();
                 self.scroll.mark_content_changed();
             }
+            ChatAction::SetEditorText(text) => self.editor.set_text(text),
             ChatAction::Clear => {
                 self.lines.clear();
                 self.scroll.scroll_to_bottom();
@@ -1950,6 +1952,16 @@ mod tests {
 
         assert_eq!(app.editor.text(), "abc\nd");
         assert_eq!(app.editor.cursor_position(), (1, 1));
+    }
+
+    #[test]
+    fn set_editor_text_action_prefills_composer() {
+        let mut app = ChatApp::new(ChatOptions::new("model"));
+
+        app.apply_action(ChatAction::SetEditorText("fork prompt".to_string()));
+
+        assert_eq!(app.editor.text(), "fork prompt");
+        assert_eq!(app.editor.cursor_position(), (0, "fork prompt".width()));
     }
 
     #[test]

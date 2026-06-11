@@ -41,6 +41,7 @@ read-only status where the previous UI performed a richer action.
 | `/logout` | Opens a provider picker for saved credentials; selecting a provider removes that credential immediately and refreshes auth/model state. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | Startup auth hint | Shows startup credential guidance for the current model when auth is missing, while respecting quiet startup. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | `/tree` | Opens a branch leaf picker; selecting a leaf switches the current conversation branch and replaces visible history immediately. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
+| `/fork` | Opens a user-message picker, creates a forked session from the selected point, replaces visible history, and pre-fills the selected prompt. | `src/interactive.rs`, `crates/pi-tui/src/chat.rs`, `tests/interactive_session_resume.rs` |
 | Markdown rendering | Assistant messages are rendered through the ratatui markdown path for headings, lists, links, code fences, and CJK text. | `crates/pi-tui/src/chat.rs:1144-1352`, `crates/pi-tui/src/chat.rs:1959-1989` |
 | Editing history | Up/down navigation restores previous prompts and the current draft. | `crates/pi-tui/src/chat.rs:318-435`, `crates/pi-tui/src/chat.rs:1811-1855` |
 | Mouse wheel | Mouse wheel routing is wired through the terminal mouse capture policy. | `crates/pi-tui/src/chat.rs:289-303`, `crates/pi-tui/src/terminal.rs:29-77` |
@@ -50,7 +51,6 @@ read-only status where the previous UI performed a richer action.
 | Feature | Current behavior | Evidence | Impact |
 |---|---|---|---|
 | `/login` | Returns a status message telling the user to use non-interactive setup. No OAuth/API-key interactive flow runs. | `src/interactive.rs:400-406`, `src/interactive.rs:863-867` | Users cannot authenticate from the interactive TUI. |
-| `/fork` | Returns a status message pointing users to `/tree`. No branch picker or fork is performed. | `src/interactive.rs:400-406`, `src/interactive.rs:873-875` | Conversation branching from TUI is unavailable. |
 
 ## Present But Degraded
 
@@ -78,12 +78,11 @@ read-only status where the previous UI performed a richer action.
 ## Priority Order
 
 1. Credential flow: `/login` is an explicit unavailable-command path.
-2. Fork parity: `/fork` is unavailable.
-3. Settings parity: `/settings` exists but still lacks the full editable
+2. Settings parity: `/settings` exists but still lacks the full editable
    interactive flow and persistence controls.
-4. Picker richness: model/session pickers work, but still lack grouping,
+3. Picker richness: model/session pickers work, but still lack grouping,
    metadata, delete confirmation, filter states, and cwd/all-session toggles.
-5. Tool presentation: live progress exists, but collapsed previews, expansion,
+4. Tool presentation: live progress exists, but collapsed previews, expansion,
    per-tool error styling, and Shift+Tab thinking visibility remain open.
 
 ## Audit Commands

@@ -597,9 +597,8 @@ async fn handle_slash_command(
         SlashCommand::Language => handle_language_command(context, args)?,
         SlashCommand::Share => handle_share_command(agent, context, args).await?,
         SlashCommand::Logout => handle_logout_command(agent, context, args).await?,
-        SlashCommand::Login | SlashCommand::Fork => {
-            status_action(format_command_unavailable(command))
-        }
+        SlashCommand::Fork => handle_fork_command(agent, args).await?,
+        SlashCommand::Login => status_action(format_command_unavailable(command)),
     };
     Ok(action)
 }
@@ -1031,6 +1030,122 @@ pub async fn select_tree_leaf_for_tui(
     Ok(pi_tui::ChatAction::Many(vec![
         pi_tui::ChatAction::ReplaceLines(visible_lines),
         status_action(format!("已切换对话分支: {current_leaf}")),
+    ]))
+}
+
+async fn handle_fork_command(agent: &mut AgentSession, args: &str) -> Result<pi_tui::ChatAction> {
+    let selected = args.trim();
+    if !selected.is_empty() {
+        return fork_from_user_message_for_tui(agent, selected).await;
+    }
+
+    let cx = crate::agent_cx::AgentCx::for_request();
+    let session = agent
+        .session
+        .lock(cx.cx())
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let items = fork_picker_items(&session);
+    if items.is_empty() {
+        return Ok(status_action("当前路径没有可 fork 的用户消息。"));
+    }
+    Ok(pi_tui::ChatAction::OpenPicker(
+        pi_tui::ChatPicker::new("Fork", "/fork", items)
+            .with_subtitle("选择要重新提交的用户消息")
+            .with_empty_message("没有匹配的用户消息"),
+    ))
+}
+
+#[doc(hidden)]
+pub fn fork_picker_items(session: &crate::session::Session) -> Vec<pi_tui::PickerItem> {
+    session
+        .entries_for_current_path()
+        .into_iter()
+        .filter_map(fork_picker_item)
+        .take(100)
+        .collect()
+}
+
+fn fork_picker_item(entry: &SessionEntry) -> Option<pi_tui::PickerItem> {
+    let SessionEntry::Message(message_entry) = entry else {
+        return None;
+    };
+    let crate::session::SessionMessage::User { content, timestamp } = &message_entry.message else {
+        return None;
+    };
+    let id = message_entry.base.id.as_ref()?;
+    let text = user_content_to_text(content);
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let description = timestamp.map_or_else(
+        || "user message".to_string(),
+        |timestamp| format!("user message  ts {timestamp}"),
+    );
+    Some(pi_tui::PickerItem::new(
+        truncate_line(trimmed, 80),
+        id.clone(),
+        description,
+    ))
+}
+
+#[doc(hidden)]
+pub async fn fork_from_user_message_for_tui(
+    agent: &mut AgentSession,
+    entry_id: &str,
+) -> Result<pi_tui::ChatAction> {
+    let cx = crate::agent_cx::AgentCx::for_request();
+    let (fork_plan, parent_path, session_dir, header_snapshot) = {
+        let session = agent
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        (
+            session.plan_fork_from_user_message(entry_id)?,
+            session.path.as_ref().map(|path| path.display().to_string()),
+            session.session_dir.clone(),
+            session.header.clone(),
+        )
+    };
+
+    let selected_text = fork_plan.selected_text.clone();
+    let mut new_session = if agent.save_enabled() {
+        crate::session::Session::create_with_dir(session_dir)
+    } else {
+        crate::session::Session::in_memory()
+    };
+    new_session.header.parent_session = parent_path;
+    new_session.header.provider = header_snapshot.provider;
+    new_session.header.model_id = header_snapshot.model_id;
+    new_session.header.thinking_level = header_snapshot.thinking_level;
+    new_session.init_from_fork_plan(fork_plan);
+
+    let history = new_session.to_messages_for_current_path();
+    let visible_lines = chat_lines_from_messages(&history);
+    let session_id = new_session.header.id.clone();
+    let leaf = new_session.leaf_id().map(ToString::to_string);
+
+    {
+        let mut active = agent
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        *active = new_session;
+    }
+    agent.agent.replace_messages(history);
+    agent.agent.stream_options_mut().session_id = Some(session_id);
+    agent.persist_session().await?;
+
+    let leaf_label = leaf.unwrap_or_else(|| "root".to_string());
+    Ok(pi_tui::ChatAction::Many(vec![
+        pi_tui::ChatAction::ReplaceLines(visible_lines),
+        pi_tui::ChatAction::SetEditorText(selected_text),
+        status_action(format!(
+            "已创建 fork，当前 leaf: {leaf_label}\n已将选中消息放回输入框。"
+        )),
     ]))
 }
 
@@ -2056,9 +2171,6 @@ fn format_command_unavailable(command: SlashCommand) -> String {
     match command {
         SlashCommand::Login => {
             "/login 需要 OAuth/API key 专用交互流程；当前请使用非交互 CLI 登录流程。".to_string()
-        }
-        SlashCommand::Fork => {
-            "/fork 需要分支选择器；当前请使用 /tree 查看当前路径信息。".to_string()
         }
         _ => format!("/{command:?} 当前不可用。"),
     }
