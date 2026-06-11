@@ -170,6 +170,8 @@ pub struct ChatPicker {
     pub title: String,
     pub prompt_prefix: String,
     pub items: Vec<PickerItem>,
+    pub subtitle: Option<String>,
+    pub empty_message: String,
 }
 
 impl ChatPicker {
@@ -183,7 +185,21 @@ impl ChatPicker {
             title: title.into(),
             prompt_prefix: prompt_prefix.into(),
             items,
+            subtitle: None,
+            empty_message: "No matches".to_string(),
         }
+    }
+
+    #[must_use]
+    pub fn with_subtitle(mut self, subtitle: impl Into<String>) -> Self {
+        self.subtitle = Some(subtitle.into());
+        self
+    }
+
+    #[must_use]
+    pub fn with_empty_message(mut self, message: impl Into<String>) -> Self {
+        self.empty_message = message.into();
+        self
     }
 }
 
@@ -1655,17 +1671,7 @@ fn render_picker(
     };
     let items = picker.filtered_items();
     let visible = usize::from(height.saturating_sub(4));
-    let lines = std::iter::once(Line::from(vec![
-        Span::styled("filter: ", Style::default().fg(palette.muted)),
-        Span::raw(picker.query.as_str()),
-    ]))
-    .chain(picker_lines(
-        &items,
-        picker.selected.min(items.len().saturating_sub(1)),
-        visible,
-        palette,
-    ))
-    .collect::<Vec<_>>();
+    let lines = picker_content_lines(picker, &items, visible, palette);
     frame.render_widget(Clear, area);
     frame.render_widget(
         Paragraph::new(lines).block(
@@ -1676,6 +1682,42 @@ fn render_picker(
         ),
         area,
     );
+}
+
+fn picker_content_lines(
+    picker: &PickerState,
+    items: &[&PickerItem],
+    visible_rows: usize,
+    palette: &ChatPalette,
+) -> Vec<Line<'static>> {
+    let header = [
+        picker.picker.subtitle.as_ref().map(|subtitle| {
+            Line::from(vec![Span::styled(
+                subtitle.clone(),
+                Style::default().fg(palette.muted),
+            )])
+        }),
+        Some(Line::from(vec![
+            Span::styled("filter: ", Style::default().fg(palette.muted)),
+            Span::raw(picker.query.clone()),
+        ])),
+    ];
+    let item_lines = if items.is_empty() {
+        vec![Line::from(vec![Span::styled(
+            picker.picker.empty_message.clone(),
+            Style::default()
+                .fg(palette.muted)
+                .add_modifier(Modifier::ITALIC),
+        )])]
+    } else {
+        picker_lines(
+            items,
+            picker.selected.min(items.len().saturating_sub(1)),
+            visible_rows,
+            palette,
+        )
+    };
+    header.into_iter().flatten().chain(item_lines).collect()
 }
 
 fn picker_lines(
@@ -1743,7 +1785,6 @@ fn picker_item_line(item: &PickerItem, selected: bool, palette: &ChatPalette) ->
     }
     Line::from(spans)
 }
-
 fn default_slash_commands() -> Vec<SlashCommandItem> {
     [
         ("/help", "帮助"),
@@ -1772,8 +1813,9 @@ fn default_slash_commands() -> Vec<SlashCommandItem> {
 mod tests {
     use super::{
         ChatAction, ChatApp, ChatLine, ChatOptions, ChatPalette, ChatPicker, ConversationScroll,
-        EditorState, EventOutcome, PickerItem, chat_layout, composer_height, composer_layout,
-        conversation_lines, footer_line, normalize_pasted_text, slash_completion_height,
+        EditorState, EventOutcome, PickerItem, PickerState, chat_layout, composer_height,
+        composer_layout, conversation_lines, footer_line, normalize_pasted_text,
+        picker_content_lines, slash_completion_height,
     };
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use ratatui::layout::Rect;
@@ -2243,6 +2285,29 @@ mod tests {
         assert_eq!(outcome, EventOutcome::None);
         assert_eq!(app.editor.text(), "/model");
         assert!(app.picker.is_some());
+    }
+
+    #[test]
+    fn picker_lines_show_empty_message_when_filter_has_no_matches() {
+        let picker = ChatPicker::new(
+            "会话列表",
+            "/resume",
+            vec![PickerItem::new("session", "/tmp/session.jsonl", "item")],
+        )
+        .with_empty_message("没有匹配的会话。");
+        let mut state = PickerState::new(picker);
+        state.query = "missing".to_string();
+        let items = state.filtered_items();
+        assert!(items.is_empty());
+
+        let lines = picker_content_lines(&state, &items, 8, &ChatPalette::default());
+        let rendered = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("没有匹配的会话。"));
     }
 
     #[test]

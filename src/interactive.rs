@@ -1277,33 +1277,88 @@ async fn handle_history_command(
     context: &InteractiveContext,
     args: &str,
 ) -> Result<pi_tui::ChatAction> {
-    if !args.trim().is_empty() {
-        return resume_session_from_path_for_tui(agent, args.trim()).await;
+    let trimmed = args.trim();
+    if !trimmed.is_empty() && !matches!(trimmed, "all" | "--all") {
+        return resume_session_from_path_for_tui(agent, trimmed).await;
     }
     let index = crate::session_index::SessionIndex::new();
     let cwd = context.cwd.display().to_string();
-    let sessions = index.list_sessions(Some(&cwd)).unwrap_or_default();
+    let scope = if matches!(trimmed, "all" | "--all") {
+        SessionPickerScope::All
+    } else {
+        SessionPickerScope::Project
+    };
+    let sessions = index
+        .list_sessions(scope.cwd_filter(&cwd))
+        .unwrap_or_default();
     if sessions.is_empty() {
-        return Ok(status_action("当前项目没有可恢复会话。"));
+        return Ok(status_action(scope.empty_status()));
     }
-    let items = sessions
+    Ok(pi_tui::ChatAction::OpenPicker(
+        pi_tui::ChatPicker::new("会话列表", "/resume", session_picker_items(sessions))
+            .with_subtitle(scope.subtitle())
+            .with_empty_message("没有匹配的会话。输入其他关键字，或用 /history all 查看全部会话。"),
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionPickerScope {
+    Project,
+    All,
+}
+
+impl SessionPickerScope {
+    fn cwd_filter(self, cwd: &str) -> Option<&str> {
+        match self {
+            Self::Project => Some(cwd),
+            Self::All => None,
+        }
+    }
+
+    const fn subtitle(self) -> &'static str {
+        match self {
+            Self::Project => {
+                "scope: current project  |  type to search  |  /history all for all sessions"
+            }
+            Self::All => "scope: all sessions  |  type to search",
+        }
+    }
+
+    const fn empty_status(self) -> &'static str {
+        match self {
+            Self::Project => "当前项目没有可恢复会话。使用 /history all 查看全部会话。",
+            Self::All => "没有可恢复会话。",
+        }
+    }
+}
+
+#[doc(hidden)]
+pub fn session_picker_items(
+    sessions: Vec<crate::session_index::SessionMeta>,
+) -> Vec<pi_tui::PickerItem> {
+    sessions
         .into_iter()
         .take(100)
-        .map(|session| {
-            let label = session
-                .name
-                .clone()
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or_else(|| session.id.clone());
-            let description = format!("{} messages  {}", session.message_count, session.timestamp);
-            pi_tui::PickerItem::new(label, session.path, description)
-        })
-        .collect::<Vec<_>>();
-    Ok(pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
-        "会话列表",
-        "/resume",
-        items,
-    )))
+        .map(session_picker_item)
+        .collect()
+}
+
+fn session_picker_item(session: crate::session_index::SessionMeta) -> pi_tui::PickerItem {
+    let label = session
+        .name
+        .clone()
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| session.id.clone());
+    let size_kib = session.size_bytes.div_ceil(1024);
+    let file_name = Path::new(&session.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(session.path.as_str());
+    let description = format!(
+        "{} messages  {} KiB  {}  {}",
+        session.message_count, size_kib, session.timestamp, file_name
+    );
+    pi_tui::PickerItem::new(label, session.path, description).with_group(session.cwd)
 }
 
 #[doc(hidden)]

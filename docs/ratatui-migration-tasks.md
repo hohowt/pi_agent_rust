@@ -85,8 +85,10 @@
 - [ ] Port session picker overlay.
   - [x] Open a generic session picker from `/history`, `/resume`, and double-Esc.
   - [x] Load selected sessions and replace active conversation state.
-  - [ ] Restore search, delete confirmation, empty/filter states, status
-        messages, branch metadata, and cwd/all-session toggles.
+  - [x] Restore searchable empty/filter states, status messages, cwd/all-session
+        scope hints, and session metadata rows.
+  - [ ] Restore delete confirmation, branch metadata, and in-picker cwd/all-session
+        toggles.
 - [ ] Port settings UI.
   - [ ] Restore editable settings rows for theme, language, queue mode,
         compaction, double-Esc action, editor padding, and autocomplete size.

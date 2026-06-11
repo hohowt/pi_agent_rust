@@ -5,6 +5,7 @@ use pi::compaction::ResolvedCompactionSettings;
 use pi::interactive::{
     build_model_picker_items, expand_submitted_content_for_tui, format_agent_event,
     format_reload_status, format_session_name_status, resume_session_from_path_for_tui,
+    session_picker_items,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -13,6 +14,7 @@ use pi::models::ModelEntry;
 use pi::provider::{Context, InputType, Model, ModelCost, Provider, StreamOptions};
 use pi::resources::ResourceLoader;
 use pi::session::{Session, SessionMessage};
+use pi::session_index::SessionMeta;
 use pi::sync::Mutex;
 use pi::tools::{ToolOutput, ToolRegistry};
 use serde_json::json;
@@ -201,6 +203,27 @@ fn model_picker_items_group_rows_by_provider() {
     assert_eq!(items[0].group.as_deref(), Some("anthropic provider"));
     assert_eq!(items[1].group.as_deref(), Some("openai provider"));
     assert!(items[1].label.starts_with("* gpt-5"));
+}
+
+#[test]
+fn session_picker_items_include_scope_group_and_metadata() {
+    let items = session_picker_items(vec![SessionMeta {
+        path: "/tmp/project/session-a.jsonl".to_string(),
+        id: "session-a".to_string(),
+        cwd: "/tmp/project".to_string(),
+        timestamp: "2026-06-11T00:00:00Z".to_string(),
+        message_count: 7,
+        last_modified_ms: 123,
+        size_bytes: 2049,
+        name: Some("release notes".to_string()),
+    }]);
+
+    assert_eq!(items[0].label, "release notes");
+    assert_eq!(items[0].value, "/tmp/project/session-a.jsonl");
+    assert_eq!(items[0].group.as_deref(), Some("/tmp/project"));
+    assert!(items[0].description.contains("7 messages"));
+    assert!(items[0].description.contains("3 KiB"));
+    assert!(items[0].description.contains("session-a.jsonl"));
 }
 
 #[test]
