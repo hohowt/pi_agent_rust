@@ -19,8 +19,8 @@ use pi_theme::Theme;
 use serde_json::json;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 #[derive(Debug, Clone)]
 pub enum PendingInput {
@@ -631,6 +631,16 @@ fn status_action(text: impl Into<String>) -> pi_tui::ChatAction {
     pi_tui::ChatAction::PushLine(pi_tui::ChatLine::status(text))
 }
 
+fn chat_action_contains_text(action: &pi_tui::ChatAction, needle: &str) -> bool {
+    match action {
+        pi_tui::ChatAction::PushLine(line) => line.text().contains(needle),
+        pi_tui::ChatAction::Many(actions) => actions
+            .iter()
+            .any(|action| chat_action_contains_text(action, needle)),
+        _ => false,
+    }
+}
+
 fn model_label(entry: &ModelEntry) -> String {
     format!("{}/{}", entry.model.provider, entry.model.id)
 }
@@ -1167,8 +1177,43 @@ async fn handle_template_command(
 }
 
 async fn handle_compact_command(agent: &mut AgentSession) -> Result<pi_tui::ChatAction> {
-    agent.compact_now(|_event: AgentEvent| {}).await?;
-    Ok(status_action("压缩已完成。"))
+    let events = Arc::new(StdMutex::new(Vec::new()));
+    let events_for_callback = Arc::clone(&events);
+    let result = agent
+        .compact_now(move |event: AgentEvent| {
+            if let Ok(mut events) = events_for_callback.lock() {
+                events.push(event);
+            }
+        })
+        .await;
+
+    let mut actions = Vec::new();
+    let captured_events = events
+        .lock()
+        .map(|events| events.clone())
+        .unwrap_or_default();
+    for event in &captured_events {
+        if let Some(status) = format_compaction_status(event) {
+            actions.push(status_action(status));
+        }
+    }
+
+    match result {
+        Ok(()) if actions.is_empty() => {
+            actions.push(status_action("上下文无需压缩：没有可压缩的历史记录。"));
+            Ok(pi_tui::ChatAction::Many(actions))
+        }
+        Ok(()) => Ok(pi_tui::ChatAction::Many(actions)),
+        Err(err) => {
+            if actions
+                .iter()
+                .all(|action| !chat_action_contains_text(action, &err.to_string()))
+            {
+                actions.push(status_action(format!("上下文压缩失败: {err}")));
+            }
+            Ok(pi_tui::ChatAction::Many(actions))
+        }
+    }
 }
 
 async fn handle_name_command(agent: &mut AgentSession, args: &str) -> Result<pi_tui::ChatAction> {
@@ -1461,18 +1506,9 @@ pub fn format_agent_event(event: &AgentEvent) -> Option<String> {
             if *is_error { "失败" } else { "完成" },
             summarize_tool_output(result)
         )),
-        AgentEvent::AutoCompactionStart { reason } => Some(format!("自动压缩开始: {reason}")),
-        AgentEvent::AutoCompactionEnd {
-            aborted,
-            will_retry,
-            error_message,
-            ..
-        } => Some(format!(
-            "自动压缩结束: aborted={aborted} retry={will_retry}{}",
-            error_message
-                .as_ref()
-                .map_or(String::new(), |err| format!(" error={err}"))
-        )),
+        AgentEvent::AutoCompactionStart { .. } | AgentEvent::AutoCompactionEnd { .. } => {
+            format_compaction_status(event)
+        }
         AgentEvent::AutoRetryStart {
             attempt,
             max_attempts,
@@ -1497,6 +1533,81 @@ pub fn format_agent_event(event: &AgentEvent) -> Option<String> {
         | AgentEvent::MessageUpdate { .. }
         | AgentEvent::MessageEnd { .. } => None,
     }
+}
+
+#[doc(hidden)]
+pub fn format_compaction_status(event: &AgentEvent) -> Option<String> {
+    match event {
+        AgentEvent::AutoCompactionStart { reason } => Some(format!("上下文压缩开始: {reason}")),
+        AgentEvent::AutoCompactionEnd {
+            result,
+            aborted,
+            will_retry,
+            error_message,
+        } => {
+            if let Some(error) = error_message {
+                return Some(format!(
+                    "上下文压缩失败: aborted={aborted} retry={will_retry} error={error}"
+                ));
+            }
+            let Some(result) = result else {
+                return Some(format!(
+                    "上下文压缩结束: aborted={aborted} retry={will_retry}"
+                ));
+            };
+
+            let summary = result
+                .get("summary")
+                .and_then(serde_json::Value::as_str)
+                .map(trim_compaction_summary);
+            let first_kept = result
+                .get("firstKeptEntryId")
+                .and_then(serde_json::Value::as_str);
+            let tokens_before = result
+                .get("tokensBefore")
+                .and_then(serde_json::Value::as_u64);
+            let read_files = result
+                .pointer("/details/readFiles")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+            let modified_files = result
+                .pointer("/details/modifiedFiles")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len);
+
+            let mut status = String::from("上下文压缩完成");
+            if let Some(tokens_before) = tokens_before {
+                let _ = write!(status, "\n- tokens before: {tokens_before}");
+            }
+            if let Some(first_kept) = first_kept {
+                let _ = write!(status, "\n- first kept entry: {first_kept}");
+            }
+            let _ = write!(
+                status,
+                "\n- files: {read_files} read, {modified_files} modified"
+            );
+            if let Some(summary) = summary
+                && !summary.is_empty()
+            {
+                let _ = write!(status, "\n\n{summary}");
+            }
+            Some(status)
+        }
+        _ => None,
+    }
+}
+
+fn trim_compaction_summary(summary: &str) -> String {
+    const MAX_SUMMARY_CHARS: usize = 1_200;
+    let trimmed_summary = summary.trim();
+    let mut trimmed = trimmed_summary
+        .chars()
+        .take(MAX_SUMMARY_CHARS)
+        .collect::<String>();
+    if trimmed_summary.chars().count() > MAX_SUMMARY_CHARS {
+        trimmed.push_str("...");
+    }
+    trimmed
 }
 
 fn compact_json(value: &serde_json::Value) -> String {

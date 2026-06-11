@@ -4,8 +4,8 @@ use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::interactive::{
     build_model_picker_items, expand_submitted_content_for_tui, format_agent_event,
-    format_reload_status, format_session_name_status, resume_session_from_path_for_tui,
-    session_picker_items,
+    format_compaction_status, format_reload_status, format_session_name_status,
+    resume_session_from_path_for_tui, session_picker_items,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -291,6 +291,51 @@ fn live_tool_progress_events_render_status_lines() {
     assert_eq!(
         format_agent_event(&end).as_deref(),
         Some(r#"tool: read 完成 {"bytes":1234}"#)
+    );
+}
+
+#[test]
+fn compaction_events_render_progress_summary_and_errors() {
+    let start = pi::agent::AgentEvent::AutoCompactionStart {
+        reason: "threshold".to_string(),
+    };
+    assert_eq!(
+        format_compaction_status(&start).as_deref(),
+        Some("上下文压缩开始: threshold")
+    );
+    assert_eq!(format_agent_event(&start), format_compaction_status(&start));
+
+    let end = pi::agent::AgentEvent::AutoCompactionEnd {
+        result: Some(json!({
+            "summary": "Earlier work was summarized.",
+            "firstKeptEntryId": "entry-12",
+            "tokensBefore": 42000,
+            "details": {
+                "readFiles": ["Cargo.toml", "src/main.rs"],
+                "modifiedFiles": ["src/main.rs"]
+            }
+        })),
+        aborted: false,
+        will_retry: false,
+        error_message: None,
+    };
+    let status = format_compaction_status(&end).expect("compaction status");
+    assert!(status.contains("上下文压缩完成"));
+    assert!(status.contains("tokens before: 42000"));
+    assert!(status.contains("first kept entry: entry-12"));
+    assert!(status.contains("files: 2 read, 1 modified"));
+    assert!(status.contains("Earlier work was summarized."));
+    assert_eq!(format_agent_event(&end), format_compaction_status(&end));
+
+    let failed = pi::agent::AgentEvent::AutoCompactionEnd {
+        result: None,
+        aborted: false,
+        will_retry: false,
+        error_message: Some("Missing API key".to_string()),
+    };
+    assert_eq!(
+        format_compaction_status(&failed).as_deref(),
+        Some("上下文压缩失败: aborted=false retry=false error=Missing API key")
     );
 }
 

@@ -124,7 +124,7 @@
 - [x] `/history` and `/resume`: load selected session.
 - [ ] `/tree`: restore full tree UI instead of basic status text.
 - [ ] `/fork`: restore branch picker/fork flow.
-- [ ] `/compact`: show compaction progress/events and resulting summary.
+- [x] `/compact`: show compaction progress/events and resulting summary.
 - [x] `/reload`: reload models/resources, update autocomplete catalog, and show
       diagnostics.
 - [ ] `/export`: restore default export path, HTML/JSON export, and status.
