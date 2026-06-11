@@ -317,7 +317,7 @@ fn save_login_credential_writes_auth_refreshes_models_and_redacts_secret() {
         &models_path,
         r#"[
   {
-    "id": "deepseek-chat",
+    "id": "deepseek-v4-flash",
     "name": "DeepSeek Chat",
     "provider": "deepseek",
     "api": "openai-chat",
@@ -352,7 +352,7 @@ fn save_login_credential_writes_auth_refreshes_models_and_redacts_secret() {
     assert!(
         available_models
             .iter()
-            .any(|entry| entry.model.id == "deepseek-chat")
+            .any(|entry| entry.model.id == "deepseek-v4-flash")
     );
 
     let reloaded = AuthStorage::load(auth_path).expect("reload auth");

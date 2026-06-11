@@ -3289,8 +3289,8 @@ Code expires in {} seconds.\n",
         cli.provider = Some(provider.provider.to_string());
         cli.model = None;
     }
-    if provider.provider.eq("openai-codex") {
-        cli.model = Some("gpt-5.5".to_string());
+    if provider.provider.eq("deepseek") {
+        cli.model = Some("deepseek-v4-flash".to_string());
     }
 
     let saved_label = match provider.kind {
@@ -4354,16 +4354,16 @@ mod tests {
         let without_cli_key = rpc_available_models(&registry, None);
         assert!(
             without_cli_key.iter().all(|entry| {
-                !(entry.model.provider.eq("openai") && entry.model.id.eq("gpt-4o"))
+                !(entry.model.provider.eq("deepseek") && entry.model.id.eq("deepseek-v4-flash"))
             }),
-            "OpenAI models should remain hidden without configured credentials"
+            "DeepSeek models should remain hidden without configured credentials"
         );
 
         let with_cli_key = rpc_available_models(&registry, Some("cli-override-key"));
         assert!(
-            with_cli_key
-                .iter()
-                .any(|entry| entry.model.provider.eq("openai") && entry.model.id.eq("gpt-4o")),
+            with_cli_key.iter().any(|entry| {
+                entry.model.provider.eq("deepseek") && entry.model.id.eq("deepseek-v4-flash")
+            }),
             "CLI API-key override should expose remote models to RPC model switching"
         );
     }
@@ -4378,7 +4378,7 @@ mod tests {
         let available_models = rpc_available_models(&registry, Some("   "));
         assert!(
             available_models.iter().all(|entry| {
-                !(entry.model.provider.eq("openai") && entry.model.id.eq("gpt-4o"))
+                !(entry.model.provider.eq("deepseek") && entry.model.id.eq("deepseek-v4-flash"))
             }),
             "Blank CLI API-key values should not expose remote models"
         );

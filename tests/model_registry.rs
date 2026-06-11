@@ -38,23 +38,12 @@ fn test_built_in_models_without_api_keys() {
             ctx.push(("model_count".into(), registry.models().len().to_string()));
         });
 
-    // Should have built-in models from all three providers
+    // Built-in catalog is intentionally limited to official DeepSeek API models.
     let models = registry.models();
-    assert!(!models.is_empty(), "Should have built-in models");
-
+    assert_eq!(models.len(), 2, "Should have two DeepSeek built-in models");
     assert!(
-        models.iter().any(|m| m.model.provider == "anthropic"),
-        "Should have Anthropic built-in models"
-    );
-
-    assert!(
-        models.iter().any(|m| m.model.provider == "openai"),
-        "Should have OpenAI built-in models"
-    );
-
-    assert!(
-        models.iter().any(|m| m.model.provider == "google"),
-        "Should have Google built-in models"
+        models.iter().all(|m| m.model.provider == "deepseek"),
+        "Only DeepSeek built-in models should be present"
     );
 
     // No models should be available (no API keys)
@@ -69,12 +58,12 @@ fn test_built_in_models_without_api_keys() {
 }
 
 #[test]
-fn test_built_in_models_with_anthropic_key() {
-    let harness = TestHarness::new("test_built_in_models_with_anthropic_key");
+fn test_built_in_models_with_deepseek_key() {
+    let harness = TestHarness::new("test_built_in_models_with_deepseek_key");
     harness.section("Setup");
 
-    // Create auth with Anthropic API key
-    let auth_content = r#"{"anthropic": {"type": "api_key", "key": "sk-ant-test-key"}}"#;
+    // Create auth with DeepSeek API key
+    let auth_content = r#"{"deepseek": {"type": "api_key", "key": "sk-ds-test-key"}}"#;
     let auth_path = harness.create_file("auth.json", auth_content);
     let auth = AuthStorage::load(auth_path).expect("load auth");
 
@@ -82,34 +71,21 @@ fn test_built_in_models_with_anthropic_key() {
     let registry = ModelRegistry::load(&auth, None);
 
     harness.section("Verify");
-    // Anthropic models should have API keys
-    let anthropic_models: Vec<_> = registry
+    let deepseek_models: Vec<_> = registry
         .models()
         .iter()
-        .filter(|m| m.model.provider == "anthropic")
+        .filter(|m| m.model.provider == "deepseek")
         .collect();
     assert!(
-        anthropic_models.iter().all(|m| m.api_key.is_some()),
-        "All Anthropic models should have API key"
+        deepseek_models.iter().all(|m| m.api_key.is_some()),
+        "All DeepSeek models should have API key"
     );
 
-    // OpenAI/Google models should not have API keys
-    let openai_models: Vec<_> = registry
-        .models()
-        .iter()
-        .filter(|m| m.model.provider == "openai")
-        .collect();
-    assert!(
-        openai_models.iter().all(|m| m.api_key.is_none()),
-        "OpenAI models should not have API key"
-    );
-
-    // Available models should only be Anthropic
     let available = registry.get_available();
     assert_eq!(
         available.len(),
-        anthropic_models.len(),
-        "Only Anthropic models should be available"
+        deepseek_models.len(),
+        "Only DeepSeek models should be available"
     );
 }
 
@@ -122,14 +98,14 @@ fn test_model_fields_populated_correctly() {
     let auth = AuthStorage::load(auth_path).expect("load auth");
     let registry = ModelRegistry::load(&auth, None);
 
-    harness.section("Verify Claude models");
-    let claude_sonnet = registry.find("anthropic", "claude-sonnet-4-5");
-    assert!(claude_sonnet.is_some(), "Claude Sonnet 4.5 should exist");
-    let model = claude_sonnet.unwrap();
+    harness.section("Verify DeepSeek models");
+    let model = registry
+        .find("deepseek", "deepseek-v4-flash")
+        .expect("DeepSeek V4 Flash should exist");
 
     harness
         .log()
-        .info_ctx("verify", "Claude Sonnet 4.5 fields", |ctx| {
+        .info_ctx("verify", "DeepSeek V4 Flash fields", |ctx| {
             ctx.push(("id".into(), model.model.id.clone()));
             ctx.push(("name".into(), model.model.name.clone()));
             ctx.push(("reasoning".into(), model.model.reasoning.to_string()));
@@ -139,27 +115,19 @@ fn test_model_fields_populated_correctly() {
             ));
         });
 
-    assert_eq!(model.model.id, "claude-sonnet-4-5");
-    assert_eq!(
-        model.model.name, "Claude Sonnet 4.5 (latest)",
-        "built-in registry models should preserve catalog display names"
-    );
-    assert!(
-        model.model.reasoning,
-        "Claude Sonnet should support reasoning"
-    );
+    assert_eq!(model.model.id, "deepseek-v4-flash");
+    assert_eq!(model.model.name, "DeepSeek V4 Flash");
+    assert!(model.model.reasoning, "Flash should support reasoning");
+    assert_eq!(model.model.api, "openai-completions");
+    assert_eq!(model.model.base_url, "https://api.deepseek.com");
     assert!(model.model.context_window > 0, "Should have context window");
     assert!(model.model.max_tokens > 0, "Should have max tokens");
     assert!(!model.model.input.is_empty(), "Should have input types");
 
-    harness.section("Verify non-reasoning model");
-    let gpt4o = registry.find("openai", "gpt-4o");
-    assert!(gpt4o.is_some(), "GPT-4o should exist");
-    let gpt4o = gpt4o.unwrap();
-    assert!(
-        !gpt4o.model.reasoning,
-        "GPT-4o should not support reasoning"
-    );
+    let pro = registry
+        .find("deepseek", "deepseek-v4-pro")
+        .expect("DeepSeek V4 Pro should exist");
+    assert!(pro.model.reasoning, "Pro should support reasoning");
 }
 
 // ============================================================================
@@ -226,16 +194,16 @@ fn test_custom_models_json_overrides_provider_config() {
     let harness = TestHarness::new("test_custom_models_json_overrides_provider_config");
     harness.section("Setup");
 
-    // Create auth with Anthropic key
-    let auth_content = r#"{"anthropic": {"type": "api_key", "key": "sk-ant-test-key"}}"#;
+    // Create auth with DeepSeek key
+    let auth_content = r#"{"deepseek": {"type": "api_key", "key": "sk-ds-test-key"}}"#;
     let auth_path = harness.create_file("auth.json", auth_content);
     let auth = AuthStorage::load(auth_path).expect("load auth");
 
-    // Create models.json that overrides Anthropic base URL (e.g., for proxy)
+    // Create models.json that overrides DeepSeek base URL (e.g., for proxy)
     let models_json = r#"{
         "providers": {
-            "anthropic": {
-                "baseUrl": "https://my-proxy.example.com/v1/messages"
+            "deepseek": {
+                "baseUrl": "https://my-proxy.example.com"
             }
         }
     }"#;
@@ -247,17 +215,17 @@ fn test_custom_models_json_overrides_provider_config() {
     harness.section("Verify");
     assert!(registry.error().is_none(), "No error expected");
 
-    // All Anthropic models should have the overridden base URL
-    let anthropic_models: Vec<_> = registry
+    // All DeepSeek models should have the overridden base URL
+    let deepseek_models: Vec<_> = registry
         .models()
         .iter()
-        .filter(|m| m.model.provider == "anthropic")
+        .filter(|m| m.model.provider == "deepseek")
         .collect();
 
-    assert!(!anthropic_models.is_empty(), "Should have Anthropic models");
-    for model in anthropic_models {
+    assert!(!deepseek_models.is_empty(), "Should have DeepSeek models");
+    for model in deepseek_models {
         assert_eq!(
-            model.model.base_url, "https://my-proxy.example.com/v1/messages",
+            model.model.base_url, "https://my-proxy.example.com",
             "Base URL should be overridden for {}",
             model.model.id
         );
@@ -272,13 +240,13 @@ fn test_custom_models_json_replaces_provider_models() {
     let auth_path = harness.create_file("auth.json", "{}");
     let auth = AuthStorage::load(auth_path).expect("load auth");
 
-    // Create models.json that fully replaces OpenAI models
+    // Create models.json that fully replaces DeepSeek models
     let models_json = r#"{
         "providers": {
-            "openai": {
-                "baseUrl": "https://api.openai.com/v1",
+            "deepseek": {
+                "baseUrl": "https://api.deepseek.com",
                 "models": [
-                    {"id": "custom-gpt", "name": "Custom GPT"}
+                    {"id": "custom-deepseek", "name": "Custom DeepSeek"}
                 ]
             }
         }
@@ -289,29 +257,29 @@ fn test_custom_models_json_replaces_provider_models() {
     let registry = ModelRegistry::load(&auth, Some(models_path));
 
     harness.section("Verify");
-    // Built-in OpenAI models should be replaced
-    let openai_models: Vec<_> = registry
+    // Built-in DeepSeek models should be replaced
+    let deepseek_models: Vec<_> = registry
         .models()
         .iter()
-        .filter(|m| m.model.provider == "openai")
+        .filter(|m| m.model.provider == "deepseek")
         .collect();
 
     harness
         .log()
-        .info_ctx("verify", "OpenAI models after replace", |ctx| {
-            ctx.push(("count".into(), openai_models.len().to_string()));
-            for m in &openai_models {
+        .info_ctx("verify", "DeepSeek models after replace", |ctx| {
+            ctx.push(("count".into(), deepseek_models.len().to_string()));
+            for m in &deepseek_models {
                 ctx.push(("model".into(), m.model.id.clone()));
             }
         });
 
-    assert_eq!(openai_models.len(), 1, "Should only have the custom model");
-    assert_eq!(openai_models[0].model.id, "custom-gpt");
+    assert_eq!(deepseek_models.len(), 1, "Should only have the custom model");
+    assert_eq!(deepseek_models[0].model.id, "custom-deepseek");
 
-    // Original GPT-4o should not exist
+    // Original DeepSeek built-ins should not exist after provider replacement.
     assert!(
-        registry.find("openai", "gpt-4o").is_none(),
-        "Built-in gpt-4o should be replaced"
+        registry.find("deepseek", "deepseek-v4-flash").is_none(),
+        "Built-in deepseek-v4-flash should be replaced"
     );
 }
 
@@ -634,13 +602,12 @@ fn test_find_model_by_provider_and_id() {
     let registry = ModelRegistry::load(&auth, None);
 
     harness.section("Find existing models");
-    assert!(registry.find("anthropic", "claude-sonnet-4-5").is_some());
-    assert!(registry.find("openai", "gpt-4o").is_some());
-    assert!(registry.find("google", "gemini-2.5-pro").is_some());
+    assert!(registry.find("deepseek", "deepseek-v4-flash").is_some());
+    assert!(registry.find("deepseek", "deepseek-v4-pro").is_some());
 
     harness.section("Find non-existing models");
-    assert!(registry.find("anthropic", "nonexistent").is_none());
-    assert!(registry.find("nonexistent", "claude-sonnet-4-5").is_none());
+    assert!(registry.find("deepseek", "nonexistent").is_none());
+    assert!(registry.find("nonexistent", "deepseek-v4-flash").is_none());
 }
 
 #[test]
@@ -648,8 +615,8 @@ fn test_get_available_filters_by_api_key() {
     let harness = TestHarness::new("test_get_available_filters_by_api_key");
     harness.section("Setup");
 
-    // Create auth with only OpenAI key
-    let auth_content = r#"{"openai": {"type": "api_key", "key": "sk-test-key"}}"#;
+    // Create auth with only DeepSeek key
+    let auth_content = r#"{"deepseek": {"type": "api_key", "key": "sk-test-key"}}"#;
     let auth_path = harness.create_file("auth.json", auth_content);
     let auth = AuthStorage::load(auth_path).expect("load auth");
     let registry = ModelRegistry::load(&auth, None);
@@ -667,10 +634,10 @@ fn test_get_available_filters_by_api_key() {
         }
     });
 
-    // Only OpenAI models should be available
+    // Only DeepSeek models should be available
     assert!(
-        available.iter().all(|m| m.model.provider == "openai"),
-        "Only OpenAI models should be available"
+        available.iter().all(|m| m.model.provider == "deepseek"),
+        "Only DeepSeek models should be available"
     );
     assert!(!available.is_empty(), "Should have available models");
 }
@@ -852,10 +819,7 @@ fn test_multiple_providers_with_keys() {
     let harness = TestHarness::new("test_multiple_providers_with_keys");
     harness.section("Setup");
 
-    let auth_content = r#"{
-        "anthropic": {"type": "api_key", "key": "sk-ant-test"},
-        "openai": {"type": "api_key", "key": "sk-openai-test"}
-    }"#;
+    let auth_content = r#"{"deepseek": {"type": "api_key", "key": "sk-ds-test"}}"#;
     let auth_path = harness.create_file("auth.json", auth_content);
     let auth = AuthStorage::load(auth_path).expect("load auth");
     let registry = ModelRegistry::load(&auth, None);
@@ -876,13 +840,6 @@ fn test_multiple_providers_with_keys() {
             }
         });
 
-    assert!(
-        providers.contains("anthropic"),
-        "Anthropic should be available"
-    );
-    assert!(providers.contains("openai"), "OpenAI should be available");
-    assert!(
-        !providers.contains("google"),
-        "Google should not be available"
-    );
+    assert_eq!(providers.len(), 1);
+    assert!(providers.contains("deepseek"), "DeepSeek should be available");
 }
