@@ -11,6 +11,7 @@ use crate::model::{AssistantMessageEvent, Message, ThinkingLevel, UserContent};
 use crate::models::{ModelEntry, ModelRegistry};
 use crate::package_manager::PackageManager;
 use crate::package_manager::ResolvedResource;
+use crate::provider_metadata::provider_auth_env_keys;
 use crate::resources::{ResourceCliOptions, ResourceLoader, parse_command_args, substitute_args};
 use crate::runtime::RuntimeHandle;
 use crate::session::SessionEntry;
@@ -345,6 +346,12 @@ pub async fn run_interactive(
     });
     let options = context.options.clone();
     let mut initial_lines = Vec::new();
+    initial_lines.extend(startup_oauth_hint_lines(
+        &context.config,
+        &context.current_model,
+        &context.available_models,
+        &AuthStorage::load_async(context.auth_path.clone()).await?,
+    ));
     initial_lines.extend(startup_changelog_lines(&context.config));
     for pending in pending_inputs {
         let content = match pending {
@@ -1549,6 +1556,54 @@ pub fn startup_changelog_lines(config: &Config) -> Vec<pi_tui::ChatLine> {
     vec![pi_tui::ChatLine::status(format!(
         "Changelog: {current_version}\n输入 /changelog 查看完整更新记录。"
     ))]
+}
+
+#[doc(hidden)]
+pub fn startup_oauth_hint_lines(
+    config: &Config,
+    current_model: &ModelEntry,
+    available_models: &[ModelEntry],
+    auth: &AuthStorage,
+) -> Vec<pi_tui::ChatLine> {
+    if config.quiet_startup.unwrap_or(false) {
+        return Vec::new();
+    }
+
+    let mut providers = vec![current_model.model.provider.as_str()];
+    providers.extend(
+        available_models
+            .iter()
+            .filter(|entry| entry.auth_header)
+            .filter(|entry| model_auth_status(entry) == "missing")
+            .map(|entry| entry.model.provider.as_str()),
+    );
+    providers.sort_unstable();
+    providers.dedup();
+
+    let mut lines = Vec::new();
+    for provider in providers.into_iter().take(3) {
+        if let Some(source) = auth.external_setup_source(provider) {
+            lines.push(pi_tui::ChatLine::status(format!(
+                "已检测到 {provider} 的外部登录: {source}\n可直接使用匹配模型；如需移除 Pi 凭据，输入 /logout。"
+            )));
+            continue;
+        }
+
+        if current_model.model.provider.eq(provider)
+            && model_auth_status(current_model) == "missing"
+        {
+            let env_hint = provider_auth_env_keys(provider).first().copied();
+            let setup = env_hint.map_or_else(
+                || format!("运行 `pi --provider {provider}` 触发交互式 setup，或编辑 auth.json。"),
+                |env| format!("设置 {env}，或运行 `pi --provider {provider}` 触发交互式 setup。"),
+            );
+            lines.push(pi_tui::ChatLine::status(format!(
+                "{provider} 当前缺少凭据。\n{setup}"
+            )));
+        }
+    }
+
+    lines
 }
 
 #[doc(hidden)]

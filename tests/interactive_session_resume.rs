@@ -10,7 +10,7 @@ use pi::interactive::{
     format_compaction_status, format_reload_status, format_session_name_status,
     last_assistant_text_for_tui, logout_picker_items, logout_provider_for_tui,
     resume_session_from_path_for_tui, session_picker_items, share_current_session_for_tui,
-    startup_changelog_lines,
+    startup_changelog_lines, startup_oauth_hint_lines,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -619,6 +619,35 @@ fn startup_changelog_respects_quiet_collapse_and_seen_version() {
     config.collapse_changelog = None;
     config.last_changelog_version = Some(latest_title);
     assert!(startup_changelog_lines(&config).is_empty());
+}
+
+#[test]
+fn startup_oauth_hint_reports_missing_current_model_credentials() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let auth = AuthStorage::load(temp.path().join("auth.json")).expect("load auth");
+    let current = model_entry("openai", "gpt-5", true, None);
+    let configured = model_entry("anthropic", "claude-sonnet-4", true, Some("key"));
+
+    let lines = startup_oauth_hint_lines(&Config::default(), &current, &[configured], &auth);
+
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].role(), "Status");
+    assert!(lines[0].text().contains("openai 当前缺少凭据"));
+    assert!(lines[0].text().contains("OPENAI_API_KEY"));
+    assert!(lines[0].text().contains("pi --provider openai"));
+}
+
+#[test]
+fn startup_oauth_hint_respects_quiet_startup() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let auth = AuthStorage::load(temp.path().join("auth.json")).expect("load auth");
+    let current = model_entry("openai", "gpt-5", true, None);
+    let config = Config {
+        quiet_startup: Some(true),
+        ..Config::default()
+    };
+
+    assert!(startup_oauth_hint_lines(&config, &current, &[], &auth).is_empty());
 }
 
 #[test]

@@ -59,7 +59,7 @@
       progress state, per-tool error styling, and Shift+Tab thinking visibility.
   - [x] Live tool progress state.
   - [ ] Collapsed previews, expansion, error styling, and Shift+Tab thinking visibility.
-- [ ] Restore startup OAuth hint and startup changelog rendering.
+- [x] Restore startup OAuth hint and startup changelog rendering.
 - [x] Keep the composer and footer directly below the rendered conversation
       content instead of pinning them to the terminal bottom when content is short.
 - [x] Render a Codex-style single-line footer with left status/model context and

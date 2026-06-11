@@ -39,6 +39,7 @@ read-only status where the previous UI performed a richer action.
 | `/share` | Creates a private/public GitHub gist through `gh`, uploads exported session HTML, and displays the Pi share viewer URL. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | `/changelog` | Shows startup changelog status when appropriate and opens a version picker for current changelog entries. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | `/logout` | Opens a provider picker for saved credentials; selecting a provider removes that credential immediately and refreshes auth/model state. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
+| Startup auth hint | Shows startup credential guidance for the current model when auth is missing, while respecting quiet startup. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | Markdown rendering | Assistant messages are rendered through the ratatui markdown path for headings, lists, links, code fences, and CJK text. | `crates/pi-tui/src/chat.rs:1144-1352`, `crates/pi-tui/src/chat.rs:1959-1989` |
 | Editing history | Up/down navigation restores previous prompts and the current draft. | `crates/pi-tui/src/chat.rs:318-435`, `crates/pi-tui/src/chat.rs:1811-1855` |
 | Mouse wheel | Mouse wheel routing is wired through the terminal mouse capture policy. | `crates/pi-tui/src/chat.rs:289-303`, `crates/pi-tui/src/terminal.rs:29-77` |
