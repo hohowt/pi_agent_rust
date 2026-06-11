@@ -127,7 +127,7 @@
 - [x] `/compact`: show compaction progress/events and resulting summary.
 - [x] `/reload`: reload models/resources, update autocomplete catalog, and show
       diagnostics.
-- [ ] `/export`: restore default export path, HTML/JSON export, and status.
+- [x] `/export`: restore default export path, HTML/JSON export, and status.
 - [x] `/copy`: restore clipboard support behind the clipboard feature.
 - [ ] `/share`: restore share flow.
 - [ ] `/changelog`: restore startup/current changelog UI.

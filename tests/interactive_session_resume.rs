@@ -3,8 +3,8 @@ use futures::Stream;
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::interactive::{
-    build_model_picker_items, expand_submitted_content_for_tui, format_agent_event,
-    format_compaction_status, format_reload_status, format_session_name_status,
+    build_model_picker_items, expand_submitted_content_for_tui, export_current_session_for_tui,
+    format_agent_event, format_compaction_status, format_reload_status, format_session_name_status,
     last_assistant_text_for_tui, resume_session_from_path_for_tui, session_picker_items,
 };
 use pi::model::{
@@ -374,6 +374,52 @@ fn last_assistant_text_for_tui_returns_latest_text_message() {
     let text = run_async(last_assistant_text_for_tui(&agent)).expect("last assistant");
 
     assert_eq!(text.as_deref(), Some("latest\nanswer"));
+}
+
+#[test]
+fn export_current_session_for_tui_writes_html_and_json() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let agent = empty_agent_session(temp.path());
+    run_async(async {
+        let cx = pi::agent_cx::AgentCx::for_request();
+        let mut session = agent.session.lock(cx.cx()).await.expect("session lock");
+        session.append_message(SessionMessage::User {
+            content: UserContent::Text("export this".to_string()),
+            timestamp: Some(1),
+        });
+        session.append_message(SessionMessage::Assistant {
+            message: AssistantMessage {
+                content: vec![ContentBlock::Text(TextContent::new("exported answer"))],
+                api: "test-api".to_string(),
+                provider: "test-provider".to_string(),
+                model: "test-model".to_string(),
+                timestamp: 2,
+                ..Default::default()
+            },
+        });
+    });
+
+    let html = run_async(export_current_session_for_tui(
+        &agent,
+        temp.path(),
+        "chat.html",
+    ))
+    .expect("html export");
+    let html_body = std::fs::read_to_string(&html.path).expect("read html export");
+    assert_eq!(html.format, "HTML");
+    assert!(html_body.contains("export this"));
+    assert!(html_body.contains("exported answer"));
+
+    let json = run_async(export_current_session_for_tui(
+        &agent,
+        temp.path(),
+        "chat.json",
+    ))
+    .expect("json export");
+    let json_body = std::fs::read_to_string(&json.path).expect("read json export");
+    assert_eq!(json.format, "JSON");
+    assert!(json_body.contains("export this"));
+    assert!(json_body.contains("exported answer"));
 }
 
 #[test]

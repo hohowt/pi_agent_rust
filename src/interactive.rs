@@ -574,11 +574,11 @@ async fn handle_slash_command(
         }
         SlashCommand::Compact => handle_compact_command(agent).await?,
         SlashCommand::Copy => handle_copy_command(agent).await?,
+        SlashCommand::Export => handle_export_command(agent, context, args).await?,
         SlashCommand::Name => handle_name_command(agent, args).await?,
         SlashCommand::Language => handle_language_command(context, args)?,
         SlashCommand::Login
         | SlashCommand::Logout
-        | SlashCommand::Export
         | SlashCommand::Fork
         | SlashCommand::Share
         | SlashCommand::Changelog => status_action(format_command_unavailable(command)),
@@ -1227,6 +1227,95 @@ async fn handle_copy_command(agent: &AgentSession) -> Result<pi_tui::ChatAction>
             text.chars().count()
         ))),
         Err(err) => Ok(status_action(format!("复制失败: {err}"))),
+    }
+}
+
+async fn handle_export_command(
+    agent: &AgentSession,
+    context: &InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
+    let export = export_current_session_for_tui(agent, &context.cwd, args.trim()).await?;
+    Ok(status_action(format!(
+        "已导出当前会话为 {}: {}",
+        export.format,
+        export.path.display()
+    )))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TuiExportResult {
+    pub path: PathBuf,
+    pub format: &'static str,
+}
+
+#[doc(hidden)]
+pub async fn export_current_session_for_tui(
+    agent: &AgentSession,
+    cwd: &Path,
+    output_arg: &str,
+) -> Result<TuiExportResult> {
+    let (snapshot, messages) = {
+        let cx = crate::agent_cx::AgentCx::for_request();
+        let session = agent
+            .session
+            .lock(cx.cx())
+            .await
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        (
+            session.export_snapshot(),
+            session.to_messages_for_current_path(),
+        )
+    };
+    let path = export_output_path(&snapshot, cwd, output_arg);
+    let format = export_format_for_path(&path);
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        crate::fs::create_dir_all(parent).await?;
+    }
+    match format {
+        "JSON" => {
+            let json = serde_json::to_string_pretty(&messages)?;
+            crate::fs::write(&path, json).await?;
+        }
+        "HTML" => {
+            crate::fs::write(&path, snapshot.to_html()).await?;
+        }
+        _ => unreachable!("known export format"),
+    }
+    Ok(TuiExportResult { path, format })
+}
+
+fn export_output_path(
+    snapshot: &crate::session::ExportSnapshot,
+    cwd: &Path,
+    output_arg: &str,
+) -> PathBuf {
+    let path = if output_arg.is_empty() {
+        let id = snapshot.header.id.trim();
+        let basename = if id.is_empty() { "session" } else { id };
+        PathBuf::from(format!("pi-session-{basename}.html"))
+    } else {
+        PathBuf::from(output_arg)
+    };
+    if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    }
+}
+
+fn export_format_for_path(path: &Path) -> &'static str {
+    if path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"))
+    {
+        "JSON"
+    } else {
+        "HTML"
     }
 }
 
