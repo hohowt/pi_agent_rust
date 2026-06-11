@@ -589,7 +589,8 @@ async fn handle_slash_command(
         SlashCommand::Changelog => handle_changelog_command(args),
         SlashCommand::Language => handle_language_command(context, args)?,
         SlashCommand::Share => handle_share_command(agent, context, args).await?,
-        SlashCommand::Login | SlashCommand::Logout | SlashCommand::Fork => {
+        SlashCommand::Logout => handle_logout_command(agent, context, args).await?,
+        SlashCommand::Login | SlashCommand::Fork => {
             status_action(format_command_unavailable(command))
         }
     };
@@ -1112,6 +1113,84 @@ async fn handle_theme_command(
     Ok(pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
         "主题", "/theme", items,
     )))
+}
+
+async fn handle_logout_command(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
+    let auth = AuthStorage::load_async(context.auth_path.clone()).await?;
+    let provider = args.trim();
+    if provider.is_empty() {
+        let items = logout_picker_items(&auth);
+        if items.is_empty() {
+            return Ok(status_action("没有可移除的已保存凭据。"));
+        }
+        return Ok(pi_tui::ChatAction::OpenPicker(pi_tui::ChatPicker::new(
+            "退出登录",
+            "/logout",
+            items,
+        )));
+    }
+
+    let (action, available_models) =
+        logout_provider_for_tui(agent, auth, context.models_path.clone(), provider).await?;
+    context.available_models = available_models;
+    Ok(action)
+}
+
+#[doc(hidden)]
+pub fn logout_picker_items(auth: &AuthStorage) -> Vec<pi_tui::PickerItem> {
+    auth.provider_names()
+        .into_iter()
+        .map(|provider| {
+            let status = match auth.credential_status(&provider) {
+                crate::auth::CredentialStatus::Missing => "missing",
+                crate::auth::CredentialStatus::ApiKey => "api key",
+                crate::auth::CredentialStatus::OAuthValid { .. } => "oauth",
+                crate::auth::CredentialStatus::OAuthExpired { .. } => "oauth expired",
+                crate::auth::CredentialStatus::BearerToken => "bearer token",
+                crate::auth::CredentialStatus::ServiceKey => "service key",
+            };
+            pi_tui::PickerItem::new(provider.clone(), provider, status)
+        })
+        .collect()
+}
+
+#[doc(hidden)]
+pub async fn logout_provider_for_tui(
+    agent: &mut AgentSession,
+    mut auth: AuthStorage,
+    models_path: PathBuf,
+    provider: &str,
+) -> Result<(pi_tui::ChatAction, Vec<ModelEntry>)> {
+    let provider = provider.trim();
+    if provider.is_empty() {
+        return Ok((status_action("用法: /logout <provider>"), Vec::new()));
+    }
+
+    if !auth.remove_provider_aliases(provider) {
+        return Ok((
+            status_action(format!("未找到已保存凭据: {provider}")),
+            ModelRegistry::load(&auth, Some(models_path)).get_available(),
+        ));
+    }
+
+    auth.save_async().await?;
+    let model_registry = ModelRegistry::load(&auth, Some(models_path));
+    let models_error = model_registry.error().map(ToString::to_string);
+    let available_models = model_registry.get_available();
+    agent.set_auth_storage(auth);
+    agent.set_model_registry(model_registry);
+
+    let mut status = format!("已移除凭据: {provider}");
+    let _ = writeln!(status, "可用模型: {}", available_models.len());
+    if let Some(error) = models_error {
+        let _ = writeln!(status, "models.json: {error}");
+    }
+
+    Ok((status_action(status), available_models))
 }
 
 fn resolve_interactive_theme(context: &InteractiveContext, theme_name: &str) -> Option<Theme> {
@@ -1812,9 +1891,6 @@ fn format_command_unavailable(command: SlashCommand) -> String {
     match command {
         SlashCommand::Login => {
             "/login 需要 OAuth/API key 专用交互流程；当前请使用非交互 CLI 登录流程。".to_string()
-        }
-        SlashCommand::Logout => {
-            "/logout 需要认证状态写入确认；当前请使用配置/auth 文件管理命令。".to_string()
         }
         SlashCommand::Fork => {
             "/fork 需要分支选择器；当前请使用 /tree 查看当前路径信息。".to_string()

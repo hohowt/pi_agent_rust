@@ -117,7 +117,7 @@
 - [x] `/session`: show basic session status.
 - [x] `/codegraph init|sync|status`: call the codegraph index API.
 - [ ] `/login`: restore OAuth/API-key interactive login flows.
-- [ ] `/logout`: restore provider credential removal flow.
+- [x] `/logout`: restore provider credential removal flow.
 - [ ] `/settings`: restore full interactive settings overlay.
 - [x] `/theme`: apply selected theme, not just show/select the item.
 - [x] `/template`: apply selected prompt template content immediately.

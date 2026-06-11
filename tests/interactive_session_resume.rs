@@ -1,14 +1,16 @@
 use async_trait::async_trait;
 use futures::Stream;
 use pi::agent::{Agent, AgentConfig, AgentSession};
+use pi::auth::{AuthCredential, AuthStorage};
 use pi::compaction::ResolvedCompactionSettings;
 use pi::config::Config;
 use pi::interactive::{
     build_model_picker_items, changelog_picker_items, expand_submitted_content_for_tui,
     export_current_session_for_tui, format_agent_event, format_changelog_entry,
     format_compaction_status, format_reload_status, format_session_name_status,
-    last_assistant_text_for_tui, resume_session_from_path_for_tui, session_picker_items,
-    share_current_session_for_tui, startup_changelog_lines,
+    last_assistant_text_for_tui, logout_picker_items, logout_provider_for_tui,
+    resume_session_from_path_for_tui, session_picker_items, share_current_session_for_tui,
+    startup_changelog_lines,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -206,6 +208,72 @@ fn model_picker_items_group_rows_by_provider() {
     assert_eq!(items[0].group.as_deref(), Some("anthropic provider"));
     assert_eq!(items[1].group.as_deref(), Some("openai provider"));
     assert!(items[1].label.starts_with("* gpt-5"));
+}
+
+#[test]
+fn logout_picker_items_submit_provider_values() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let mut auth = AuthStorage::load(temp.path().join("auth.json")).expect("load auth");
+    auth.set(
+        "openai",
+        AuthCredential::ApiKey {
+            key: "openai-key".to_string(),
+        },
+    );
+    auth.set(
+        "anthropic",
+        AuthCredential::BearerToken {
+            token: "anthropic-token".to_string(),
+        },
+    );
+
+    let items = logout_picker_items(&auth);
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(items[0].label, "anthropic");
+    assert_eq!(items[0].value, "anthropic");
+    assert_eq!(items[0].description, "bearer token");
+    assert_eq!(items[1].label, "openai");
+    assert_eq!(items[1].value, "openai");
+    assert_eq!(items[1].description, "api key");
+}
+
+#[test]
+fn logout_provider_removes_saved_credential_and_refreshes_models() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let auth_path = temp.path().join("auth.json");
+    let mut auth = AuthStorage::load(auth_path.clone()).expect("load auth");
+    auth.set(
+        "openai",
+        AuthCredential::ApiKey {
+            key: "openai-key".to_string(),
+        },
+    );
+    auth.set(
+        "anthropic",
+        AuthCredential::ApiKey {
+            key: "anthropic-key".to_string(),
+        },
+    );
+    auth.save().expect("save auth");
+    let mut agent = empty_agent_session(temp.path());
+
+    let (action, available_models) = run_async(logout_provider_for_tui(
+        &mut agent,
+        auth,
+        temp.path().join("models.json"),
+        "openai",
+    ))
+    .expect("logout provider");
+
+    let pi_tui::ChatAction::PushLine(status) = action else {
+        panic!("expected logout status");
+    };
+    assert!(status.text().contains("已移除凭据: openai"));
+    assert!(!available_models.is_empty());
+    let reloaded = AuthStorage::load(auth_path).expect("reload auth");
+    assert!(!reloaded.has_stored_credential("openai"));
+    assert!(reloaded.has_stored_credential("anthropic"));
 }
 
 #[test]
