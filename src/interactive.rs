@@ -5,7 +5,7 @@ use pi_core::model::{ContentBlock, TextContent};
 use pi_prompt::PromptCatalog;
 
 use crate::agent::{AgentEvent, AgentSession, QueueMode};
-use crate::auth::AuthStorage;
+use crate::auth::{AuthCredential, AuthStorage};
 use crate::config::{Config, Language, SettingsScope};
 use crate::model::{AssistantMessageEvent, Message, ThinkingLevel, UserContent};
 use crate::models::{ModelEntry, ModelRegistry};
@@ -18,6 +18,7 @@ use crate::session::SessionEntry;
 use crate::tools::process_file_arguments;
 use pi_theme::Theme;
 use serde_json::json;
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -184,6 +185,7 @@ struct InteractiveContext {
     resources: ResourceLoader,
     resource_cli: ResourceCliOptions,
     package_manager: PackageManager,
+    pending_oauth_logins: HashMap<String, PendingOAuthLogin>,
     auth_path: PathBuf,
     models_path: PathBuf,
     cwd: PathBuf,
@@ -235,6 +237,7 @@ impl InteractiveContext {
             resources: init.resources,
             resource_cli: init.resource_cli,
             package_manager: PackageManager::new(init.cwd.clone()),
+            pending_oauth_logins: HashMap::new(),
             auth_path: init.auth_path,
             models_path: init.models_path,
             cwd: init.cwd,
@@ -263,6 +266,11 @@ impl InteractiveContext {
         self.options.slash_commands = slash_command_items(self.config.language());
         pi_tui::ChatAction::SetOptions(Box::new(self.options.clone()))
     }
+}
+
+#[derive(Debug, Clone)]
+struct PendingOAuthLogin {
+    verifier: String,
 }
 
 fn slash_command_items(language: Language) -> Vec<pi_tui::SlashCommandItem> {
@@ -598,7 +606,7 @@ async fn handle_slash_command(
         SlashCommand::Share => handle_share_command(agent, context, args).await?,
         SlashCommand::Logout => handle_logout_command(agent, context, args).await?,
         SlashCommand::Fork => handle_fork_command(agent, args).await?,
-        SlashCommand::Login => status_action(format_command_unavailable(command)),
+        SlashCommand::Login => handle_login_command(agent, context, args).await?,
     };
     Ok(action)
 }
@@ -1660,6 +1668,276 @@ async fn handle_logout_command(
         logout_provider_for_tui(agent, auth, context.models_path.clone(), provider).await?;
     context.available_models = available_models;
     Ok(action)
+}
+
+async fn handle_login_command(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+    args: &str,
+) -> Result<pi_tui::ChatAction> {
+    let parts = parse_command_args(args);
+    if parts.is_empty() {
+        return Ok(pi_tui::ChatAction::OpenPicker(
+            pi_tui::ChatPicker::new("登录", "/login", login_picker_items())
+                .with_subtitle(
+                    "OAuth 会打开授权 URL；API key provider 可用 /login <provider> <key>",
+                )
+                .with_empty_message("没有匹配的 provider"),
+        ));
+    }
+
+    let Some(choice) = login_provider_choice(&parts[0]) else {
+        return Ok(status_action(format!(
+            "不支持的登录 provider: {}",
+            parts[0]
+        )));
+    };
+
+    match choice.kind {
+        LoginCredentialKind::ApiKey => {
+            let Some(key) = parts
+                .get(1)
+                .map(String::as_str)
+                .filter(|key| !key.trim().is_empty())
+            else {
+                return Ok(status_action(format!(
+                    "用法: /login {} <api-key>\n也可以设置环境变量 {}。",
+                    choice.provider, choice.env
+                )));
+            };
+            save_login_credential(
+                agent,
+                context,
+                choice.provider,
+                AuthCredential::ApiKey {
+                    key: key.trim().to_string(),
+                },
+            )
+            .await
+        }
+        LoginCredentialKind::OAuthPkce => {
+            if let Some(code_input) = parts.get(1).map(String::as_str) {
+                return complete_pending_oauth_login(agent, context, choice, code_input).await;
+            }
+            let start = start_login_oauth(choice.command)?;
+            context.pending_oauth_logins.insert(
+                choice.command.to_string(),
+                PendingOAuthLogin {
+                    verifier: start.verifier.clone(),
+                },
+            );
+            let instructions = start
+                .instructions
+                .as_deref()
+                .unwrap_or("打开 URL 完成授权，然后粘贴 callback URL 或 authorization code。");
+            Ok(status_action(format!(
+                "OAuth 登录: {}\n{}\n完成后运行 `/login {} <callback-url-or-code>`。\n{}",
+                choice.provider, instructions, choice.command, start.url
+            )))
+        }
+        LoginCredentialKind::OAuthDeviceFlow => Ok(status_action(format!(
+            "{} 使用 device-flow 登录；当前 TUI 请使用非交互 setup 完成授权。",
+            choice.provider
+        ))),
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LoginCredentialKind {
+    ApiKey,
+    OAuthPkce,
+    OAuthDeviceFlow,
+}
+
+#[derive(Clone, Copy)]
+struct LoginProviderChoice {
+    command: &'static str,
+    provider: &'static str,
+    label: &'static str,
+    kind: LoginCredentialKind,
+    env: &'static str,
+}
+
+const LOGIN_PROVIDER_CHOICES: &[LoginProviderChoice] = &[
+    LoginProviderChoice {
+        command: "openai-codex",
+        provider: "openai-codex",
+        label: "OpenAI Codex (ChatGPT)",
+        kind: LoginCredentialKind::OAuthPkce,
+        env: "",
+    },
+    LoginProviderChoice {
+        command: "openai",
+        provider: "openai",
+        label: "OpenAI",
+        kind: LoginCredentialKind::ApiKey,
+        env: "OPENAI_API_KEY",
+    },
+    LoginProviderChoice {
+        command: "anthropic",
+        provider: "anthropic",
+        label: "Anthropic (Claude API key)",
+        kind: LoginCredentialKind::ApiKey,
+        env: "ANTHROPIC_API_KEY",
+    },
+    LoginProviderChoice {
+        command: "anthropic-oauth",
+        provider: "anthropic",
+        label: "Anthropic (Claude Code OAuth)",
+        kind: LoginCredentialKind::OAuthPkce,
+        env: "",
+    },
+    LoginProviderChoice {
+        command: "google-gemini-cli",
+        provider: "google-gemini-cli",
+        label: "Google Cloud Code Assist",
+        kind: LoginCredentialKind::OAuthPkce,
+        env: "",
+    },
+    LoginProviderChoice {
+        command: "google",
+        provider: "google",
+        label: "Google Gemini",
+        kind: LoginCredentialKind::ApiKey,
+        env: "GOOGLE_API_KEY",
+    },
+    LoginProviderChoice {
+        command: "google-antigravity",
+        provider: "google-antigravity",
+        label: "Google Antigravity",
+        kind: LoginCredentialKind::OAuthPkce,
+        env: "",
+    },
+    LoginProviderChoice {
+        command: "kimi-for-coding",
+        provider: "kimi-for-coding",
+        label: "Kimi for Coding",
+        kind: LoginCredentialKind::OAuthDeviceFlow,
+        env: "KIMI_API_KEY",
+    },
+    LoginProviderChoice {
+        command: "deepseek",
+        provider: "deepseek",
+        label: "DeepSeek",
+        kind: LoginCredentialKind::ApiKey,
+        env: "DEEPSEEK_API_KEY",
+    },
+    LoginProviderChoice {
+        command: "openrouter",
+        provider: "openrouter",
+        label: "OpenRouter",
+        kind: LoginCredentialKind::ApiKey,
+        env: "OPENROUTER_API_KEY",
+    },
+];
+
+#[doc(hidden)]
+pub fn login_picker_items() -> Vec<pi_tui::PickerItem> {
+    LOGIN_PROVIDER_CHOICES
+        .iter()
+        .map(|choice| {
+            let kind = match choice.kind {
+                LoginCredentialKind::ApiKey => format!("API key ({})", choice.env),
+                LoginCredentialKind::OAuthPkce => "OAuth".to_string(),
+                LoginCredentialKind::OAuthDeviceFlow => "OAuth device flow".to_string(),
+            };
+            pi_tui::PickerItem::new(choice.label, choice.command, kind)
+        })
+        .collect()
+}
+
+fn login_provider_choice(input: &str) -> Option<LoginProviderChoice> {
+    let normalized = input.trim().to_ascii_lowercase();
+    LOGIN_PROVIDER_CHOICES.iter().copied().find(|choice| {
+        choice.command.eq_ignore_ascii_case(&normalized)
+            || choice.provider.eq_ignore_ascii_case(&normalized)
+            || choice.label.to_ascii_lowercase().eq(&normalized)
+    })
+}
+
+fn start_login_oauth(command: &str) -> Result<crate::auth::OAuthStartInfo> {
+    Ok(match command {
+        "openai-codex" => crate::auth::start_openai_codex_oauth()?,
+        "anthropic-oauth" => crate::auth::start_anthropic_oauth()?,
+        "google-gemini-cli" => crate::auth::start_google_gemini_cli_oauth()?,
+        "google-antigravity" => crate::auth::start_google_antigravity_oauth()?,
+        _ => anyhow::bail!("OAuth login is not supported for {command}"),
+    })
+}
+
+async fn complete_pending_oauth_login(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+    choice: LoginProviderChoice,
+    code_input: &str,
+) -> Result<pi_tui::ChatAction> {
+    let Some(pending) = context.pending_oauth_logins.remove(choice.command) else {
+        return Ok(status_action(format!(
+            "没有待完成的 OAuth 登录: {}\n先运行 `/login {}` 获取授权 URL。",
+            choice.provider, choice.command
+        )));
+    };
+    let credential = match choice.command {
+        "openai-codex" => {
+            crate::auth::complete_openai_codex_oauth(code_input, &pending.verifier).await?
+        }
+        "anthropic-oauth" => {
+            crate::auth::complete_anthropic_oauth(code_input, &pending.verifier).await?
+        }
+        "google-gemini-cli" => {
+            crate::auth::complete_google_gemini_cli_oauth(code_input, &pending.verifier).await?
+        }
+        "google-antigravity" => {
+            crate::auth::complete_google_antigravity_oauth(code_input, &pending.verifier).await?
+        }
+        _ => anyhow::bail!("OAuth completion is not supported for {}", choice.command),
+    };
+    save_login_credential(agent, context, choice.provider, credential).await
+}
+
+async fn save_login_credential(
+    agent: &mut AgentSession,
+    context: &mut InteractiveContext,
+    provider: &str,
+    credential: AuthCredential,
+) -> Result<pi_tui::ChatAction> {
+    let (action, available_models) = save_login_credential_for_tui(
+        agent,
+        context.auth_path.clone(),
+        context.models_path.clone(),
+        provider,
+        credential,
+    )
+    .await?;
+    context.available_models = available_models;
+    Ok(action)
+}
+
+#[doc(hidden)]
+pub async fn save_login_credential_for_tui(
+    agent: &mut AgentSession,
+    auth_path: PathBuf,
+    models_path: PathBuf,
+    provider: &str,
+    credential: AuthCredential,
+) -> Result<(pi_tui::ChatAction, Vec<ModelEntry>)> {
+    let mut auth = AuthStorage::load_async(auth_path).await?;
+    let _ = auth.remove_provider_aliases(provider);
+    auth.set(provider.to_string(), credential);
+    auth.save_async().await?;
+
+    let model_registry = ModelRegistry::load(&auth, Some(models_path));
+    let models_error = model_registry.error().map(ToString::to_string);
+    let available_models = model_registry.get_available();
+    agent.set_auth_storage(auth);
+    agent.set_model_registry(model_registry);
+
+    let mut status = format!("已保存登录凭据: {provider}");
+    let _ = writeln!(status, "可用模型: {}", available_models.len());
+    if let Some(error) = models_error {
+        let _ = writeln!(status, "models.json: {error}");
+    }
+    Ok((status_action(status), available_models))
 }
 
 #[doc(hidden)]

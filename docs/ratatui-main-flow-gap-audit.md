@@ -43,6 +43,7 @@ read-only status where the previous UI performed a richer action.
 | `/tree` | Opens a branch leaf picker; selecting a leaf switches the current conversation branch and replaces visible history immediately. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | `/fork` | Opens a user-message picker, creates a forked session from the selected point, replaces visible history, and pre-fills the selected prompt. | `src/interactive.rs`, `crates/pi-tui/src/chat.rs`, `tests/interactive_session_resume.rs` |
 | `/settings` | Opens an editable settings picker for theme, language, queue modes, compaction, double-Esc behavior, editor padding, and autocomplete rows; changes persist to project settings. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
+| `/login` | Opens a provider picker. API-key providers save credentials with `/login <provider> <key>`; PKCE OAuth providers start an auth URL and complete with `/login <provider> <callback-url-or-code>`, then refresh available models. | `src/interactive.rs`, `tests/interactive_session_resume.rs` |
 | Markdown rendering | Assistant messages are rendered through the ratatui markdown path for headings, lists, links, code fences, and CJK text. | `crates/pi-tui/src/chat.rs:1144-1352`, `crates/pi-tui/src/chat.rs:1959-1989` |
 | Editing history | Up/down navigation restores previous prompts and the current draft. | `crates/pi-tui/src/chat.rs:318-435`, `crates/pi-tui/src/chat.rs:1811-1855` |
 | Mouse wheel | Mouse wheel routing is wired through the terminal mouse capture policy. | `crates/pi-tui/src/chat.rs:289-303`, `crates/pi-tui/src/terminal.rs:29-77` |
@@ -51,12 +52,13 @@ read-only status where the previous UI performed a richer action.
 
 | Feature | Current behavior | Evidence | Impact |
 |---|---|---|---|
-| `/login` | Returns a status message telling the user to use non-interactive setup. No OAuth/API-key interactive flow runs. | `src/interactive.rs:400-406`, `src/interactive.rs:863-867` | Users cannot authenticate from the interactive TUI. |
+| None currently identified in the primary slash-command audit. | Core slash commands now have at least a ratatui main-flow path. | `docs/ratatui-migration-tasks.md` | Remaining gaps are degraded parity items below. |
 
 ## Present But Degraded
 
 | Feature | Current behavior | Evidence | Missing behavior |
 |---|---|---|---|
+| `/login` | API-key and PKCE OAuth flows are available from the TUI picker and direct commands. | `src/interactive.rs`, `tests/interactive_session_resume.rs` | Kimi device-flow login still falls back to non-interactive setup; API keys are entered as command text rather than a dedicated masked secret prompt. |
 | `/model` picker | Generic picker can switch model by selected value. | `src/interactive.rs:381`, `src/interactive.rs:438-484` | Provider grouping, auth warnings, current marker, richer details, thinking suffix parity, direct Enter selection parity. |
 | `/name` | Sets name and prints confirmation. | `src/interactive.rs:398`, `src/interactive.rs:771-786` | Old status-bar style confirmation/error parity. |
 
@@ -77,7 +79,7 @@ read-only status where the previous UI performed a richer action.
 
 ## Priority Order
 
-1. Credential flow: `/login` is an explicit unavailable-command path.
+1. Credential flow: finish `/login` device-flow and masked secret prompt parity.
 2. Picker richness: model/session pickers work, but still lack grouping,
    metadata, delete confirmation, filter states, and cwd/all-session toggles.
 3. Tool presentation: live progress exists, but collapsed previews, expansion,

@@ -116,7 +116,7 @@
 - [x] `/thinking`: set thinking level by argument.
 - [x] `/session`: show basic session status.
 - [x] `/codegraph init|sync|status`: call the codegraph index API.
-- [ ] `/login`: restore OAuth/API-key interactive login flows.
+- [x] `/login`: restore API-key and PKCE OAuth interactive login flows.
 - [x] `/logout`: restore provider credential removal flow.
 - [x] `/settings`: restore full interactive settings overlay.
 - [x] `/theme`: apply selected theme, not just show/select the item.

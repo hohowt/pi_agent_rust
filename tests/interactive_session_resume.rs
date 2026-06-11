@@ -8,10 +8,11 @@ use pi::interactive::{
     build_model_picker_items, changelog_picker_items, expand_submitted_content_for_tui,
     export_current_session_for_tui, fork_from_user_message_for_tui, fork_picker_items,
     format_agent_event, format_changelog_entry, format_compaction_status, format_reload_status,
-    format_session_name_status, last_assistant_text_for_tui, logout_picker_items,
-    logout_provider_for_tui, resume_session_from_path_for_tui, select_tree_leaf_for_tui,
-    session_picker_items, settings_picker_items_for_config, share_current_session_for_tui,
-    startup_changelog_lines, startup_oauth_hint_lines, tree_picker_items,
+    format_session_name_status, last_assistant_text_for_tui, login_picker_items,
+    logout_picker_items, logout_provider_for_tui, resume_session_from_path_for_tui,
+    save_login_credential_for_tui, select_tree_leaf_for_tui, session_picker_items,
+    settings_picker_items_for_config, share_current_session_for_tui, startup_changelog_lines,
+    startup_oauth_hint_lines, tree_picker_items,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -275,6 +276,90 @@ fn logout_provider_removes_saved_credential_and_refreshes_models() {
     let reloaded = AuthStorage::load(auth_path).expect("reload auth");
     assert!(!reloaded.has_stored_credential("openai"));
     assert!(reloaded.has_stored_credential("anthropic"));
+}
+
+#[test]
+fn login_picker_items_include_api_key_and_oauth_choices_with_distinct_values() {
+    let items = login_picker_items();
+
+    let openai = items
+        .iter()
+        .find(|item| item.label == "OpenAI")
+        .expect("openai api-key login item");
+    assert_eq!(openai.value, "openai");
+    assert_eq!(openai.description, "API key (OPENAI_API_KEY)");
+
+    let codex = items
+        .iter()
+        .find(|item| item.label == "OpenAI Codex (ChatGPT)")
+        .expect("openai codex oauth login item");
+    assert_eq!(codex.value, "openai-codex");
+    assert_eq!(codex.description, "OAuth");
+
+    let anthropic_api = items
+        .iter()
+        .find(|item| item.label == "Anthropic (Claude API key)")
+        .expect("anthropic api-key login item");
+    let anthropic_oauth = items
+        .iter()
+        .find(|item| item.label == "Anthropic (Claude Code OAuth)")
+        .expect("anthropic oauth login item");
+    assert_eq!(anthropic_api.value, "anthropic");
+    assert_eq!(anthropic_oauth.value, "anthropic-oauth");
+}
+
+#[test]
+fn save_login_credential_writes_auth_refreshes_models_and_redacts_secret() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let auth_path = temp.path().join("auth.json");
+    let models_path = temp.path().join("models.json");
+    std::fs::write(
+        &models_path,
+        r#"[
+  {
+    "id": "deepseek-chat",
+    "name": "DeepSeek Chat",
+    "provider": "deepseek",
+    "api": "openai-chat",
+    "base_url": "https://api.deepseek.com",
+    "input": ["text"],
+    "cost": {"input": 0.0, "output": 0.0},
+    "context_window": 64000,
+    "max_tokens": 4096
+  }
+]"#,
+    )
+    .expect("write models.json");
+
+    let mut agent = empty_agent_session(temp.path());
+    let (action, available_models) = run_async(save_login_credential_for_tui(
+        &mut agent,
+        auth_path.clone(),
+        models_path,
+        "deepseek",
+        AuthCredential::ApiKey {
+            key: "secret-deepseek-key".to_string(),
+        },
+    ))
+    .expect("save login credential");
+
+    let pi_tui::ChatAction::PushLine(status) = action else {
+        panic!("expected login status line");
+    };
+    assert!(status.text().contains("已保存登录凭据: deepseek"));
+    assert!(status.text().contains("可用模型: "));
+    assert!(!status.text().contains("secret-deepseek-key"));
+    assert!(
+        available_models
+            .iter()
+            .any(|entry| entry.model.id == "deepseek-chat")
+    );
+
+    let reloaded = AuthStorage::load(auth_path).expect("reload auth");
+    assert_eq!(
+        reloaded.api_key("deepseek").as_deref(),
+        Some("secret-deepseek-key")
+    );
 }
 
 #[test]
