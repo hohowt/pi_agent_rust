@@ -2,10 +2,13 @@ use async_trait::async_trait;
 use futures::Stream;
 use pi::agent::{Agent, AgentConfig, AgentSession};
 use pi::compaction::ResolvedCompactionSettings;
+use pi::config::Config;
 use pi::interactive::{
-    build_model_picker_items, expand_submitted_content_for_tui, export_current_session_for_tui,
-    format_agent_event, format_compaction_status, format_reload_status, format_session_name_status,
+    build_model_picker_items, changelog_picker_items, expand_submitted_content_for_tui,
+    export_current_session_for_tui, format_agent_event, format_changelog_entry,
+    format_compaction_status, format_reload_status, format_session_name_status,
     last_assistant_text_for_tui, resume_session_from_path_for_tui, session_picker_items,
+    startup_changelog_lines,
 };
 use pi::model::{
     AssistantMessage, ContentBlock, Message, StreamEvent, TextContent, UserContent, UserMessage,
@@ -420,6 +423,47 @@ fn export_current_session_for_tui_writes_html_and_json() {
     assert_eq!(json.format, "JSON");
     assert!(json_body.contains("export this"));
     assert!(json_body.contains("exported answer"));
+}
+
+#[test]
+fn changelog_picker_lists_versions_and_formats_selected_entry() {
+    let items = changelog_picker_items();
+
+    assert!(!items.is_empty());
+    assert!(items[0].label.contains("Unreleased"));
+    assert_eq!(items[0].value, "0");
+    assert!(!items[0].description.is_empty());
+
+    let entry = format_changelog_entry("0").expect("first changelog entry");
+    assert!(entry.contains("Unreleased"));
+    assert!(entry.contains("Features") || entry.contains("Bug Fixes"));
+}
+
+#[test]
+fn startup_changelog_respects_quiet_collapse_and_seen_version() {
+    let lines = startup_changelog_lines(&Config::default());
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0].role(), "Status");
+    assert!(lines[0].text().contains("Changelog:"));
+
+    let mut config = Config {
+        quiet_startup: Some(true),
+        ..Config::default()
+    };
+    assert!(startup_changelog_lines(&config).is_empty());
+
+    config.quiet_startup = None;
+    config.collapse_changelog = Some(true);
+    assert!(startup_changelog_lines(&config).is_empty());
+
+    let latest_title = changelog_picker_items()
+        .into_iter()
+        .next()
+        .expect("latest changelog item")
+        .label;
+    config.collapse_changelog = None;
+    config.last_changelog_version = Some(latest_title);
+    assert!(startup_changelog_lines(&config).is_empty());
 }
 
 #[test]

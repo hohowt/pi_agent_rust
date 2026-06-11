@@ -274,12 +274,15 @@ fn slash_command_items(language: Language) -> Vec<pi_tui::SlashCommandItem> {
             ("/theme", "选择主题"),
             ("/resume", "选择历史会话"),
             ("/history", "打开会话列表"),
+            ("/export", "导出会话"),
+            ("/copy", "复制上一条 assistant 消息"),
             ("/tree", "显示对话树信息"),
             ("/compact", "压缩上下文"),
             ("/clear", "清屏"),
             ("/reload", "重新加载资源"),
             ("/template", "选择 prompt template"),
             ("/language", "切换语言"),
+            ("/changelog", "显示 changelog"),
             ("/codegraph", "管理 codegraph 索引"),
             ("/exit", "退出"),
         ],
@@ -292,12 +295,15 @@ fn slash_command_items(language: Language) -> Vec<pi_tui::SlashCommandItem> {
             ("/theme", "Pick theme"),
             ("/resume", "Pick previous session"),
             ("/history", "Open session list"),
+            ("/export", "Export session"),
+            ("/copy", "Copy last assistant message"),
             ("/tree", "Show conversation tree info"),
             ("/compact", "Compact context"),
             ("/clear", "Clear screen"),
             ("/reload", "Reload resources"),
             ("/template", "Pick prompt template"),
             ("/language", "Switch language"),
+            ("/changelog", "Show changelog"),
             ("/codegraph", "Manage codegraph index"),
             ("/exit", "Quit"),
         ],
@@ -336,6 +342,7 @@ pub async fn run_interactive(
     });
     let options = context.options.clone();
     let mut initial_lines = Vec::new();
+    initial_lines.extend(startup_changelog_lines(&context.config));
     for pending in pending_inputs {
         let content = match pending {
             PendingInput::Text(text) => expand_submitted_content_for_tui(
@@ -576,12 +583,11 @@ async fn handle_slash_command(
         SlashCommand::Copy => handle_copy_command(agent).await?,
         SlashCommand::Export => handle_export_command(agent, context, args).await?,
         SlashCommand::Name => handle_name_command(agent, args).await?,
+        SlashCommand::Changelog => handle_changelog_command(args),
         SlashCommand::Language => handle_language_command(context, args)?,
-        SlashCommand::Login
-        | SlashCommand::Logout
-        | SlashCommand::Fork
-        | SlashCommand::Share
-        | SlashCommand::Changelog => status_action(format_command_unavailable(command)),
+        SlashCommand::Login | SlashCommand::Logout | SlashCommand::Fork | SlashCommand::Share => {
+            status_action(format_command_unavailable(command))
+        }
     };
     Ok(action)
 }
@@ -1317,6 +1323,125 @@ fn export_format_for_path(path: &Path) -> &'static str {
     } else {
         "HTML"
     }
+}
+
+fn handle_changelog_command(args: &str) -> pi_tui::ChatAction {
+    let selector = args.trim();
+    if selector.is_empty() {
+        let items = changelog_picker_items();
+        if items.is_empty() {
+            return status_action("没有可显示的 changelog 条目。");
+        }
+        return pi_tui::ChatAction::OpenPicker(
+            pi_tui::ChatPicker::new("Changelog", "/changelog", items)
+                .with_subtitle("选择一个版本查看完整条目")
+                .with_empty_message("没有匹配的 changelog 条目"),
+        );
+    }
+
+    match format_changelog_entry(selector) {
+        Some(entry) => status_action(entry),
+        None => status_action(format!("未找到 changelog 条目: {selector}")),
+    }
+}
+
+#[doc(hidden)]
+pub fn startup_changelog_lines(config: &Config) -> Vec<pi_tui::ChatLine> {
+    if config.quiet_startup.unwrap_or(false) || config.collapse_changelog.unwrap_or(false) {
+        return Vec::new();
+    }
+
+    let Some(latest) = changelog_sections().into_iter().next() else {
+        return Vec::new();
+    };
+    let current_version = latest.title.trim();
+    if config
+        .last_changelog_version
+        .as_deref()
+        .is_some_and(|version| version == current_version)
+    {
+        return Vec::new();
+    }
+
+    vec![pi_tui::ChatLine::status(format!(
+        "Changelog: {current_version}\n输入 /changelog 查看完整更新记录。"
+    ))]
+}
+
+#[doc(hidden)]
+pub fn changelog_picker_items() -> Vec<pi_tui::PickerItem> {
+    changelog_sections()
+        .into_iter()
+        .enumerate()
+        .map(|(index, section)| {
+            pi_tui::PickerItem::new(
+                section.title.clone(),
+                index.to_string(),
+                changelog_section_description(&section.body),
+            )
+        })
+        .collect()
+}
+
+#[doc(hidden)]
+pub fn format_changelog_entry(selector: &str) -> Option<String> {
+    let sections = changelog_sections();
+    let selected = selector
+        .parse::<usize>()
+        .ok()
+        .and_then(|index| sections.get(index))
+        .or_else(|| {
+            sections.iter().find(|section| {
+                section
+                    .title
+                    .to_ascii_lowercase()
+                    .contains(&selector.to_ascii_lowercase())
+            })
+        })?;
+    Some(format!("{}\n\n{}", selected.title, selected.body.trim()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChangelogSection {
+    title: String,
+    body: String,
+}
+
+fn changelog_sections() -> Vec<ChangelogSection> {
+    let mut sections = Vec::new();
+    let mut current_title: Option<String> = None;
+    let mut current_body = Vec::new();
+
+    for line in include_str!("../CHANGELOG.md").lines() {
+        if let Some(title) = line.strip_prefix("## ") {
+            if let Some(title) = current_title.take() {
+                sections.push(ChangelogSection {
+                    title,
+                    body: current_body.join("\n"),
+                });
+                current_body.clear();
+            }
+            current_title = Some(title.trim().to_string());
+        } else if current_title.is_some() {
+            current_body.push(line.to_string());
+        }
+    }
+
+    if let Some(title) = current_title {
+        sections.push(ChangelogSection {
+            title,
+            body: current_body.join("\n"),
+        });
+    }
+
+    sections
+}
+
+fn changelog_section_description(body: &str) -> String {
+    body.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with('#'))
+        .map_or_else(|| "No details".to_string(), |line| truncate_line(line, 120))
 }
 
 #[doc(hidden)]
